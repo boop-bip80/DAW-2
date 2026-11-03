@@ -388,7 +388,8 @@ impl History {
     }
 
     /// How many steps there are ("Last reset" not counted).
-    #[cfg(test)]
+    /// Available in release builds too: loading completion must distinguish an untouched
+    /// session from one with edits even if the user has undone every change.
     pub fn len(&self) -> usize {
         self.steps.len()
     }

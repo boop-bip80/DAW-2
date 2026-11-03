@@ -14,6 +14,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # PR jobs otherwise check out GitHub's ephemeral merge ref. Release-candidate
+  # manifests must identify the durable, exact source revision being built.
+  CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   build:
@@ -40,6 +43,8 @@ jobs:
             staged_executable: Lemon Studio.app/Contents/MacOS/lemonstudio
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_COMMIT }}
 
       # ALSA (audio output and MIDI input). The app loads Wayland, X11 and xkbcommon at run time, but Lemon Sampler built
       # on its own (the bundle step) links wayland-client through its file dialogs, so that needs the Wayland package.
@@ -87,7 +92,7 @@ jobs:
           --binary "${{ matrix.executable }}"
           --bundled "target/bundled"
           --output "${{ runner.temp }}/lemon-candidate"
-          --commit "${{ github.sha }}"
+          --commit "${{ env.CANDIDATE_COMMIT }}"
 
       # This verifies only the existing ad-hoc signature, not trusted Developer ID or notarization.
       - name: Verify staged macOS bundle's ad-hoc signature
@@ -109,7 +114,7 @@ jobs:
       - name: Upload qualified portable candidate and test evidence
         uses: actions/upload-artifact@v4
         with:
-          name: lemon-${{ matrix.platform }}-${{ github.sha }}
+          name: lemon-${{ matrix.platform }}-${{ env.CANDIDATE_COMMIT }}
           path: |
             ${{ runner.temp }}/lemon-candidate/*.zip
             ${{ runner.temp }}/lemon-candidate/*.tar.gz

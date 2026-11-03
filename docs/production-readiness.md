@@ -30,7 +30,9 @@ CI stages a platform-specific portable candidate from built native modules. Its 
 header, every expected VST3/CLAP module (25 plugins × 2 formats), bundled license/notices, corresponding source
 commit, SHA-256 inventory and archive checksum. Linux's staged assets include the desktop entry and MIME XML for
 `.lemon` and `.flp`. The macOS app carries `LICENSE` and `THIRD-PARTY-NOTICES.txt` *inside* its signed resource seal
-and advertises both extensions to Finder. Nested Cargo builds all use `--locked`.
+and advertises both extensions to Finder. Nested Cargo builds all use `--locked`. On pull requests, qualification
+explicitly checks out the PR head SHA rather than GitHub's temporary merge SHA, and names the artifact and source
+manifest after the exact revision under test.
 
 The owned qualification invokes **the binary inside the stage**, never an unrelated debug binary, then requires:
 

@@ -100,22 +100,35 @@ fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
     if a == b || (cfg!(windows) && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()) {
         return Ok(true);
     }
-    let left = std::fs::metadata(a)?;
-    let right = std::fs::metadata(b)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let left = std::fs::metadata(a)?;
+        let right = std::fs::metadata(b)?;
         return Ok(left.dev() == right.dev() && left.ino() == right.ino());
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        return Ok(left.volume_serial_number().zip(left.file_index()) == right.volume_serial_number().zip(right.file_index())
-            && left.volume_serial_number().is_some() && left.file_index().is_some());
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+        // std::os::windows::fs::MetadataExt::file_index is unstable on our pinned
+        // toolchain. Ask Windows for the identity of an open file instead: the
+        // volume serial and 64-bit file index identify hard links as one file.
+        fn identity(path: &Path) -> std::io::Result<(u32, u64)> {
+            let file = std::fs::File::open(path)?;
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: the file handle stays open for the call, and `info` is a
+            // writable, correctly laid out Win32 output structure.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok((info.dwVolumeSerialNumber, (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)))
+        }
+        return Ok(identity(&a)? == identity(&b)?);
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (left, right);
         Ok(false)
     }
 }

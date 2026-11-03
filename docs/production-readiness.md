@@ -68,7 +68,8 @@ staging report and owned synthetic-workflow report/logs** as a GitHub Actions ar
 `lemon-<platform>-<commit>`, retained for 14 days. These artifacts are publicly downloadable to people with
 repository access, are unsigned (macOS: only ad-hoc-signed), and **are not GitHub Releases or vetted distributions**.
 No external licensed project corpus, user recordings, private credentials or third-party compatibility fixtures are
-included. A failing job must not upload a candidate as successful.
+included. A failing job must not upload a candidate as successful; it may upload only scrubbed synthetic-test
+diagnostic logs (7-day retention) to make cross-platform failures actionable.
 
 ### Move 3 — Close external go/no-go gates, sign and distribute
 

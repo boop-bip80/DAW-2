@@ -132,7 +132,10 @@ def run(binary, output):
         completed = subprocess.run([str(binary), "--render", str(session), str(path), "--rate", "48000", "--seconds", "3", "--builtin-only"],
                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
         (output / f"render-{number}.log").write_text(completed.stdout, encoding="utf-8")
-        assert completed.returncode == 0, f"render {number} failed: see its log"
+        if completed.returncode != 0:
+            # This is only our synthetic session, with no user-provided assets or
+            # persistent control token. Include the useful tail in the CI failure.
+            raise RuntimeError(f"render {number} exited {completed.returncode}:\n{completed.stdout[-6000:]}")
         renders.append(path)
     assert renders[0].read_bytes() == renders[1].read_bytes(), "the owned render must be deterministic in fresh processes"
     data = renders[0].read_bytes()

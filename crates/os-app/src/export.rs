@@ -494,13 +494,20 @@ fn publish_prepared(
     }
     // Preflight and reserve rollback copies *all at once*. None of the previous outputs can be modified before
     // every requested destination has been checked and snapshotted.
-    let originals=outputs.iter().map(|w|PreviousWave::capture(&w.spool.path)).collect::<Result<Vec<_>,_>>()?;
+    let mut originals=outputs.iter().map(|w|PreviousWave::capture(&w.spool.path)).collect::<Result<Vec<_>,_>>()?;
     let mut files=Vec::with_capacity(outputs.len());
     for (i,output) in outputs.iter().enumerate() {
         if let Err(e)=publish(i,output) {
             // `replace_with` can fail after rename if syncing the parent directory fails; include the attempted
             // target as well as earlier successes in rollback, even if it is normally still unmodified.
-            let failures=originals[..=i].iter().rev().filter_map(|old|old.restore().err()).collect::<Vec<_>>();
+            // Preserve the only previous-generation bytes if restoring that output fails.
+            let failures=originals[..=i].iter_mut().rev().filter_map(|old| {
+                let error=old.restore().err()?;
+                Some(match old.copy.take() {
+                    Some(backup)=>format!("{error}; previous output retained at {}",backup.display()),
+                    None=>error,
+                })
+            }).collect::<Vec<_>>();
             if failures.is_empty() {return Err(format!("{e}; all attempted export files rolled back"));}
             return Err(format!("{e}; rollback incomplete: {}",failures.join("; ")));
         }
@@ -1032,6 +1039,54 @@ mod tests {
                 !name.to_string_lossy().contains("lemon-render")
             }),"failed batch left temporary render/backup files in {}",dir.display());
         }
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+
+    #[test]
+    fn incomplete_rollback_retains_original_snapshot() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let folder = std::env::temp_dir().join(format!(
+            "lemon_wave_failed_restore_{}_{}",
+            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&folder).unwrap();
+        let mut job = Job::wav(&folder.join("take.wav"));
+        job.options.split = true;
+        job.options.split_master = true;
+        job.options.tail = Tail::Cut;
+        job.track_names = vec!["Master".into(), "Bus".into()];
+        let mix = vec![0.2f32, 0.1, 0.3, 0.2];
+        let tracks = vec![mix.clone(), mix.clone()];
+        let mut stream = WaveStream::new(&job, 48000, 2).unwrap();
+        stream.push(&mix, &tracks).unwrap();
+        let prepared = stream.outputs.into_iter()
+            .map(|w| w.prepare(&job.options, 48000).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(prepared.len() >= 2);
+        let first = prepared[0].spool.path.clone();
+        let second = prepared[1].spool.path.clone();
+        let original = b"previous irreplaceable audio";
+        std::fs::write(&first, original).unwrap();
+        std::fs::write(&second, b"other original audio").unwrap();
+        let error = publish_prepared(prepared, |index, wave| {
+            if index == 1 {return Err("injected second publish failure".into());}
+            wave.publish()?;
+            // Force restore failure portably without relying on filesystem privileges.
+            std::fs::remove_file(&first).unwrap();
+            std::fs::create_dir(&first).unwrap();
+            Ok(())
+        }).unwrap_err();
+        assert!(error.contains("rollback incomplete"), "{error}");
+        assert!(error.contains("previous output retained at"), "{error}");
+        assert_eq!(std::fs::read(&second).unwrap().as_slice(), b"other original audio");
+        let backups = std::fs::read_dir(first.parent().unwrap()).unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().contains(".lemon-render-original-"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap().as_slice(), original);
         std::fs::remove_dir_all(folder).unwrap();
     }
 

@@ -6,7 +6,7 @@
 """Stage an unsigned CI release candidate; verify its modules, licenses and hashes.
 
 The archive is a portable *candidate*, not a clean-machine installer or a signed
-release. `owned_workflow.py` must exercise the executable from `payload` before
+release. `owned_workflow.py` must exercise the executable extracted from the archive before
 approval for any publication can be considered. The external, hardware and
 signing gates remain separate.
 """
@@ -14,7 +14,7 @@ signing gates remain separate.
 import argparse
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform as host_platform
 import re
 import shutil
@@ -141,6 +141,10 @@ def verify_macos_signatures(payload, names):
 
 
 def stage(args):
+    actual_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True,
+                                   capture_output=True, text=True).stdout.strip()
+    if args.commit != actual_commit:
+        raise ValueError(f"claimed source commit {args.commit} != checked-out HEAD {actual_commit}")
     platform = args.platform
     if platform == "macos" and sys.platform != "darwin":
         raise ValueError("macOS candidates require the native runner to preserve and verify bundle signatures")
@@ -207,6 +211,9 @@ def stage(args):
         "platform": platform,
         "host_architecture": host_platform.machine(),
         "rust_toolchain": pinned_toolchain(),
+        "rustc_version_verbose": subprocess.run(["rustc", "-Vv"], check=True, capture_output=True, text=True).stdout.strip(),
+        "cargo_version": subprocess.run(["cargo", "-V"], check=True, capture_output=True, text=True).stdout.strip(),
+        "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
         "binary": binary.relative_to(payload).as_posix(),
         "built_in_plugin_count": len(names),
         "plugin_format_count": 2 * len(names),
@@ -215,7 +222,6 @@ def stage(args):
     }
     (payload / "BUILD-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     (payload / "SHA256SUMS").write_text(checksums(contents), encoding="utf-8")
-    verify(output)
 
     stem = f"lemonstudio-{platform}-{args.commit[:12]}-ci-candidate"
     if platform == "macos":
@@ -239,14 +245,17 @@ def stage(args):
         "status": "staged-unqualified", "platform": platform, "archive": archive.name,
         "archive_sha256": digest, "binary": manifest["binary"], "plugin_count": len(names),
     }, indent=2) + "\n", encoding="utf-8")
+    verify(output)
     print(json.dumps({"archive": str(archive), "archive_sha256": digest, "staged_binary": str(binary)}, indent=2))
 
 
-def verify(output):
+def verify(output, owned_result=None):
     payload = output.resolve() / "payload"
     manifest = json.loads((payload / "BUILD-MANIFEST.json").read_text(encoding="utf-8"))
     if manifest["rust_toolchain"] != pinned_toolchain():
         raise ValueError("candidate manifest differs from pinned Rust toolchain")
+    if manifest["cargo_lock_sha256"] != sha256(ROOT / "Cargo.lock"):
+        raise ValueError("candidate manifest differs from checked-out Cargo.lock")
     actual = inventory(payload)
     if manifest["files"] != actual or (payload / "SHA256SUMS").read_text(encoding="utf-8") != checksums(actual):
         raise ValueError("release candidate manifest/checksums do not match packaged files")
@@ -261,14 +270,85 @@ def verify(output):
         if sha256(payload / source) != sha256(ROOT / source):
             raise ValueError(f"release candidate {source} differs from source checkout")
     result_path = output / "stage-result.json"
-    if result_path.exists():
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        archive = output / result["archive"]
-        if sha256(archive) != result["archive_sha256"]:
-            raise ValueError("outer archive checksum mismatch")
-        if (output / (archive.name + ".sha256")).read_text(encoding="utf-8") != f"{result['archive_sha256']}  {archive.name}\n":
-            raise ValueError("outer .sha256 sidecar mismatch")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    archive = output / result["archive"]
+    if sha256(archive) != result["archive_sha256"]:
+        raise ValueError("outer archive checksum mismatch")
+    if (output / (archive.name + ".sha256")).read_text(encoding="utf-8") != f"{result['archive_sha256']}  {archive.name}\n":
+        raise ValueError("outer .sha256 sidecar mismatch")
+    if owned_result is not None:
+        extracted = json.loads((output / "archive-qualification.json").read_text(encoding="utf-8"))
+        qualified = json.loads(owned_result.read_text(encoding="utf-8"))
+        if extracted["binary_sha256"] != qualified["binary_sha256"]:
+            raise ValueError("smoke-tested executable differs from extracted archive")
     print(f"Verified {len(actual)} files and {manifest['plugin_format_count']} native plugin modules: {payload}")
+
+
+
+def unpack(output):
+    """Extract the distributable and verify every file before its binary is tested."""
+    output = output.resolve(strict=True)
+    verify(output)
+    payload = output / "payload"
+    manifest = json.loads((payload / "BUILD-MANIFEST.json").read_text(encoding="utf-8"))
+    result = json.loads((output / "stage-result.json").read_text(encoding="utf-8"))
+    platform = manifest["platform"]
+    archive = output / result["archive"]
+    extraction = output / "unpacked"
+    extraction.mkdir(exist_ok=False)
+
+    def safe_member(name):
+        path = PurePosixPath(name.replace("\\", "/"))
+        if not path.parts or path.is_absolute() or ".." in path.parts or ":" in path.parts[0]:
+            raise ValueError(f"unsafe archive member path: {name}")
+
+    if platform == "macos":
+        # Ditto preserves resource forks and extended attributes in signed bundles.
+        subprocess.run(["ditto", "-x", "-k", str(archive), str(extraction)], check=True)
+        root = extraction
+    elif platform == "windows":
+        with zipfile.ZipFile(archive) as packaged:
+            for entry in packaged.infolist():
+                safe_member(entry.filename)
+            packaged.extractall(extraction)
+        root = extraction / "Lemon Studio"
+    elif platform == "linux":
+        with tarfile.open(archive, "r:gz") as packaged:
+            for entry in packaged.getmembers():
+                safe_member(entry.name)
+                if not (entry.isfile() or entry.isdir()):
+                    raise ValueError(f"unexpected link/device archive member: {entry.name}")
+            packaged.extractall(extraction, filter="data")
+        root = extraction / "Lemon Studio"
+    else:
+        raise ValueError(f"unknown candidate platform {platform}")
+
+    if not root.is_dir():
+        raise ValueError("archive lacks the documented candidate root")
+    if inventory(root) != inventory(payload):
+        raise ValueError("extracted archive differs from staged hash-verified payload")
+    for name in ("BUILD-MANIFEST.json", "SHA256SUMS"):
+        if sha256(root / name) != sha256(payload / name):
+            raise ValueError(f"extracted archive {name} differs from staged payload")
+    binary = root / manifest["binary"]
+    native_module(binary, platform)
+    if platform == "linux" and not binary.stat().st_mode & 0o111:
+        raise ValueError("extracted Linux executable lost its execute permission")
+    names = expected_plugins()
+    validate_plugins(root / "Plugins", platform, names)
+    if platform == "macos":
+        verify_macos_signatures(root, names)
+    attestation = {
+        "status": "passed",
+        "archive": archive.name,
+        "archive_sha256": sha256(archive),
+        "extracted_binary": binary.relative_to(output).as_posix(),
+        "binary_sha256": sha256(binary),
+        "verified_files": len(inventory(root)) + 2,
+        "native_plugin_modules": 2 * len(names),
+    }
+    (output / "archive-qualification.json").write_text(json.dumps(attestation, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(attestation, indent=2))
 
 
 def main():
@@ -282,13 +362,18 @@ def main():
     staging.add_argument("--commit", required=True, help="the full Git commit of the candidate sources")
     verifying = sub.add_parser("verify")
     verifying.add_argument("--output", type=Path, required=True)
+    verifying.add_argument("--owned-result", type=Path)
+    unpacking = sub.add_parser("unpack")
+    unpacking.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "stage":
         if not re.fullmatch(r"[a-f0-9]{40}", args.commit):
             parser.error("--commit must be a 40-character lowercase Git commit SHA")
         stage(args)
+    elif args.command == "verify":
+        verify(args.output, args.owned_result)
     else:
-        verify(args.output)
+        unpack(args.output)
 
 
 if __name__ == "__main__":

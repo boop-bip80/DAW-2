@@ -1880,7 +1880,9 @@ fn main() -> std::process::ExitCode {
     // Plugin editors in real plugin windows, checked from the main thread (`plugins::window_check`).
     #[cfg(target_os = "macos")]
     if args.first().map(String::as_str) == Some("--plugin-window-check") {
-        return std::process::ExitCode::from(plugins::window_check::run(&args[1..]) as u8);
+        let status = plugins::window_check::run(&args[1..]);
+        plugins::sweep_retired();
+        return std::process::ExitCode::from(status as u8);
     }
     app::move_old_settings();
     // The mixing threads every engine renders on, from here on (spec: audio/multicore.md).
@@ -1896,6 +1898,8 @@ fn main() -> std::process::ExitCode {
     }
     if args.iter().any(|a| a == "--screenshot") {
         screenshot(&args);
+        // The screenshot's App can retire hosted plugins while unwinding.
+        plugins::sweep_retired();
         return std::process::ExitCode::SUCCESS;
     }
     // The control plane's socket (spec: roadmap/control-plane.md): beside the window, or without one.

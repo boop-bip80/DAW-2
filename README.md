@@ -127,13 +127,14 @@ Per-area details are in [docs/status.md](docs/status.md). The full, item-by-item
 
 ## Getting started
 
-No public prebuilt binaries are provided at this stage: Lemon Studio is built from source. Each platform below goes from a fresh
-machine to Lemon Studio installed with its icon, and Lemon Studio's own plugins installed for any DAW. All three need
+No production releases or installers are provided. Short-lived unsigned portable candidates from successful
+same-repository CI jobs are for testing only; for a local installation, build from source. Each platform below goes
+from a fresh machine to Lemon Studio installed with its icon and bundled plugins. All three need
 **Rust**, using the toolchain pinned by `rust-toolchain.toml` (currently 1.99.1), installed through [rustup](https://rustup.rs/), and a clone of this repository:
 
 ```bash
-git clone https://github.com/ItsAlphaNeon/Lemon-Studio.git
-cd Lemon-Studio
+git clone https://github.com/boop-bip80/DAW-2.git
+cd DAW-2
 ```
 
 `cargo run -p os-app --release` builds and runs Lemon Studio. Before Lemon Studio starts, it also rebuilds Lemon

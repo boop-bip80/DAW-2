@@ -8,6 +8,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -30,12 +33,12 @@ jobs:
             os: windows-latest
             platform: windows
             executable: target/release/lemonstudio.exe
-            staged_executable: bin/lemonstudio.exe
+            staged_executable: Lemon Studio/bin/lemonstudio.exe
           - name: Linux
             os: ubuntu-24.04
             platform: linux
             executable: target/release/lemonstudio
-            staged_executable: bin/lemonstudio
+            staged_executable: Lemon Studio/bin/lemonstudio
           - name: macOS
             os: macos-latest
             platform: macos
@@ -94,24 +97,32 @@ jobs:
           --output "${{ runner.temp }}/lemon-candidate"
           --commit "${{ env.CANDIDATE_COMMIT }}"
 
-      # This verifies only the existing ad-hoc signature, not trusted Developer ID or notarization.
-      - name: Verify staged macOS bundle's ad-hoc signature
-        if: runner.os == 'macOS'
-        run: codesign --verify --verbose=2 "${{ runner.temp }}/lemon-candidate/payload/Lemon Studio.app"
+      # Test the exact bytes a downloader extracts, including native modes and macOS signatures.
+      - name: Extract archive and compare each packaged file
+        run: python tools/qualification/stage.py unpack --output "${{ runner.temp }}/lemon-candidate"
 
-      # Exercise the actual staged executable with a synthetic native session, cold reopen, render and take recovery.
+      # This is an ad-hoc signature, not trusted Developer ID or notarization.
+      - name: Verify extracted macOS app signature
+        if: runner.os == 'macOS'
+        run: codesign --verify --verbose=2 "${{ runner.temp }}/lemon-candidate/unpacked/Lemon Studio.app"
+
+      # Exercise the archive-extracted executable with a synthetic session, reopen, render and take recovery.
       - name: Qualify staged executable with owned synthetic project
         run: >-
           python tools/qualification/owned_workflow.py
-          --binary "${{ runner.temp }}/lemon-candidate/payload/${{ matrix.staged_executable }}"
+          --binary "${{ runner.temp }}/lemon-candidate/unpacked/${{ matrix.staged_executable }}"
           --output "${{ runner.temp }}/lemon-qualified"
 
-      - name: Verify packaged file and archive hashes after qualification
-        run: python tools/qualification/stage.py verify --output "${{ runner.temp }}/lemon-candidate"
+      - name: Verify archive hashes and the smoke-tested executable digest
+        run: >-
+          python tools/qualification/stage.py verify
+          --output "${{ runner.temp }}/lemon-candidate"
+          --owned-result "${{ runner.temp }}/lemon-qualified/result.json"
 
       # Only successful, hash-verified candidates are downloadable. These are short-lived,
       # unsigned (macOS: ad-hoc-signed) test artifacts, NOT production releases.
       - name: Upload qualified portable candidate and test evidence
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/upload-artifact@v4
         with:
           name: lemon-${{ matrix.platform }}-${{ env.CANDIDATE_COMMIT }}
@@ -120,6 +131,7 @@ jobs:
             ${{ runner.temp }}/lemon-candidate/*.tar.gz
             ${{ runner.temp }}/lemon-candidate/*.sha256
             ${{ runner.temp }}/lemon-candidate/stage-result.json
+            ${{ runner.temp }}/lemon-candidate/archive-qualification.json
             ${{ runner.temp }}/lemon-qualified/result.json
             ${{ runner.temp }}/lemon-qualified/*.log
           if-no-files-found: error

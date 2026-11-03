@@ -5,12 +5,12 @@
 Lemon Studio repository. The release pipeline added on this stabilization branch must itself pass on the exact
 candidate commit before any technical result is described as verified.
 
-**Evidence status (2026-11-03):** stabilization is committed locally and the synthetic Rust workspace test profile
-passed locally on Linux (the loopback-socket test was skipped because the container forbids local socket binding).
-The new three-platform CI qualification, archive checks and signed/installer end-to-end tests have **not** been
-observed passing on GitHub Actions. No external licensed compatibility fixtures, physical-device session logs,
-clean-machine acceptance results, trusted signatures or notarization tickets have been supplied. Green CI on the
-upstream repository would not change this fork's status.
+**Evidence status (2026-11-03):** stabilization is published as [draft PR #1](https://github.com/boop-bip80/DAW-2/pull/1).
+The 2026-11-03 CI run [#6](https://github.com/boop-bip80/DAW-2/actions/runs/41569789209) successfully built,
+tested, staged and smoke-qualified Windows, Linux and macOS portable candidates at commit `f594361`. Newer code
+changes must pass a fresh three-platform run on their exact commit. No external licensed compatibility fixtures,
+physical-device session logs, clean-machine acceptance results, trusted distribution signatures or notarization
+tickets have been supplied. Green upstream CI cannot qualify this fork.
 
 ## The fastest rigorous path: three coordinated release moves
 
@@ -26,21 +26,23 @@ upstream repository would not change this fork's status.
 
 ### Move 2 — Qualify the exact candidate package users would exercise
 
-CI stages a platform-specific portable candidate from built native modules. Its staging script checks the binary
-header, every expected VST3/CLAP module (25 plugins × 2 formats), bundled license/notices, corresponding source
-commit, SHA-256 inventory and archive checksum. Linux's staged assets include the desktop entry and MIME XML for
+CI stages a platform-specific portable candidate from built native modules. Staging verifies the checked-out source
+SHA, Rust/Cargo toolchain and lockfile hash, native headers, every expected VST3/CLAP module (25 plugins × 2 formats),
+licenses/notices and SHA-256 inventory. It then extracts the downloadable archive into a fresh directory and checks
+every packaged file before running its **extracted** executable. Linux's staged assets include the desktop entry and MIME XML for
 `.lemon` and `.flp`. The macOS app carries `LICENSE` and `THIRD-PARTY-NOTICES.txt` *inside* its signed resource seal
 and advertises both extensions to Finder. Nested Cargo builds all use `--locked`. On pull requests, qualification
 explicitly checks out the PR head SHA rather than GitHub's temporary merge SHA, and names the artifact and source
 manifest after the exact revision under test.
 
-The owned qualification invokes **the binary inside the stage**, never an unrelated debug binary, then requires:
+The owned qualification invokes **the binary extracted from the downloadable archive**, never an unrelated debug
+or pre-archive binary, then requires:
 
 | Exercise | Machine-verifiable acceptance |
 |---|---|
-| Native project | Create a synthetic sample/channel/pattern/playlist, save a real `.lemon` with its native header, and cold-open in a second process |
+| Native project | Create sample/channel/pattern/playlist, save a native `.lemon` and cold-open in another process; verify note, clip and sample semantics |
 | Mixer persistence | All three EQ bands' frequency, gain and width survive the cold reopen unchanged |
-| Audio export | Render a finite, stereo 48-kHz float WAV with nonzero peak; second independent render must be byte-identical |
+| Audio export | Render finite stereo 48-kHz float WAV with bounded duration and peak; second independent render byte-identical, processes exiting cleanly |
 | Retained recording | Recover a `.wav.part` with a deliberately torn journal; preserve the existing destination and use a distinct recovered filename |
 | Packaging | Verify each staged module's native binary type, all 50 plugin-format entries, GPL/notices copies, archive and payload checksums |
 
@@ -52,10 +54,12 @@ cargo build --release -p os-app --bin lemonstudio --locked
 cargo run -p bundle-plugins --locked
 python tools/qualification/stage.py stage --platform linux --binary target/release/lemonstudio \
   --bundled target/bundled --output /tmp/lemon-release-candidate --commit "$(git rev-parse HEAD)"
+python tools/qualification/stage.py unpack --output /tmp/lemon-release-candidate
 python tools/qualification/owned_workflow.py \
-  --binary /tmp/lemon-release-candidate/payload/bin/lemonstudio \
+  --binary '/tmp/lemon-release-candidate/unpacked/Lemon Studio/bin/lemonstudio' \
   --output /tmp/lemon-owned-result
-python tools/qualification/stage.py verify --output /tmp/lemon-release-candidate
+python tools/qualification/stage.py verify --output /tmp/lemon-release-candidate \
+  --owned-result /tmp/lemon-owned-result/result.json
 ```
 
 The two output directories above must not already exist. On Windows and macOS, CI selects the appropriate staged
@@ -64,11 +68,12 @@ that the **ad-hoc** app signature survived staging; that signature is not distri
 
 The owner authorized publishing the stabilization branch and short-lived test artifacts on 2026-11-02/03.
 After the staged smoke and hash checks pass, CI uploads **portable candidate archives, `.sha256` sidecars, the
-staging report and owned synthetic-workflow report/logs** as a GitHub Actions artifact named
+staging report, extracted-archive verification and owned synthetic-workflow report/logs** as a GitHub Actions artifact named
 `lemon-<platform>-<commit>`, retained for 14 days. These artifacts are publicly downloadable to people with
 repository access, are unsigned (macOS: only ad-hoc-signed), and **are not GitHub Releases or vetted distributions**.
 No external licensed project corpus, user recordings, private credentials or third-party compatibility fixtures are
-included. A failing job must not upload a candidate as successful; it may upload only scrubbed synthetic-test
+included. The maintained workflow suppresses candidate uploads on fork PRs. A failing job never uploads an accepted
+candidate; it may upload only scrubbed synthetic-test
 diagnostic logs (7-day retention) to make cross-platform failures actionable.
 
 ### Move 3 — Close external go/no-go gates, sign and distribute
@@ -81,10 +86,10 @@ substitute for them:
 | Real FL Studio compatibility | Licensed `.flp` project corpus + original/resaved pairs across supported historical versions; all selected semantic parts equal. `legacy_pairs.rs` now fails on mismatches, not just parse failures | **No-go: fixtures/results absent** |
 | Audio/FX parity | `OS_FX_NULL`, `OS_PC_NULL`, `OS_FC_NULL` `.case` fixture directories and independently reviewed tolerances/baselines; documented audible edge cases | **No-go: fixtures/results absent** |
 | Real audio devices | Record/replay/export/monitor on supported WASAPI shared/exclusive and ASIO, Linux ALSA (and PipeWire/PulseAudio through its documented compatibility path), and Core Audio combinations. JACK-specific mode is explicitly deferred until implemented/qualified. Include 44.1/48/96 kHz, 64/128/256-frame buffers where supported, MIDI loopback, device loss/recovery, at least 60-minute sessions, underrun counts and log hashes | **No-go: device matrix absent** |
-| Data integrity | Repeated forced-exit and low-disk/permission-failure saves; independently cold-open last committed `.lemon`; prove existing `.flp`, earlier `.lemon`, backups and WAV takes are preserved. Verify backup rotation, plugin state and mid-recording journals | **No-go: adversarial acceptance absent** |
-| Long-form export in all advertised formats | Prove at least 60-minute song/stem exports at supported 44.1/48/96-kHz settings to WAV, FLAC, MP3 and OGG, including sample-rate conversion, non-finite/length checks, tail behavior and failure rollback. Today only native-rate 32-bit float WAV streams; buffered codec/resample paths stop at a 16-million-float limit (about 2.9 minutes of stereo audio at 48 kHz), and multi-file publication is not crash-atomic | **No-go: streaming codec/resample and crash recovery incomplete** |
+| Data integrity | Force-exit/low-disk/permission-failure saves; verify imported sparse-file saves refuse known state loss and leave dirty state; cold-open the last committed `.lemon`; prove existing `.flp`, backups, WAV rollback originals and recorded takes survive. Validate generation recovery and mid-recording journals | **No-go: adversarial acceptance absent** |
+| Long-form export in all advertised formats | Prove 60-minute song/stems at 44.1/48/96 kHz to WAV, FLAC, MP3 and OGG, including conversion, tail behavior and rollback. Only native-rate 32-bit float WAV currently streams; other paths stop at 16,777,216 aggregate floats (about 2.9 minutes for one stereo mix at 48 kHz, far less for stems). GUI export can truncate tempo-automated slowdowns; CLI uses an unbounded buffered/direct-output path. Multi-file publication is not crash-atomic | **No-go: exact musical end, shared streaming export, codecs and crash recovery incomplete** |
 | Third-party plugin matrix | Representative VST3, CLAP and VST2 plugins on each OS (with lawful redistributable test instruments), editor lifecycle, parameter automation, preset/state restoration, PDC, offline export, save/cold-open. Document crash and failure matrix | **No-go: compatibility matrix absent** |
-| Plugin crash safety policy | Explicit supported risk model for untrusted native plugins. Windows SEH catches only some in-process faults; Unix executes foreign code directly, without crash recovery. For an unqualified third-party-plugin stability promise, implement out-of-process isolation first | **No-go for generalized plugin crash containment** |
+| Plugin crash safety policy | Document native plugin risk; Windows SEH catches only some faults, Unix foreign code is uncontained. Prove safe-open can preserve session/state with a plugin that crashes during load; use out-of-process isolation before generalized third-party crash containment claims | **No-go for safe plugin-state recovery and generalized containment** |
 | Install and trust | Independent clean-machine install/uninstall and file associations on all three OSes, dependency/SBOM review, durable GPL Corresponding Source availability, reviewed complete third-party notices; Developer ID + notarization for macOS and appropriate Windows signing/reputation work | **No-go: portable unsigned candidate only** |
 | Release provenance | Immutable tag/commit, reviewed changelog, manifest/hashes, corresponding source archive, published checksums and signatures, security/contact/rollback instructions, authorized artifact destination | **No-go: not published/approved** |
 

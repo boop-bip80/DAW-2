@@ -1887,10 +1887,12 @@ fn main() -> std::process::ExitCode {
     mix_threads::start();
     // A render without a window (FILE > Export audio from the command line, `render`).
     if args.first().map(String::as_str) == Some("--render") {
-        // A direct process::exit on Windows enters loader/TLS shutdown before
-        // Rust can complete its thread-lifecycle cleanup, even after a successful
-        // render. Preserve the CLI result while returning normally from main.
-        return std::process::ExitCode::from(render::cli(&args[1..]) as u8);
+        let status = render::cli(&args[1..]);
+        // Hosted::drop retires plugin instances into thread-local storage.
+        // Like GUI shutdown, destroy eligible instances on this main thread
+        // before the runtime begins thread-local/Windows loader teardown.
+        plugins::sweep_retired();
+        return std::process::ExitCode::from(status as u8);
     }
     if args.iter().any(|a| a == "--screenshot") {
         screenshot(&args);

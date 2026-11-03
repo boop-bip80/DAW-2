@@ -88,13 +88,16 @@ mod tests {
     use super::*;
     use crate::prefs::set_check;
 
-    /// The machine's physical cores are found, no more than its logical ones.
+    /// Machine topology may exceed process affinity or a container quota. The pool's existing clamp is the limit.
     #[test]
     fn physical_cores_are_found() {
         let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
         if let Some(n) = physical_cores() {
-            assert!((1..=logical).contains(&n), "{n} of {logical}");
+            assert!(n > 0, "reported physical topology must be nonzero");
+            assert!(parallel::default_workers(Some(n)) <= (logical / 2).max(1));
         }
+        assert_eq!(parallel::default_workers(Some(usize::MAX)), (logical / 2).max(1), "host topology is clamped to this process");
+        assert_eq!(parallel::default_workers(Some(0)), 1);
     }
 
     // spec: audio/multicore.md "Settings"

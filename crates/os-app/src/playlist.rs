@@ -604,9 +604,25 @@ impl Wave {
     }
 }
 
-/// What a playlist undo step keeps (`crate::history`): the shown arrangement's clips, markers and tracks, the
-/// automation data and the channels' stretch settings.
-pub(crate) type Snapshot = (Vec<Clip>, Vec<TimeMarker>, Vec<PlaylistTrack>, Vec<Automation>, Vec<[u32; 4]>);
+/// A playlist step belongs to an arrangement's stable identity, even while another arrangement is shown.
+#[derive(Debug, Clone)]
+pub(crate) struct Snapshot {
+    pub arrangement: u32,
+    pub clips: Vec<Clip>,
+    pub markers: Vec<TimeMarker>,
+    tracks: Vec<PlaylistTrack>,
+    automations: Vec<Automation>,
+    stretch: Vec<[u32; 4]>,
+    selection: Vec<usize>,
+}
+
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        // A selection-only click is navigation, not a musical edit or a new undo step.
+        self.arrangement == other.arrangement && self.clips == other.clips && self.markers == other.markers
+            && self.tracks == other.tracks && self.automations == other.automations && self.stretch == other.stretch
+    }
+}
 
 pub struct PlaylistState {
     pub tool: PlTool,
@@ -622,6 +638,8 @@ pub struct PlaylistState {
     pub pick_rows: [f32; 3],
     /// Selected clips (indices into the first arrangement's clips).
     pub sel: Vec<usize>,
+    /// Clip selections of arrangements left by navigation, keyed by stable arrangement ID.
+    selection_by_arrangement: HashMap<u32, Vec<usize>>,
     /// Selected track (Ctrl+Up / Down, header click).
     pub track: u16,
     /// Song position (ticks): song playback starts here.
@@ -773,6 +791,7 @@ impl Default for PlaylistState {
             pick_scroll: 0.0,
             pick_rows: [PICK_ROW; 3],
             sel: Vec::new(),
+            selection_by_arrangement: HashMap::new(),
             track: 0,
             pos: 0,
             jump_quantize: 0,
@@ -1464,6 +1483,7 @@ pub fn snapshot(s: &mut State) {
 /// the four checks (2026-10-16)").
 pub fn snapshot_as(s: &mut State, name: &'static str) {
     arr_mut(s);
+    s.control.settle(&mut s.project);
     let snap = crate::history::Snap::Playlist(Box::new(capture(s)));
     crate::history::record(s, name, snap);
 }
@@ -1472,28 +1492,50 @@ pub fn snapshot_as(s: &mut State, name: &'static str) {
 /// and `extra`, what the command changes beyond it.
 pub fn snapshot_with(s: &mut State, name: &'static str, extra: crate::history::Snap) {
     arr_mut(s);
+    s.control.settle(&mut s.project);
     let snap = crate::history::Snap::Several(vec![crate::history::Snap::Playlist(Box::new(capture(s))), extra]);
     crate::history::record(s, name, snap);
 }
 
-/// The playlist's undo state now (`snapshot`).
+/// The playlist's undo state now (`snapshot`). Snapshot entry points assign identities before this runs.
 pub(crate) fn capture(s: &State) -> Snapshot {
-    let (clips, markers, tracks) = s.project.arrangement().map(|a| (a.clips.clone(), a.markers.clone(), a.tracks.clone())).unwrap_or_default();
-    let stretch = s.project.channels.iter().map(|c| c.sound.stretch).collect();
-    (clips, markers, tracks, s.project.automations.clone(), stretch)
+    let arrangement = s.project.arrangement().map_or(0, |a| a.id.0);
+    capture_arrangement(s, arrangement).unwrap_or_else(|| Snapshot {
+        arrangement, clips: Vec::new(), markers: Vec::new(), tracks: Vec::new(),
+        automations: s.project.automations.clone(), stretch: s.project.channels.iter().map(|c| c.sound.stretch).collect(),
+        selection: Vec::new(),
+    })
 }
 
-/// Puts an undo state back (undo and redo, `crate::history`).
-pub(crate) fn restore(s: &mut State, (c, m, t, a, st): Snapshot) {
+/// Capture the other side of an undo step from its arrangement, never from the currently visible one.
+pub(crate) fn capture_arrangement(s: &State, identity: u32) -> Option<Snapshot> {
+    let a = s.project.arrangements.iter().find(|a| a.id.0 == identity)?;
+    let selection = if s.project.arrangement().is_some_and(|shown| shown.id.0 == identity) {
+        s.playlist.sel.clone()
+    } else {
+        s.playlist.selection_by_arrangement.get(&identity).cloned().unwrap_or_default()
+    };
+    Some(Snapshot {
+        arrangement: identity, clips: a.clips.clone(), markers: a.markers.clone(), tracks: a.tracks.clone(),
+        automations: s.project.automations.clone(), stretch: s.project.channels.iter().map(|c| c.sound.stretch).collect(), selection,
+    })
+}
+
+/// Restore the referenced arrangement and show it, as a pattern undo shows the referenced pattern. A stale step
+/// never writes into an unrelated arrangement which happens to reuse its old display number.
+pub(crate) fn restore(s: &mut State, saved: Snapshot) {
+    let Some(number) = s.project.arrangements.iter().find(|a| a.id.0 == saved.arrangement).map(|a| a.number) else { return };
+    show_arrangement(s, number);
     let arr = arr_mut(s);
-    arr.clips = c;
-    arr.markers = m;
-    arr.tracks = t;
-    s.project.automations = a;
-    for (ch, v) in s.project.channels.iter_mut().zip(st) {
-        ch.sound.stretch = v;
+    arr.clips = saved.clips;
+    arr.markers = saved.markers;
+    arr.tracks = saved.tracks;
+    let count = arr.clips.len();
+    s.project.automations = saved.automations;
+    for (ch, value) in s.project.channels.iter_mut().zip(saved.stretch) {
+        ch.sound.stretch = value;
     }
-    s.playlist.sel.clear();
+    s.playlist.sel = saved.selection.into_iter().filter(|&i| i < count).collect();
     s.piano.dirty = true;
 }
 
@@ -2158,6 +2200,9 @@ pub fn create_automation(s: &mut State, tgt: u32, name: &str, value: f64) -> u16
     // automatically" is on (spec: ui/settings-choices.md "Advanced: Initialize controls automatically").
     let init = crate::init::automatic(tgt, value);
     arr_mut(s);
+    // Undo targets an arrangement's persistent identity, not its display number. As with
+    // snapshot_as/snapshot_with, assign one before capturing the first automation clip.
+    s.control.settle(&mut s.project);
     let mut snap = crate::history::Snap::Playlist(Box::new(capture(s)));
     if init.is_some() {
         snap = crate::history::Snap::Several(vec![snap, crate::history::Snap::Init(tgt, crate::init::entry(s, tgt))]);
@@ -3906,14 +3951,20 @@ fn cmd_is_clone(c: &Cmd) -> bool {
     matches!(c, Cmd::ArrClone)
 }
 
-/// Shows arrangement number `n` (event 100, spec: flp/events/playlist.md): selection and undo belong to the one
-/// left; a playing song continues with the new one.
+/// Shows arrangement number `n` without discarding any undo/redo steps. Selection follows the stable arrangement
+/// identity; a playing song continues with the newly shown arrangement.
 pub fn show_arrangement(s: &mut State, n: u16) {
+    if !s.project.arrangements.iter().any(|a| a.number == n) { return }
+    s.control.settle(&mut s.project);
+    if let Some(old) = s.project.arrangement() {
+        s.playlist.selection_by_arrangement.insert(old.id.0, s.playlist.sel.clone());
+    }
     s.project.current_arrangement = Some(n);
-    s.playlist.sel.clear();
+    let arrangement = s.project.arrangement().expect("checked");
+    s.playlist.sel = s.playlist.selection_by_arrangement.get(&arrangement.id.0).cloned().unwrap_or_default()
+        .into_iter().filter(|&i| i < arrangement.clips.len()).collect();
     s.playlist.hover_clip = None;
     s.playlist.hover_handle = None;
-    crate::history::forget_playlist(s);
     s.piano.dirty = true;
 }
 

@@ -164,7 +164,7 @@ impl Snap {
     fn now(&self, s: &State) -> Snap {
         match self {
             Snap::Pattern { number, .. } => Snap::pattern(s, *number),
-            Snap::Playlist(_) => Snap::Playlist(Box::new(crate::playlist::capture(s))),
+            Snap::Playlist(p) => Snap::Playlist(Box::new(crate::playlist::capture_arrangement(s, p.arrangement).unwrap_or_else(|| (**p).clone()))),
             Snap::Knob(id, _) => Snap::Knob(*id, knob_value(s, *id)),
             // A track gone since is left as the step has it (`put` does nothing then).
             Snap::TrackIo(t, _) => crate::mixer::track(s, *t).map_or_else(|| self.clone(), |m| Snap::TrackIo(*t, track_io_of(m))),
@@ -181,15 +181,6 @@ impl Snap {
         }
     }
 
-    /// Whether this holds the playlist (`forget_playlist`).
-    fn has_playlist(&self) -> bool {
-        match self {
-            Snap::Playlist(_) => true,
-            Snap::Several(v) => v.iter().any(Snap::has_playlist),
-            _ => false,
-        }
-    }
-
     /// `rescale` for this.
     fn rescale(&mut self, from: u16, to: u16) {
         match self {
@@ -199,8 +190,8 @@ impl Snap {
                 *length = length.map(|l| os_model::rescale_length(l, from, to));
             }
             Snap::Playlist(p) => {
-                p.0.iter_mut().for_each(|c| c.rescale(from, to));
-                p.1.iter_mut().for_each(|m| m.rescale(from, to));
+                p.clips.iter_mut().for_each(|c| c.rescale(from, to));
+                p.markers.iter_mut().for_each(|m| m.rescale(from, to));
             }
             Snap::Patterns { patterns, .. } => {
                 for p in patterns {
@@ -704,20 +695,6 @@ pub fn trim(s: &mut State) {
     s.history.trim();
 }
 
-/// Another arrangement is shown: the playlist's steps belong to the one left (spec: ui/playlist.md §10).
-pub fn forget_playlist(s: &mut State) {
-    let h = &mut s.history;
-    let mut done = 0;
-    let mut kept = Vec::with_capacity(h.steps.len());
-    for (i, st) in std::mem::take(&mut h.steps).into_iter().enumerate() {
-        if !st.snap.has_playlist() {
-            done += usize::from(i < h.done);
-            kept.push(st);
-        }
-    }
-    (h.steps, h.done, h.run) = (kept, done, None);
-}
-
 /// The timebase changed from `from` to `to` ticks per quarter: the steps' notes, control points, lengths, clips and
 /// markers follow, so no undo brings back ticks of the old timebase (a timebase step keeps its own, `Timebase`).
 pub fn rescale(s: &mut State, from: u16, to: u16) {
@@ -733,6 +710,68 @@ mod tests {
 
     fn note_count(s: &State) -> usize {
         s.project.pattern(s.pattern).map_or(0, |p| p.notes.len())
+    }
+
+    #[test]
+    fn arrangement_navigation_preserves_undo_redo_and_the_correct_selection() {
+        use os_model::{Clip, ClipSource};
+        let mut app = App::new(None);
+        let s = &mut app.state;
+        let mut a = os_flp::project::default_arrangement();
+        a.number = 0;
+        a.clips = vec![Clip::new(0, 96, 0, ClipSource::Pattern(1))];
+        let mut b = os_flp::project::default_arrangement();
+        b.number = 1;
+        b.clips = vec![Clip::new(128, 96, 0, ClipSource::Pattern(1))];
+        s.project.arrangements = vec![a, b];
+        crate::playlist::show_arrangement(s, 0);
+        s.playlist.sel = vec![0];
+        crate::playlist::snapshot_as(s, "Edit A");
+        crate::playlist::arr_mut(s).clips[0].position = 100;
+        done_with(s);
+        crate::playlist::show_arrangement(s, 1);
+        s.playlist.sel = vec![0];
+        crate::playlist::snapshot_as(s, "Edit B");
+        crate::playlist::arr_mut(s).clips[0].position = 200;
+        done_with(s);
+        crate::playlist::show_arrangement(s, 0);
+        assert_eq!(s.playlist.sel, [0]);
+        assert_eq!(s.history.steps.len(), 2, "navigation must not discard either edit");
+        // The file/display order may change without changing which arrangement the step belongs to.
+        s.project.arrangements.swap(0, 1);
+        assert_eq!(undo(s).as_deref(), Some("Edit B"));
+        assert_eq!(s.project.arrangement().unwrap().number, 1);
+        assert_eq!(crate::playlist::clips(s)[0].position, 128);
+        assert_eq!(s.playlist.sel, [0]);
+        assert_eq!(undo(s).as_deref(), Some("Edit A"));
+        assert_eq!(s.project.arrangement().unwrap().number, 0);
+        assert_eq!(crate::playlist::clips(s)[0].position, 0);
+        crate::playlist::show_arrangement(s, 1);
+        assert_eq!(redo(s).as_deref(), Some("Edit A"));
+        assert_eq!(s.project.arrangement().unwrap().number, 0);
+        assert_eq!(crate::playlist::clips(s)[0].position, 100);
+        assert_eq!(redo(s).as_deref(), Some("Edit B"));
+        assert_eq!(s.project.arrangement().unwrap().number, 1);
+        assert_eq!(crate::playlist::clips(s)[0].position, 200);
+        assert_eq!(s.playlist.sel, [0]);
+    }
+
+    #[test]
+    fn a_stale_playlist_step_cannot_target_a_reused_arrangement_number() {
+        let mut app = App::new(None);
+        let s = &mut app.state;
+        crate::playlist::snapshot(s);
+        let old = s.project.arrangement().unwrap().id.0;
+        let number = s.project.arrangement().unwrap().number;
+        let mut replacement = os_flp::project::default_arrangement();
+        replacement.number = number;
+        replacement.name = Some("A different arrangement".into());
+        s.project.arrangements = vec![replacement];
+        s.control.settle(&mut s.project);
+        assert_ne!(s.project.arrangement().unwrap().id.0, old);
+        let before = s.project.clone();
+        undo(s);
+        assert_eq!(s.project, before);
     }
 
     /// Two recorded edits: undo and redo swap them back and forth; a new action drops the undone branch; past

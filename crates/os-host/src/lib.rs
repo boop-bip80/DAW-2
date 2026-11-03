@@ -15,7 +15,8 @@
 //! A `SharedPlugin` coerces to `os_engine::SharedInstrument` / `SharedEffect` (`plugin.clone() as SharedInstrument`).
 //!
 //! Crashes (all formats): every instance is created as a [`Guarded`] one ([`share`]), whose calls run under the crash
-//! guard ([`guard`]). A plugin whose code crashes is stopped and Lemon Studio keeps running.
+//! guard where supported ([`guard`]). Unix hosts run plugins in process without native-fault containment; recovering
+//! from a plugin's memory fault requires restarting and reopening a saved/recovery project.
 // spec: plugins/plugin-formats.md (hosting inside Lemon Studio), plugins/vst3-hosting.md
 
 #[cfg(target_os = "macos")]
@@ -23,11 +24,13 @@ pub mod bundle;
 pub mod guard;
 mod guarded;
 mod meter;
+mod param_order;
 #[cfg(unix)]
 pub mod runloop;
 
 pub use guarded::{share, Guarded};
 pub use meter::{Attention, Meter};
+pub use param_order::ParamOrder;
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -257,6 +260,18 @@ pub trait Plugin: Instrument + HostedEffect + Send {
 
     /// Number of parameters.
     fn param_count(&self) -> usize {
+        0
+    }
+    /// Stable parameter IDs in automation-index order, including absent parameters retained as tombstones.
+    fn parameter_ids(&self) -> Vec<u32> {
+        (0..self.param_count()).map(|i| self.param_info(i).map_or(u32::MAX, |p| p.id)).collect()
+    }
+    /// Restores a project's automation-index order. Formats with fixed indices accept only their existing order.
+    fn restore_parameter_ids(&mut self, ids: &[u32]) -> bool {
+        ids == self.parameter_ids()
+    }
+    /// Changes when parameter metadata or the ID mapping changes, even if the count stays the same.
+    fn param_revision(&self) -> u64 {
         0
     }
     /// Parameter `index` (0..param_count).

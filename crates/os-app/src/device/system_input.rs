@@ -13,7 +13,7 @@
 //! What the device is (its name and channels) is asked off the UI thread and kept a few seconds (`info`): asking the
 //! sound server takes a while, and the mixer asks on every repaint.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,13 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache { found: None, at: None, asking: f
 
 /// Set by `forget`: an input that failed to open is tried again (`OutputDevice::sync_inputs`).
 static RETRY: AtomicBool = AtomicBool::new(false);
+
+/// Additional input delay from the causal sample-rate converter, in output frames.
+static CONVERSION_DELAY: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn conversion_delay() -> u64 {
+    CONVERSION_DELAY.load(Ordering::Acquire)
+}
 
 /// Another input device was chosen: what was found is dropped and the device is asked again.
 pub fn forget() {
@@ -115,6 +122,7 @@ impl Drop for SystemInput {
     fn drop(&mut self) {
         drop(self.stream.take());
         input_ring().open(0, 0);
+        CONVERSION_DELAY.store(0, Ordering::Release);
         if self.alsa {
             super::heal_sound_server();
         }
@@ -162,9 +170,13 @@ pub fn open(cfg: &AudioCfg, rate: u32, block: Option<u32>) -> Result<SystemInput
         config.buffer_size = BufferSize::Default;
         stream = build_any(&device, format, &config, rate, failed.clone());
     }
-    let stream = stream.inspect_err(|_| input_ring().open(0, 0))?;
+    let stream = stream.inspect_err(|_| {
+        input_ring().open(0, 0);
+        CONVERSION_DELAY.store(0, Ordering::Release);
+    })?;
     stream.play().map_err(|e| {
         input_ring().open(0, 0);
+        CONVERSION_DELAY.store(0, Ordering::Release);
         e.to_string()
     })?;
     Ok(SystemInput { stream: Some(stream), name, failed, alsa: host.id().name() == "ALSA" })
@@ -189,7 +201,8 @@ where
 {
     let device_ch = usize::from(config.channels).max(1);
     let ch = device_ch.min(INPUT_CHANNELS);
-    let mut resample = Resampler::new(config.sample_rate, rate, ch);
+    let mut resample = Resampler::new(config.sample_rate, rate, ch)?;
+    CONVERSION_DELAY.store(resample.as_ref().map_or(0, Resampler::delay), Ordering::Release);
     device
         .build_input_stream::<T, _, _>(
             config.clone(),
@@ -199,8 +212,10 @@ where
                 match resample.as_mut() {
                     None => input_ring().push(frames, at),
                     Some(r) => {
-                        let out = r.run(frames, at);
-                        input_ring().push(out.len() / ch, |c, f| out[f * ch + c]);
+                        // Chunked publication must still report the complete callback's burst to the ring reader.
+                        let burst = (frames as u128 * u128::from(r.to)).div_ceil(u128::from(r.from)).min(usize::MAX as u128) as usize;
+                        input_ring().block.fetch_max(burst, Ordering::Relaxed);
+                        r.run(frames, at, |out| input_ring().push(out.len() / ch, |c, f| out[f * ch + c]));
                     }
                 }
             },
@@ -219,53 +234,100 @@ where
         .map_err(|e| e.to_string())
 }
 
-/// Linear resampling from the device's rate to the output's, block by block (`None` when they are the same).
+/// Streaming low-pass, windowed-sinc conversion. The kernel is calculated off the callback, widened for
+/// downsampling, and delayed until its future input exists. Fixed history/output storage bounds callback memory
+/// regardless of callback size. Rational phase accumulation avoids drift and makes chunk boundaries irrelevant.
+/// Qualified rates are 8..384 kHz, with a pass band through 80% of the lower Nyquist frequency; the transition band
+/// is intentional. At equal rates the converter is bypassed without adding delay.
 struct Resampler {
-    /// Input frames per output frame.
-    step: f64,
-    /// Where the next output frame falls, in input frames from the start of the next block (-1 ..= 0: between the
-    /// previous block's last frame and this one's first).
-    pos: f64,
+    from: u32,
+    to: u32,
+    /// Integer and fractional input-frame position of the next output sample (fraction in units of `to`).
+    next: u64,
+    fraction: u64,
+    seen: u64,
+    half: usize,
     ch: usize,
-    last: Vec<f32>,
+    history: Vec<f32>,
+    kernels: Vec<f32>,
     out: Vec<f32>,
 }
 
+const PHASES: usize = 1024;
+const OUTPUT_CHUNK: usize = 256;
+
 impl Resampler {
-    fn new(from: u32, to: u32, ch: usize) -> Option<Resampler> {
-        (from != to && from > 0 && to > 0).then(|| Resampler {
-            step: f64::from(from) / f64::from(to),
-            pos: 0.0,
-            ch,
-            last: vec![0.0; ch],
-            // Room for long blocks made now, not in the callback.
-            out: Vec::with_capacity(ch * 32768),
-        })
+    fn new(from: u32, to: u32, ch: usize) -> Result<Option<Resampler>, String> {
+        if !(8000..=384000).contains(&from) || !(8000..=384000).contains(&to) || !(1..=INPUT_CHANNELS).contains(&ch) {
+            return Err("input conversion supports 8–384 kHz and 1–8 channels".into());
+        }
+        if from == to {
+            return Ok(None);
+        }
+        // Reserve a transition band below Nyquist, rather than aliasing frequencies at the destination's edge.
+        let ratio = (f64::from(from) / f64::from(to)).max(1.0) / 0.90;
+        let half = (64.0 * ratio).ceil() as usize;
+        let taps = 2 * half;
+        let mut kernels = vec![0.0; (PHASES + 1) * taps];
+        for phase in 0..=PHASES {
+            let row = &mut kernels[phase * taps..(phase + 1) * taps];
+            os_dsp::resample::weights(phase as f64 / PHASES as f64, ratio, half, os_dsp::resample::Quality::Exact, row);
+            let sum: f64 = row.iter().map(|&v| f64::from(v)).sum();
+            for v in row {
+                *v = (f64::from(*v) / sum) as f32;
+            }
+        }
+        Ok(Some(Resampler { from, to, next: 0, fraction: 0, seen: 0, half, ch,
+            history: vec![0.0; (taps + 1) * ch], kernels, out: vec![0.0; OUTPUT_CHUNK * ch] }))
     }
 
-    /// The output frames of a block of `frames` input frames, `at(channel, frame)` an input sample (interleaved).
-    fn run(&mut self, frames: usize, at: impl Fn(usize, usize) -> f32) -> &[f32] {
-        self.out.clear();
-        if frames == 0 {
-            return &self.out;
-        }
-        let sample = |s: &Self, c: usize, i: isize| if i < 0 { s.last[c] } else { at(c, i as usize) };
-        while self.pos <= (frames - 1) as f64 {
-            let i = self.pos.floor();
-            let t = (self.pos - i) as f32;
-            let i = i as isize;
+    fn delay(&self) -> u64 {
+        (self.half as u64 * u64::from(self.to)).div_ceil(u64::from(self.from))
+    }
+
+    /// Emit interleaved chunks without allocating or resizing. Empty and arbitrary-sized input blocks are valid.
+    fn run(&mut self, frames: usize, at: impl Fn(usize, usize) -> f32, mut emit: impl FnMut(&[f32])) {
+        let taps = 2 * self.half;
+        let history_frames = taps + 1;
+        let mut filled = 0;
+        for f in 0..frames {
+            let base = self.seen as usize % history_frames * self.ch;
             for c in 0..self.ch {
-                let a = sample(self, c, i);
-                let b = if i + 1 < frames as isize { sample(self, c, i + 1) } else { a };
-                self.out.push(a + (b - a) * t);
+                self.history[base + c] = at(c, f);
             }
-            self.pos += self.step;
+            self.seen += 1;
+            while self.next + (self.half as u64) < self.seen {
+                let phase = self.fraction as f64 * PHASES as f64 / f64::from(self.to);
+                let index = (phase as usize).min(PHASES - 1);
+                let blend = (phase - index as f64) as f32;
+                let a = &self.kernels[index * taps..(index + 1) * taps];
+                let b = &self.kernels[(index + 1) * taps..(index + 2) * taps];
+                let first = self.next as i64 - self.half as i64 + 1;
+                self.out[filled..filled + self.ch].fill(0.0);
+                for k in 0..taps {
+                    let source = first + k as i64;
+                    if source < 0 {
+                        continue; // Silence before the stream began.
+                    }
+                    let weight = a[k] + (b[k] - a[k]) * blend;
+                    let base = source as usize % history_frames * self.ch;
+                    for c in 0..self.ch {
+                        self.out[filled + c] += self.history[base + c] * weight;
+                    }
+                }
+                filled += self.ch;
+                if filled == self.out.len() {
+                    emit(&self.out);
+                    filled = 0;
+                }
+                self.fraction += u64::from(self.from);
+                self.next += self.fraction / u64::from(self.to);
+                self.fraction %= u64::from(self.to);
+            }
         }
-        self.pos -= frames as f64;
-        for c in 0..self.ch {
-            self.last[c] = at(c, frames - 1);
+        if filled > 0 {
+            emit(&self.out[..filled]);
         }
-        &self.out
     }
 }
 
@@ -273,23 +335,69 @@ impl Resampler {
 mod tests {
     use super::*;
 
-    /// A ramp at 44.1 kHz comes out at 48 kHz as the same ramp, blocks joined without a seam.
-    #[test]
-    fn resampling_keeps_a_ramp_straight_across_blocks() {
-        let mut r = Resampler::new(44100, 48000, 1).expect("rates differ");
+    fn convert(from: u32, to: u32, frames: usize, blocks: &[usize], at: impl Fn(usize, usize) -> f32) -> Vec<f32> {
+        let mut r = Resampler::new(from, to, 2).unwrap().unwrap();
+        let storage = (r.history.as_ptr(), r.out.as_ptr(), r.kernels.as_ptr());
+        let capacity = (r.history.capacity(), r.out.capacity(), r.kernels.capacity());
         let mut got = Vec::new();
-        let mut n = 0usize;
-        for block in [441usize, 100, 1, 512, 300] {
-            let start = n;
-            got.extend_from_slice(r.run(block, |_, f| (start + f) as f32));
-            n += block;
+        let mut start = 0;
+        for &block in blocks.iter().cycle() {
+            let n = block.min(frames - start);
+            r.run(n, |c, f| at(c, start + f), |out| {
+                assert!(out.len() <= 2 * OUTPUT_CHUNK);
+                got.extend_from_slice(out);
+            });
+            start += n;
+            if start == frames {
+                break;
+            }
         }
-        let step = 44100.0 / 48000.0;
-        for (k, v) in got.iter().enumerate() {
-            assert!((v - (k as f64 * step) as f32).abs() < 1e-3, "frame {k}: {v}");
+        assert_eq!((r.history.as_ptr(), r.out.as_ptr(), r.kernels.as_ptr()), storage);
+        assert_eq!((r.history.capacity(), r.out.capacity(), r.kernels.capacity()), capacity);
+        let expected = ((frames.saturating_sub(r.half) as u64 * u64::from(to)).div_ceil(u64::from(from))) as usize;
+        assert_eq!(got.len() / 2, expected, "the filter's stated delay accounts for the unreturned tail");
+        got
+    }
+
+    #[test]
+    fn resampling_is_independent_of_callback_boundaries_and_bounded() {
+        for (from, to) in [(44100, 48000), (96000, 48000), (48000, 44100)] {
+            let signal = |c, f: usize| ((f as f64 * 0.013 + c as f64).sin() * 0.8) as f32;
+            let whole = convert(from, to, 40000, &[40000], signal);
+            let split = convert(from, to, 40000, &[1, 0, 17, 441, 100, 512, 300], signal);
+            assert_eq!(whole, split, "{from} -> {to}");
         }
-        let expected = (n as f64 / step) as usize;
-        assert!(got.len().abs_diff(expected) <= 1, "{} frames for {n} in", got.len());
-        assert!(Resampler::new(48000, 48000, 2).is_none());
+        assert!(Resampler::new(48000, 48000, 2).unwrap().is_none());
+        assert!(Resampler::new(0, 48000, 2).is_err());
+        assert!(Resampler::new(384001, 48000, 2).is_err());
+    }
+
+    #[test]
+    fn downsampling_rejects_aliases_and_preserves_the_pass_band() {
+        for (from, to) in [(96000, 48000), (192000, 44100), (48000, 44100)] {
+            let frequency = f64::from(to) * 0.40; // 80% of destination Nyquist.
+            let alias_frequency = (f64::from(to) * 0.625).min(f64::from(from) * 0.49);
+            let got = convert(from, to, from as usize / 5, &[73, 511, 1, 2048], |c, f| {
+                let hz = if c == 0 { frequency } else { alias_frequency };
+                (2.0 * std::f64::consts::PI * hz * f as f64 / f64::from(from)).sin() as f32
+            });
+            let valid = &got[2048..]; // Exclude the finite zero-padded start transient.
+            let rms = |channel| (valid.chunks_exact(2).map(|v| f64::from(v[channel]).powi(2)).sum::<f64>() / (valid.len() / 2) as f64).sqrt();
+            let pass = rms(0);
+            let rejected = rms(1);
+            assert!((pass - std::f64::consts::FRAC_1_SQRT_2).abs() < 0.004, "{from} -> {to}: pass-band RMS {pass}");
+            assert!(rejected < 0.0007, "{from} -> {to}: alias RMS {rejected}, expected more than 60 dB rejection");
+        }
+    }
+
+    #[test]
+    fn a_constant_input_has_unity_gain_and_the_delay_is_reported() {
+        let r = Resampler::new(44100, 48000, 2).unwrap().unwrap();
+        assert_eq!(r.delay(), (r.half as u64 * 48000).div_ceil(44100));
+        let got = convert(44100, 48000, 10000, &[7, 441, 1], |c, _| if c == 0 { 0.25 } else { -0.75 });
+        for sample in got[1024..].chunks_exact(2) {
+            assert!((sample[0] - 0.25).abs() < 2e-6);
+            assert!((sample[1] + 0.75).abs() < 2e-6);
+        }
     }
 }

@@ -201,6 +201,9 @@ impl App {
                 }
             }
         };
+        if !made.is_empty() && !errors.is_empty() {
+            msg.push_str(&format!("; {} track(s) failed: {}", errors.len(), errors.join("; ")));
+        }
         if lost > 0 {
             msg = format!("{msg} ({lost} frames were lost: the disk was too slow)");
         }

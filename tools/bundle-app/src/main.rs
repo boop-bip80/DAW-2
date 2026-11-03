@@ -3,7 +3,7 @@
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
 //! `cargo run -p bundle-app [-- --install]` (macOS): builds Lemon Studio in release mode and writes
-//! `<target>/bundled/Lemon Studio.app`: the program, its icon and an `Info.plist` that lets the Finder open `.flp`
+//! `<target>/bundled/Lemon Studio.app`: the program, its icon and an `Info.plist` that lets the Finder open `.lemon` and `.flp`
 //! projects with it and says why it uses the microphone (without that, macOS does not let an app hear its audio
 //! inputs: the mixer tracks' inputs and audio recording). The icon is made from the Icon Composer document
 //! `assets/logo/macOS.icon` by `tools/logo/macos-icon.sh`: `assets/lemonstudio.car` (the bundle's `Assets.car`) is the
@@ -30,7 +30,7 @@ fn main() {
     let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("target"));
     let target = if target.is_relative() { root.join(target) } else { target };
     let ok = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .args(["build", "--release", "--bin", EXE, "-p", "os-app"])
+        .args(["build", "--release", "--locked", "--bin", EXE, "-p", "os-app"])
         .current_dir(&root)
         .env("CARGO_TARGET_DIR", &target)
         .status()
@@ -52,6 +52,11 @@ fn main() {
     let assets = root.join("crates/os-app/assets");
     std::fs::copy(assets.join(format!("{EXE}.car")), resources.join("Assets.car")).expect("copy the icon");
     std::fs::copy(assets.join(format!("{EXE}.icns")), resources.join(format!("{EXE}.icns"))).expect("copy the icon");
+    // A standalone `.app` must retain the license and the complete notices even if moved out of an archive.
+    // Copy these before codesign so the resource seal covers them.
+    for name in ["LICENSE", "THIRD-PARTY-NOTICES.txt"] {
+        std::fs::copy(root.join(name), resources.join(name)).unwrap_or_else(|e| panic!("copy {name}: {e}"));
+    }
     run(Command::new("codesign").args(["--force", "--sign", "-"]).arg(&app), "codesign");
     println!("{}", app.display());
 
@@ -109,6 +114,18 @@ fn info_plist() -> String {
 	<string>Lemon Studio records and monitors your audio inputs on its mixer tracks.</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Lemon Studio project</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>lemon</string>
+			</array>
+		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
 			<string>FL Studio project</string>

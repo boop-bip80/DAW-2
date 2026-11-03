@@ -94,7 +94,8 @@ thread_local! {
 
 /// The first `Project_N` (N from 1) that names nothing in `root`, as a folder or as a project file.
 pub fn free_name(root: &Path) -> String {
-    let taken = |n: &str| !root.as_os_str().is_empty() && (root.join(n).exists() || root.join(format!("{n}.flp")).exists());
+    let taken = |n: &str| !root.as_os_str().is_empty()
+        && (root.join(n).exists() || crate::project_files::PROJECT_EXTS.iter().any(|ext| root.join(format!("{n}.{ext}")).exists()));
     (1u32..).map(|n| format!("Project_{n}")).find(|n| !taken(n)).expect("a free name")
 }
 
@@ -176,9 +177,9 @@ impl SaveForm {
         if self.new_folder { self.root.join(self.name.text.trim()) } else { self.root.clone() }
     }
 
-    /// The project's file: `<folder>/<name>.flp`.
+    /// The native project file: `<folder>/<name>.lemon`.
     pub fn file(&self) -> PathBuf {
-        self.folder().join(format!("{}.flp", self.name.text.trim()))
+        self.folder().join(format!("{}.{}", self.name.text.trim(), crate::project_files::EXT))
     }
 
     /// Location's text: the folder with a trailing separator (nothing without a root).
@@ -389,7 +390,7 @@ impl App {
 
     /// Save / Create (spec §7): the folder is made, the form's information (and New project's time settings) go into
     /// the project, the samples it uses are copied to `<folder>/Samples` while Copy is ticked, event 202 names the
-    /// folder (the Data folder choice stays as it was), and the project is saved as `<folder>/<name>.flp`. The root
+    /// folder (the Data folder choice stays as it was), and the project is saved as `<folder>/<name>.lemon`. The root
     /// folder, Copy and Move are kept for the next form.
     fn save_form_save(&mut self, f: SaveForm) {
         prefs::set_text(ROOT_KEY, &f.root.to_string_lossy());
@@ -414,12 +415,35 @@ impl App {
             self.set_timebase(f.ppq);
             self.set_bar(f.num, 16 / f.den.max(1));
         }
-        if f.copy {
-            self.state.message = Some(self.copy_used_samples_to(&dir));
-        }
-        self.state.project.data_folder.get_or_insert_with(DataFolder::default).folder = df::folder_text(&dir);
+        let before = self.state.project.clone();
+        let change = if f.copy {
+            match self.collect_assets_to(&dir) {
+                Ok(change) => Some(change),
+                Err(e) => {
+                    self.state.message = Some(format!("Save stopped: {e}"));
+                    return self.dialog_done(Then::SaveProject(f.next), Reply::File(None));
+                }
+            }
+        } else { None };
+        let data = self.state.project.data_folder.get_or_insert_with(DataFolder::default);
+        data.folder = df::folder_text(&dir);
+        if f.copy { data.choice = DataFolder::RELATIVE; }
         let file = f.file();
-        self.dialog_done(Then::SaveProject(f.next), Reply::File(Some(file)));
+        match self.save_to_result(file) {
+            Ok(_) => {
+                crate::assets::collection_notice(self, change.as_ref());
+                crate::missing::apply(self);
+                if let Some(next) = f.next { self.go_on_if_saved(next); }
+            }
+            Err(e) => {
+                let restored = change.map(|c| c.rollback(self)).transpose();
+                self.state.project = before;
+                crate::missing::apply(self);
+                let detail = restored.err().map_or_else(String::new, |e| format!("; {e}"));
+                self.state.message = Some(format!("Save failed: {e}{detail}; the original sample paths were retained"));
+                self.dialog_done(Then::SaveProject(f.next), Reply::File(None));
+            }
+        }
         df::reread(&self.state);
     }
 }
@@ -470,9 +494,104 @@ mod tests {
         prefs::set_choice(&prefs::ASK_DATA_FOLDER, 3);
     }
 
+    #[test]
+    fn automatic_names_avoid_native_legacy_and_folder_collisions() {
+        let dir = scratch("native_names");
+        std::fs::write(dir.join("Project_1.lemon"), b"native").unwrap();
+        std::fs::write(dir.join("Project_2.flp"), b"import").unwrap();
+        std::fs::create_dir(dir.join("Project_3")).unwrap();
+        assert_eq!(free_name(&dir), "Project_4");
+        let app = App::new(None);
+        let mut f = SaveForm::new(false, &app.state, None);
+        f.root = dir.clone();
+        f.new_folder = false;
+        f.name.set("Song.v2");
+        assert_eq!(f.file(), dir.join("Song.v2.lemon"), "a dot in the name is retained");
+        done(&dir);
+    }
+
+    /// Exercise the user-facing save entry points with every native state family and audible EQ settings. Each
+    /// stage is reopened before the next save, so settings surviving only in the live app cannot hide data loss.
+    #[test]
+    fn native_state_survives_first_save_save_as_rename_and_data_folder_save() {
+        use crate::icons::Icon;
+        use crate::playlist::IconOwner;
+
+        fn reopen(app: App) -> App {
+            let path = app.state.path.clone().expect("saved project");
+            assert_eq!(path.extension().and_then(|e| e.to_str()), Some(crate::project_files::EXT));
+            let file = os_flp::FlpFile::parse(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(os_flp::lemon::is_lemon(&file));
+            assert!(!app.unsaved());
+            let native = crate::lemon_state::saved_form(&app.state, &app.plugins);
+            let mixer = app.state.project.mixer.clone();
+            let back = App::new(Some(path));
+            assert_eq!(crate::lemon_state::saved_form(&back.state, &back.plugins), native);
+            assert_eq!(back.state.project.mixer, mixer);
+            assert!(!back.unsaved());
+            back
+        }
+
+        let dir = scratch("native_entry_points");
+        prefs::set_choice(&prefs::ASK_DATA_FOLDER, 3);
+        prefs::set_check(&prefs::COPY_USED_SAMPLES, false);
+        let mut app = App::new(None);
+        app.state.project = crate::app::test_project();
+        app.state.control.settle(&mut app.state.project);
+        let s = &mut app.state;
+        let ch = s.project.channels[1].id.0;
+        s.playlist.icons.insert(IconOwner::Channel(ch), Icon::Mic);
+        s.playlist.icons.insert(IconOwner::Track(2), Icon::Star);
+        s.playlist.icons.insert(IconOwner::Slot(2, 1), Icon::Plug);
+        s.mixer.slot_names.insert((2, 1), "Native name ✓".into());
+        s.mixer.slot_colors.insert((2, 0), os_model::Rgb::new(10, 200, 30));
+        s.playlist.perf_clip_progress = false;
+        s.playlist.perf_track_progress = true;
+        s.playlist.perf_plus_scene = true;
+        s.playlist.perf_velocity_subclips = false;
+        s.project.pdc_off = true;
+        s.mixer.waveforms = true;
+        s.mixer.extra = false;
+        s.rack.wave_preview.insert(ch);
+        s.rack.through_off.insert(s.project.channels[2].id.0);
+        s.rack.note_lock = [Some(3), Some(1)];
+        if s.project.arrangements.is_empty() {
+            s.project.arrangements.push(os_flp::project::default_arrangement());
+        }
+        s.project.arrangements[0].tracks[3].clip_lock = Some(os_model::ClipSource::Pattern(1));
+        s.project.arrangements[0].tracks[4].clip_lock = Some(os_model::ClipSource::Channel(0));
+        s.project.mixer[2].eq = [[900, 6000, 18000], [-600, 32000, 22000], [300, 54000, 14000]];
+        app.plugins.editor_scales.insert(0, 1.5);
+        app.plugins.editor_scales.insert(crate::plugins::fx_key(3, 2), 1.25);
+
+        app.act(Action::MenuItem(0, crate::views::menus::FILE_SAVE));
+        assert!(form(&app).is_some(), "default first Save uses the form");
+        click(&mut app, FHit::Main);
+        let mut app = reopen(app);
+
+        let save_as = dir.join("Save-as.lemon");
+        crate::dialog::fake::answer(Some(save_as.clone()));
+        app.act(Action::MenuItem(0, crate::views::menus::FILE_SAVE_AS));
+        assert_eq!(app.state.path, Some(save_as.clone()));
+        let mut app = reopen(app);
+
+        app.rename_project("Renamed", None);
+        assert!(!save_as.exists());
+        assert_eq!(app.state.path, Some(dir.join("Renamed.lemon")));
+        let mut app = reopen(app);
+
+        let folder = dir.join("Other-folder");
+        std::fs::create_dir(&folder).unwrap();
+        app.data_folder_done(df::DThen::Changed(folder.clone()), Reply::Button(Answer::Yes));
+        assert_eq!(app.state.path, Some(folder.join("Renamed.lemon")));
+        assert!(dir.join("Renamed.lemon").is_file());
+        let _ = reopen(app);
+        done(&dir);
+    }
+
     /// Save on a project never saved (the default, When saving unsaved projects only): the Save as form, named the next
     /// free Project_N in the user's projects folder, Create new project folder ticked, Location the folder it makes.
-    /// Save makes `<root>/Project_1/Project_1.flp`, copies the samples to its Samples folder, 202 names the folder and
+    /// Save makes `<root>/Project_1/Project_1.lemon`, copies the samples to its Samples folder, 202 names the folder and
     /// 167 stays 0; the next form offers Project_2, the remembered root and Copy as left. A saved project's Save as is
     /// the file dialog.
     #[test]
@@ -496,13 +615,15 @@ mod tests {
         click(&mut app, FHit::Main);
         assert!(app.state.dialogs.is_empty(), "saved");
         let folder = root.join("Project_1");
-        let file = folder.join("Project_1.flp");
+        let file = folder.join("Project_1.lemon");
         let copy = folder.join(df::SAMPLES_DIR).join("kick.wav");
         assert_eq!(app.state.path, Some(file.clone()));
         assert!(file.is_file() && copy.is_file());
         let opened = App::new(Some(file.clone()));
-        assert_eq!(opened.state.project.channels[0].sample_path.as_deref(), Some(copy.to_string_lossy().as_ref()));
-        assert_eq!(opened.state.project.data_folder, Some(DataFolder { choice: DataFolder::NONE, folder: df::folder_text(&folder) }));
+        assert_eq!(opened.state.project.channels[0].sample_path.as_deref(), Some("Samples/kick.wav"), "saved sample references are portable");
+        assert_eq!(crate::plugins::resolve_sample("Samples/kick.wav"), copy.to_string_lossy(), "the opened project's search folder resolves the portable reference");
+        assert_eq!(opened.state.project.data_folder, Some(DataFolder { choice: DataFolder::RELATIVE, folder: df::folder_text(&folder) }),
+            "Copy used samples makes portable relative references, so the saved data folder must be relative");
         // A new project: the form remembers the root and Copy, and offers the next free name.
         let mut other = App::new(None);
         other.act(Action::MenuItem(0, crate::views::menus::FILE_SAVE_AS));
@@ -526,7 +647,7 @@ mod tests {
         let dir = scratch("names");
         let root = dir.join("Projects");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("Taken.flp"), b"x").unwrap();
+        std::fs::write(root.join("Taken.lemon"), b"x").unwrap();
         let mut app = App::new(None);
         app.open_save_form(None);
         type_text(&mut app, "a/b");
@@ -539,7 +660,7 @@ mod tests {
         type_text(&mut app, "Taken");
         click(&mut app, FHit::Check(0));
         click(&mut app, FHit::Main);
-        assert!(app.top_message().is_some_and(|m| m.1.contains("Taken.flp already exists")));
+        assert!(app.top_message().is_some_and(|m| m.1.contains("Taken.lemon already exists")));
         app.dialog_click(DHit::Button(0));
         // The Information group: folded, its fields do not take the keys; unfolded, Tab goes through them.
         click(&mut app, FHit::Field(1));
@@ -557,7 +678,7 @@ mod tests {
         type_text(&mut app, "Song");
         app.dialog_key(&Key::Named(NamedKey::Enter), false, false);
         assert!(app.state.dialogs.is_empty());
-        assert_eq!(app.state.path, Some(root.join("Song.flp")), "into the root");
+        assert_eq!(app.state.path, Some(root.join("Song.lemon")), "into the root");
         let info = &app.state.project.info;
         assert_eq!((info.title.as_deref(), info.author.as_deref(), info.url.as_deref(), info.genre.as_deref()), (Some("My song"), Some("Me"), None, Some("Lo-fi")));
         done(&dir);
@@ -632,7 +753,7 @@ mod tests {
         click(&mut app, FHit::Main);
         assert!(app.state.dialogs.is_empty());
         assert_eq!((app.state.project.ppq, app.state.project.bar()), (192, (3, 2)));
-        let file = dir.join("Projects").join("Project_1").join("Project_1.flp");
+        let file = dir.join("Projects").join("Project_1").join("Project_1.lemon");
         assert_eq!(app.state.path, Some(file.clone()));
         assert!(!app.unsaved());
         done(&dir);

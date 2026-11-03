@@ -597,6 +597,71 @@ mod separate {
     }
 
     #[test]
+    fn saved_parameter_ids_survive_reordered_plugin_enumeration() {
+        let probe = Arc::new(Probe::default());
+        let (_m, p) = instance(&probe);
+        let saved = p.save_state().unwrap();
+        drop(p);
+        probe.reorder.store(true, Ordering::Release);
+        let (_m, mut p) = instance(&probe);
+        assert_eq!(p.param_info(0).unwrap().id, MODE, "the new plugin enumerates Mode first");
+        assert!(p.load_state(&saved));
+        assert_eq!(p.parameter_ids(), [GAIN, MODE, PEAK]);
+        assert_eq!(p.param_info(0).unwrap().id, GAIN);
+        assert!(p.activate(48000));
+        p.param_fx(0, 0, 0.25);
+        let (mut l, mut r) = ones(32);
+        p.process_fx(48000, &mut l, &mut r);
+        assert_eq!(l[0], 0.5, "old position zero still automates Gain");
+        let revision = p.param_revision();
+        probe.reorder.store(false, Ordering::Release);
+        probe.controller().restart(PARAM_TITLES_CHANGED);
+        p.idle();
+        assert_eq!(p.parameter_ids(), [GAIN, MODE, PEAK]);
+        assert_ne!(p.param_revision(), revision);
+        assert_eq!(fl_state::FlState::parse(&p.save_state().unwrap()).unwrap().params, [GAIN, MODE, PEAK]);
+    }
+
+    #[test]
+    fn controller_state_failures_are_not_replaced_by_empty_success() {
+        let probe = Arc::new(Probe::default());
+        let (_m, mut p) = instance(&probe);
+        let saved = p.save_state().unwrap();
+        probe.reject_controller_save.store(true, Ordering::Release);
+        assert!(p.save_state().is_none());
+        probe.reject_controller_save.store(false, Ordering::Release);
+        probe.reject_controller_load.store(true, Ordering::Release);
+        assert!(!p.load_state(&saved));
+    }
+
+    #[test]
+    fn offline_mode_is_set_up_and_restored_before_live_processing() {
+        let probe = Arc::new(Probe::default());
+        let (_m, mut p) = instance(&probe);
+        assert!(p.activate(48000));
+        let (mut l, mut r) = ones(32);
+        p.process_fx(48000, &mut l, &mut r);
+        p.set_offline(true);
+        p.process_fx(48000, &mut l, &mut r);
+        // This is also the cancellation restoration path: no completed render is required before returning live.
+        p.set_offline(false);
+        p.process_fx(48000, &mut l, &mut r);
+        assert_eq!(*probe.setup_modes.lock().unwrap(), [0, 2, 0]);
+        assert_eq!(*probe.process_modes.lock().unwrap(), [0, 2, 0]);
+        assert_eq!(probe.logged("comp.set_active"), ["comp.set_active 1", "comp.set_active 0", "comp.set_active 1", "comp.set_active 0", "comp.set_active 1"]);
+    }
+
+    #[test]
+    fn midi_controller_mapping_preserves_the_source_channel() {
+        let probe = Arc::new(Probe::default());
+        let (_m, mut p) = instance(&probe);
+        p.midi(11, [0xB0, 7, 127]);
+        p.midi(23, [0xB3, 7, 0]);
+        p.midi(31, [0xB9, 7, 64]);
+        assert_eq!(p.auto, [(11, GAIN, 1.0), (23, MODE, 0.0)], "an unmapped channel must not fall back to channel one");
+    }
+
+    #[test]
     fn restart_requests_are_handled_on_idle() {
         let probe = Arc::new(Probe::default());
         let (_m, mut p) = instance(&probe);
@@ -1154,4 +1219,7 @@ fn notes_go_on_their_midi_channel() {
     unsafe {
         assert_eq!((on.event.note_on.channel, off.event.note_off.channel, plain.event.note_on.channel), (3, 3, 0));
     }
+    ids.event(Note { time: 0, kind: NoteKind::On, key: 60, velocity: 1.0, ch: 7 }).unwrap();
+    let explicit = ids.event(Note { time: 9, kind: NoteKind::OffChannel, key: 60, velocity: 0.0, ch: 3 }).unwrap();
+    unsafe { assert_eq!(explicit.event.note_off.channel, 3, "an end on channel four cannot target channel eight's same-pitch voice"); }
 }

@@ -45,6 +45,7 @@ pub struct Entry {
 pub struct List {
     pub plugin: Weak<Mutex<dyn os_host::Plugin>>,
     pub params: Vec<Entry>,
+    pub revision: u64,
     /// When `params_tick` last took the instance's events (`Hosted::due`).
     pub seen: crate::plugins::Look,
     /// The parameters' values as last read or sent by the plugin, by id: what an edit in the plugin's window moves
@@ -410,7 +411,8 @@ impl App {
             let t0 = std::time::Instant::now();
             let weak = Arc::downgrade(&h.plugin);
             let count = p.param_count();
-            let stale = ui.lists.get(&key).is_none_or(|l| l.params.len() != count || !Weak::ptr_eq(&l.plugin, &weak));
+            let revision = p.param_revision();
+            let stale = ui.lists.get(&key).is_none_or(|l| l.params.len() != count || l.revision != revision || !Weak::ptr_eq(&l.plugin, &weak));
             if stale {
                 let params: Vec<Entry> = (0..count)
                     .map(|i| match p.param_info(i) {
@@ -420,7 +422,12 @@ impl App {
                     .collect();
                 let values = read_values(&*p, &params);
                 let now = std::time::Instant::now();
-                ui.lists.insert(key, List { plugin: weak, params, seen: look, values, open: BTreeMap::new(), read_at: now, reread: false });
+                // A metadata rescan can arrive during an editor gesture. Retain that gesture's starting values
+                // for IDs still present so one rename/reorder does not lose the eventual undo step.
+                let open = ui.lists.get(&key).filter(|l| Weak::ptr_eq(&l.plugin, &weak)).map(|l| {
+                    l.open.iter().filter(|(id, _)| params.iter().any(|p| p.id == **id)).map(|(&id, &v)| (id, v)).collect()
+                }).unwrap_or_default();
+                ui.lists.insert(key, List { plugin: weak, params, revision, seen: look, values, open, read_at: now, reread: false });
             }
             let events = p.take_param_events();
             if let Some(l) = ui.lists.get_mut(&key) {
@@ -707,7 +714,7 @@ mod tests {
         assert_eq!(key_of(s, Target::ChannelParam(ch, 7)), Some((0, 7)));
         assert_eq!(key_of(s, Target::SlotParam(2, 3, 35)), Some((fx_key(2, 3), 35)));
         let cutoff = Entry { id: 9, name: "Cutoff".into(), hidden: false, default: 1.0, steps: 0 };
-        s.params.lists.insert(0, List { plugin: Weak::<Mutex<Dummy>>::new(), params: vec![cutoff], seen: crate::plugins::Look::never(), values: BTreeMap::new(), open: BTreeMap::new(), read_at: std::time::Instant::now(), reread: false });
+        s.params.lists.insert(0, List { plugin: Weak::<Mutex<Dummy>>::new(), params: vec![cutoff], revision: 0, seen: crate::plugins::Look::never(), values: BTreeMap::new(), open: BTreeMap::new(), read_at: std::time::Instant::now(), reread: false });
         assert_eq!(clip_name(s, 0, 0), "Lead - Cutoff");
         // Last tweaked keeps the two newest, newest first, without repeats.
         let p = &mut s.params;

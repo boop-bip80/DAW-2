@@ -621,6 +621,17 @@ impl ChannelState {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct InputHeld { channel: usize, key: u16, midi: u8, id: u64 }
+#[derive(Debug, Clone, Copy)]
+struct InputEvent { frame: u64, kind: InputKind }
+#[derive(Debug, Clone, Copy)]
+enum InputKind {
+    On { channel: usize, key: u16, velocity: u8, midi: u8, id: u64 },
+    Off { channel: usize, key: u16, midi: u8, id: u64 },
+    Midi { channel: usize, bytes: [u8; 3], bend_cents: f64 },
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Voice {
     channel: usize,
     pos: f64,
@@ -643,6 +654,11 @@ struct Voice {
     serial: u32,
     /// Key of a live note (`note_on`), which `note_off` releases.
     live: Option<u16>,
+    /// A live input instance; zero is the legacy typing/preview path.
+    input_id: u64,
+    /// Frames before a timestamped live note starts, and before its release is applied.
+    start_in: u32,
+    release_in: Option<u64>,
     /// Release fade after a live note off: (frames left, fade length).
     release: Option<(u32, u32)>,
     /// Frames played so far, and the age at which the note ended (the channel envelopes' clock).
@@ -1060,6 +1076,9 @@ pub struct Engine {
     awake: bool,
     /// The tail rule has ended the song: a tick at or after its end stayed quiet (spec: audio/timing.md).
     tail_done: bool,
+    /// Explicit fixed offline tail; None preserves the legacy first-quiet-tick rule.
+    tail_frames: Option<u64>,
+    tail_started: Option<u64>,
     /// Pause (`pause`): the channels fade out of the mixer and are then held where they are (`held`) while the mixer
     /// runs on; `resume` fades them back in. Frames left of the fade out / in, and the fades' length.
     held: bool,
@@ -1123,9 +1142,12 @@ pub struct Engine {
     next_voice: u32,
     /// Live notes for instrument channels waiting for the next tick (channel, key, velocity or -1 for an end, MIDI
     /// channel).
-    inst_live: Vec<(usize, u8, f32, u8)>,
+    inst_live: Vec<(usize, u8, f32, u8, u32)>,
+    input_events: Vec<InputEvent>,
+    input_held: Vec<InputHeld>,
+    note_rules: Vec<notes::Rules>,
     /// Controller messages for instrument channels waiting for the next tick (channel, message; `Engine::midi`).
-    inst_midi: Vec<(usize, [u8; 3])>,
+    inst_midi: Vec<(usize, [u8; 3], u32)>,
     inst_events: Vec<notes::Event>,
     /// Per instrument channel: the tuning its notes were last given (`InstTuning`).
     inst_tuning: Vec<InstTuning>,
@@ -1186,6 +1208,7 @@ pub struct Engine {
     /// Every mixer track's post-fader output, tick after tick, while capturing (`set_track_capture`; an export's Split
     /// mixer tracks).
     capture: Option<Vec<Vec<f32>>>,
+    capture_tracks: Vec<bool>,
     /// Disk recording: what the armed tracks take while the song plays goes here (`set_record_tap`).
     record: Option<std::sync::Arc<dyn RecordTap>>,
     /// Plugin delay compensation: the pads not kept with the tracks, the head of the stream skipped, the values
@@ -1638,6 +1661,8 @@ impl Engine {
             live_only: false,
             awake: false,
             tail_done: false,
+            tail_frames: None,
+            tail_started: None,
             held: false,
             count_in: 0,
             count_in_len: 0,
@@ -1672,6 +1697,9 @@ impl Engine {
             inst_shapes: Vec::new(),
             next_voice: 0,
             inst_live: Vec::with_capacity(64),
+            input_events: Vec::with_capacity(256),
+            input_held: Vec::with_capacity(128),
+            note_rules: Vec::with_capacity(128),
             inst_midi: Vec::with_capacity(64),
             inst_events: Vec::with_capacity(64),
             inst_tuning: Vec::new(),
@@ -1695,6 +1723,7 @@ impl Engine {
             insert_fx: true,
             master_fx: true,
             capture: None,
+            capture_tracks: Vec::new(),
             record: None,
             pdc,
             main_unity: main_volume == os_model::Project::MAIN_VOLUME_DEFAULT,
@@ -1831,7 +1860,7 @@ impl Engine {
         let Some(ch) = self.channels.get_mut(channel) else { return };
         if ch.instrument.0.is_some() {
             self.tail_done = false;
-            self.inst_midi.push((channel, bytes));
+            self.inst_midi.push((channel, bytes, 0));
             return;
         }
         if bytes[0] & 0xF0 == 0xE0 {
@@ -1853,7 +1882,7 @@ impl Engine {
         }
         let k = key.min(127) as u8;
         let ticks = (frames as f64 / self.clock.samples_per_tick()).ceil().max(1.0) as u64;
-        self.inst_live.push((channel, k, f32::from(velocity) / 128.0, 0));
+        self.inst_live.push((channel, k, f32::from(velocity) / 128.0, 0, 0));
         self.inst_offs.push((self.tick + ticks, channel, k, None));
         self.tail_done = false;
     }
@@ -1904,7 +1933,17 @@ impl Engine {
     /// Keeps every mixer track's post-fader output (before its sends) from now on: `take_track_audio` hands it over.
     pub fn set_track_capture(&mut self, on: bool) {
         self.capture = on.then(|| vec![Vec::new(); self.tracks.len()]);
+        self.capture_tracks.clear();
         self.pdc.taken = self.pdc.handed;
+    }
+
+    /// Capture only selected output tracks; other mixer tracks still process their routing but retain no stem audio.
+    pub fn set_track_capture_selection(&mut self, tracks: &[usize]) {
+        self.set_track_capture(true);
+        self.capture_tracks = vec![false; self.tracks.len()];
+        for &t in tracks {
+            if let Some(on) = self.capture_tracks.get_mut(t) { *on = true; }
+        }
     }
 
     /// The tracks' output kept since `set_track_capture` (interleaved L/R per track, master first), emptied: as much of
@@ -2054,69 +2093,129 @@ impl Engine {
     /// `note_on` on MIDI channel `midi` (0..15): an instrument channel's plugin gets the note, and its end, on it (MIDI
     /// channel through, spec: ui/channel-rack.md §18); other channels ignore it.
     pub fn note_on_midi(&mut self, channel: usize, key: u16, velocity: u8, midi: u8) {
+        self.note_on_offset(channel, key, velocity, midi, 0, 0);
+    }
+
+    /// Timestamped live input, scheduled on the engine's frame clock. A late event starts at the next available
+    /// frame; its original timestamp is retained by the transport's recording clock, not rewritten by UI polling.
+    pub fn note_on_input(&mut self, channel: usize, key: u16, velocity: u8, midi: u8, id: u64, frame: u64) {
+        self.input_events.push(InputEvent { frame, kind: InputKind::On { channel, key, velocity, midi, id } });
+        self.tail_done = false;
+    }
+
+    pub fn note_off_input(&mut self, channel: usize, key: u16, midi: u8, id: u64, frame: u64) {
+        self.input_events.push(InputEvent { frame, kind: InputKind::Off { channel, key, midi, id } });
+    }
+
+    pub fn midi_input(&mut self, channel: usize, bytes: [u8; 3], bend_cents: f64, frame: u64) {
+        self.input_events.push(InputEvent { frame, kind: InputKind::Midi { channel, bytes, bend_cents } });
+        self.tail_done = false;
+    }
+
+    /// First frame that has not yet been rendered. Timestamped live inputs cannot modify already queued audio.
+    pub fn next_input_frame(&self) -> u64 {
+        self.frame
+    }
+
+    fn note_on_offset(&mut self, channel: usize, key: u16, velocity: u8, midi: u8, id: u64, offset: u32) {
         let Some(ch) = self.channels.get(channel) else { return };
         self.tail_done = false;
+        let midi = midi & 15;
         if ch.instrument.0.is_some() {
-            self.inst_live.push((channel, key.min(127) as u8, f32::from(velocity) / 128.0, midi & 15));
-            self.sounding.push((channel, key, u64::MAX));
+            // One physical input source owns one held note. Duplicate delivery with the same opaque source ID
+            // must not add a second hold: otherwise a single NoteOff leaves the plugin stuck indefinitely.
+            if id != 0 && self.input_held.iter().any(|h| h.channel == channel && h.key == key && h.midi == midi && h.id == id) {
+                return;
+            }
+            // MIDI 1 has no independent voice identity for two sources mapped to the same key and channel. Keep
+            // one logical held note until every source releases it, rather than letting one source cut another.
+            let already = id != 0 && self.input_held.iter().any(|h| h.channel == channel && h.key == key && h.midi == midi);
+            if id != 0 {
+                self.input_held.push(InputHeld { channel, key, midi, id });
+            }
+            if !already {
+                self.inst_live.push((channel, key.min(127) as u8, f32::from(velocity) / 128.0, midi, offset));
+                self.sounding.push((channel, key, u64::MAX));
+            }
             return;
         }
-        if ch.sample.is_none() {
+        if ch.sample.is_none() { return; }
+        if id != 0 && self.voices.iter().any(|v| v.channel == channel && v.live == Some(key) && v.input_id == id && v.release.is_none() && v.off.is_none()) {
             return;
         }
         let (vel, pan) = (laws::velocity_gain(velocity), 0.0);
         let gain = ch.start_gain(vel, pan);
         let serial = ch.serial;
-        // A realtime stretch copy made for this key plays as it is.
         let (buf, step) = match ch.keyed.iter().position(|k| k.0 == key) {
             Some(i) => ((i + 1) as u16, 1.0),
             None => (0, laws::playback_rate(key, 0)),
         };
-        self.note_off(channel, key); // retrigger
+        if id == 0 { self.note_off(channel, key); }
         self.voices.push(Voice {
-            channel,
-            pos: 0.0,
-            step,
-            cut: None,
-            release_at: None,
-            vel,
-            pan,
-            gain,
-            dest: gain,
-            delta: (0.0, 0.0),
-            ramp_left: 0,
-            serial,
-            live: Some(key),
-            release: None,
-            age: 0,
-            off: None,
-            shape: None,
-            buf,
-            key,
-            slide: VoiceSlide::new(step, velocity, pan),
-            via: None,
+            channel, pos: 0.0, step, cut: None, release_at: None, vel, pan, gain, dest: gain,
+            delta: (0.0, 0.0), ramp_left: 0, serial, live: Some(key), input_id: id, start_in: offset,
+            release_in: None, release: None, age: 0, off: None, shape: None, buf, key,
+            slide: VoiceSlide::new(step, velocity, pan), via: None,
         });
         self.sounding.push((channel, key, u64::MAX));
     }
 
-    /// Release a live note with a short fade.
+    /// Release a legacy live note with a short fade. Timestamped MIDI calls use their source identity instead.
     pub fn note_off(&mut self, channel: usize, key: u16) {
-        if self.has_instrument(channel) && self.sounding.iter().any(|&(c, k, end)| c == channel && k == key && end == u64::MAX) {
-            self.inst_live.push((channel, key.min(127) as u8, -1.0, 0));
+        self.note_off_offset(channel, key, 0, 0, 0);
+    }
+
+    fn note_off_offset(&mut self, channel: usize, key: u16, midi: u8, id: u64, offset: u32) {
+        if self.has_instrument(channel) {
+            if id != 0 {
+                let Some(at) = self.input_held.iter().position(|h| h.id == id && h.channel == channel && h.key == key && h.midi == midi) else { return };
+                self.input_held.remove(at);
+                if self.input_held.iter().any(|h| h.channel == channel && h.key == key && h.midi == midi) { return; }
+            }
+            if self.sounding.iter().any(|&(c,k,end)| c == channel && k == key && end == u64::MAX) {
+                self.inst_live.push((channel, key.min(127) as u8, -1.0, midi & 15, offset));
+            }
         }
-        let fade = (f64::from(self.rate) * RELEASE_SECONDS) as u32;
-        let vol_env = self.channels.get(channel).is_some_and(|c| c.vol_env.is_some());
         for v in &mut self.voices {
-            if v.channel == channel && v.live == Some(key) && v.release.is_none() && v.off.is_none() {
-                if vol_env {
-                    // The volume envelope's release ends the note.
-                    v.off = Some(v.age);
-                } else {
-                    v.release = Some((fade.max(1), fade.max(1)));
+            if v.channel == channel && v.live == Some(key) && v.input_id == id && v.release.is_none() && v.off.is_none() {
+                v.release_in = Some(u64::from(offset));
+            }
+        }
+        let still_held = self.input_held.iter().any(|h| h.channel == channel && h.key == key);
+        if !still_held {
+            self.sounding.retain(|&(c,k,end)| !(c == channel && k == key && end == u64::MAX));
+        }
+    }
+
+    fn input_events_for_tick(&mut self, n: usize) {
+        self.input_events.sort_by_key(|e| e.frame);
+        let end = self.frame.saturating_add(n as u64);
+        // Drain the due prefix once. Repeated remove(0) shifts every pending event on every note in a dense
+        // MIDI passage, turning a burst into quadratic work on the render thread.
+        let count = self.input_events.partition_point(|e| e.frame < end);
+        let due: Vec<_> = self.input_events.drain(..count).collect();
+        for event in due {
+            let offset = event.frame.saturating_sub(self.frame).min(n.saturating_sub(1) as u64) as u32;
+            match event.kind {
+                InputKind::On { channel, key, velocity, midi, id } => self.note_on_offset(channel,key,velocity,midi,id,offset),
+                InputKind::Off { channel, key, midi, id } => self.note_off_offset(channel,key,midi,id,offset),
+                InputKind::Midi { channel, bytes, bend_cents } => {
+                    if self.has_instrument(channel) {
+                        self.inst_midi.push((channel,bytes,offset));
+                    } else {
+                        self.midi(channel,bytes,bend_cents);
+                    }
                 }
             }
         }
-        self.sounding.retain(|&(c, k, end)| !(c == channel && k == key && end == u64::MAX));
+    }
+
+    /// Render this many frames after the scheduled material, even across silence gaps. This bounded policy is
+    /// suitable for production exports with delayed effects; None retains the legacy compatibility tail rule.
+    pub fn set_tail_frames(&mut self, frames: Option<u64>) {
+        self.tail_frames = frames.map(|n| n.min((TAIL_LIMIT_SECONDS * f64::from(self.rate)) as u64));
+        self.tail_started = None;
+        self.tail_done = false;
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -2198,13 +2297,15 @@ impl Engine {
                 && self.voices.is_empty()
                 && self.inst_tail == 0
                 && self.inst_live.is_empty()
+                && self.input_events.is_empty()
+                && self.input_held.is_empty()
                 && self.inst_midi.is_empty()
                 && !self.tap_clicks.sounding()
                 && self.pdc.drain == 0;
         }
         // With delay compensation as many frames as the head skipped follow the song's end (the file keeps its length).
         let flushed = self.pdc.flush.is_none_or(|f| f == 0);
-        !self.looping && !self.paused() && drained && self.tail_done && flushed && self.inst_live.is_empty() && !self.tap_clicks.sounding()
+        !self.looping && !self.paused() && drained && self.tail_done && flushed && self.inst_live.is_empty() && self.input_events.is_empty() && !self.tap_clicks.sounding()
     }
 
     /// Start playback in the tick that contains `frame` (at the project tempo; notes before that tick as `seek_tick`
@@ -2472,6 +2573,8 @@ impl Engine {
         }
         self.sounding = std::mem::take(&mut old.sounding);
         self.inst_live = std::mem::take(&mut old.inst_live);
+        self.input_events = std::mem::take(&mut old.input_events);
+        self.input_held = std::mem::take(&mut old.input_held);
         self.inst_midi = std::mem::take(&mut old.inst_midi);
         // A controller's pitch bend stays on its channel.
         for (new, o) in self.channels.iter_mut().zip(&old.channels) {
@@ -3002,7 +3105,9 @@ impl Engine {
                 !self.inst_active && self.out.iter().all(|s| (s * gain).abs() < QUIET)
             };
             let limit = (TAIL_LIMIT_SECONDS * f64::from(self.rate) / self.clock.samples_per_tick()) as u64;
-            if quiet || tick >= self.end_tick + limit {
+            let tail_start = *self.tail_started.get_or_insert(start);
+            let complete = self.tail_frames.map_or(quiet, |frames| start.saturating_add(len as u64).saturating_sub(tail_start) >= frames);
+            if complete || tick >= self.end_tick + limit {
                 self.tail_done = true;
             }
         }
@@ -3287,6 +3392,9 @@ impl Engine {
             ramp_left: 0,
             serial,
             live: None,
+            input_id: 0,
+            start_in: 0,
+            release_in: None,
             release: None,
             age: 0,
             off: None,
@@ -3350,18 +3458,16 @@ impl Engine {
     /// renders its channel (`instrument_job`) and, with `voices`, the sampler voices render into their tracks' inputs,
     /// on the pool while the generator switch is on. What the instruments put out waits for `instruments_out`.
     fn render_generators(&mut self, n: usize, song: &TransportInfo, voices: bool) {
-        for (ch, key, vel, midi) in self.inst_live.drain(..) {
-            self.inst_events.push(if vel < 0.0 {
-                notes::Event::off(ch, 0, key)
-            } else {
-                let on = notes::Event::on(ch, 0, key, vel);
-                notes::Event { levels: crate::NoteLevels { channel: midi, ..on.levels }, ..on }
-            });
+        self.input_events_for_tick(n);
+        for (ch, key, vel, midi, offset) in self.inst_live.drain(..) {
+            let event = if vel < 0.0 { notes::Event::off(ch, offset, key) } else { notes::Event::on(ch, offset, key, vel) };
+            self.inst_events.push(notes::Event { levels: crate::NoteLevels { channel: midi, ..event.levels }, ..event });
         }
         self.inst_events.sort_by_key(|e| e.off);
-        let rules: Vec<notes::Rules> = self.channels.iter().map(|c| c.rules).collect();
+        self.note_rules.clear();
+        self.note_rules.extend(self.channels.iter().map(|c| c.rules));
         self.note_voices.resize(self.channels.len(), notes::Voices::default());
-        notes::apply(&self.inst_events, &rules, &mut self.note_voices, n as u32, &mut self.inst_notes);
+        notes::apply(&self.inst_events, &self.note_rules, &mut self.note_voices, n as u32, &mut self.inst_notes);
         let held = !self.inst_offs.is_empty()
             || self.sounding.iter().any(|&(c, _, end)| end == u64::MAX && self.channels.get(c).is_some_and(|ch| ch.instrument.0.is_some()));
         if held || !self.inst_events.is_empty() {
@@ -3483,7 +3589,7 @@ impl Engine {
         // On the first tick the slot values arrived before delay compensation was worked out.
         if !self.pdc.delivered {
             for &t in &self.order {
-                self.params.deliver_slots(t, &self.tracks[t].effects);
+                self.params.deliver_slots(t, &self.tracks[t].effects, self.exporting);
             }
         }
         let (io, direct) = match self.io.as_mut() {
@@ -3495,6 +3601,7 @@ impl Engine {
             limit,
             song,
             frames,
+            capture_tracks: (!self.capture_tracks.is_empty()).then_some(self.capture_tracks.as_slice()),
             master_fx: self.master_fx,
             insert_fx: self.insert_fx,
             auto_bypass: auto_bypass::enabled(),
@@ -3733,9 +3840,27 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
     // Rate 1 copies samples only while the position is whole (a voice that was pitched keeps its fraction).
     let exact = step == 1.0 && v.pos.fract() == 0.0 && ch.pitch_env.is_none();
     let mut scale = step.max(1.0);
-    let off_s = v.off.map(|o| o as f64 * ch.frame_s);
+    let mut off_s = v.off.map(|o| o as f64 * ch.frame_s);
     let mut pos = v.pos;
     for f in offset..end {
+        if let Some(left) = &mut v.release_in {
+            if *left == 0 {
+                if ch.vol_env.is_some() {
+                    v.off = Some(v.age);
+                    off_s = Some(v.age as f64 * ch.frame_s);
+                } else {
+                    let fade = (RELEASE_SECONDS / ch.frame_s).max(1.0) as u32;
+                    v.release = Some((fade, fade));
+                }
+                v.release_in = None;
+            } else {
+                *left -= 1;
+            }
+        }
+        if v.start_in > 0 {
+            v.start_in -= 1;
+            continue;
+        }
         if pos >= n as f64 {
             v.pos = pos;
             v.gain = (gl, gr);
@@ -4007,7 +4132,7 @@ struct InstCx<'a> {
     /// This tick's notes by channel, the notes instruments missed, controller messages waiting.
     notes: &'a [(usize, u32, notes::Note)],
     missed: &'a [(usize, notes::Note)],
-    midi: &'a [(usize, [u8; 3])],
+    midi: &'a [(usize, [u8; 3], u32)],
     params: &'a param_auto::ParamAuto,
     shapes: multicore::Shapes,
     /// Per channel: a note held or due to end (`Engine::inst_held`); the program's Auto-bypass when silent setting.
@@ -4105,8 +4230,8 @@ fn instrument_job(cx: &InstCx, lane: InstLane, sc: &mut multicore::MixScratch) {
     }
     inst.transport(cx.song);
     // Controller messages before this tick's notes.
-    for &(_, bytes) in cx.midi.iter().filter(|m| m.0 == c) {
-        inst.midi(0, bytes);
+    for &(_, bytes, offset) in cx.midi.iter().filter(|m| m.0 == c) {
+        inst.midi(offset, bytes);
     }
     // The layer whose notes it plays adds its levels to the channel's.
     let layer = ch.via.and_then(|w| cx.channels.get(w.layer).map(|l| (l.layer_adds(), w.gain)));
@@ -4386,7 +4511,8 @@ fn send_note(inst: &mut dyn Instrument, off: u32, note: notes::Note, fines: &mut
     match note {
         notes::Note::Choke(key, None) => inst.choke(off, fines.sent(key)),
         notes::Note::Choke(key, Some(voice)) => inst.voice_choke(off, fines.sent(key), voice),
-        notes::Note::Off(key) => inst.note_off(off, fines.sent(key)),
+        notes::Note::Off(key) => inst.note_end(off, fines.sent(key), 0),
+        notes::Note::End(key, channel) => inst.note_end(off, fines.sent(key), channel),
         notes::Note::On { key, vel, start, fine, levels, voice } => {
             // An instrument that ignores a tuning plays the note's pitch to the nearest semitone on a moved key.
             let sent = if fines.moves { (i32::from(key) + (fines.shift + fine).round() as i32).clamp(0, 127) as u8 } else { key };

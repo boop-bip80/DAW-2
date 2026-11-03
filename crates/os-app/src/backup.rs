@@ -4,9 +4,9 @@
 
 //! Project backups (settings window, File ▸ Backup). While a project is open the interval of the Autosave choice runs;
 //! when it ends and the project changed since the last backup or save, the project is written to
-//! `<user folder>/Projects/Backup` as `<name> (autosaved on M-D-YYYY at HhMM).flp`, and the oldest autosaves of that
-//! name beyond Maximum are deleted. Saving over a file first copies the old file there as
-//! `<name> (overwritten on M-D-YYYY at HhMM).flp`. With Location's "project data folder" (the default), a project with a
+//! `<user folder>/Projects/Backup` with a persistent project identity and a unique generation in each name. Only
+//! autosaves belonging to that identity are pruned beyond Maximum. Saving over a file first preserves the old file
+//! in a separate durable generation. With Location's "project data folder" (the default), a project with a
 //! data folder backs up to `<data folder>/Backup` instead (`crate::data_folder::backup_folder`). Not yet: Never's
 //! reminder and the backups "before risky operations".
 // spec: ui/settings-choices.md "Backup files", ui/data-folder.md §3
@@ -26,8 +26,8 @@ pub struct Backup {
     /// The running interval (None: Never) and when it ends.
     every: Option<Duration>,
     due: Option<Instant>,
-    /// The project and tempo of the last backup.
-    last: Option<(Project, f64)>,
+    /// Model, tempo, native metadata and plugin edit revision at the last successful backup.
+    last: Option<(Project, f64, Vec<u8>, u64)>,
 }
 
 /// The interval of Autosave entry `i`: Never none, Rarely 15, Occasionally 10, Regularly 5, Frequently 5, Very
@@ -68,17 +68,66 @@ pub fn project_name(path: Option<&Path>) -> String {
     path.and_then(Path::file_stem).map_or_else(|| "untitled".to_string(), |n| n.to_string_lossy().into_owned())
 }
 
+/// A non-secret, random project identity. New projects and Save As get distinct recovery lineages.
+pub fn new_identity() -> [u8; 16] {
+    use std::hash::{BuildHasher, Hasher};
+    let random = std::collections::hash_map::RandomState::new();
+    let mut a = random.build_hasher();
+    a.write_u128(generation());
+    a.write_u32(std::process::id());
+    let mut b = random.build_hasher();
+    b.write_u64(a.finish());
+    b.write_u8(1);
+    let mut id = [0; 16];
+    id[..8].copy_from_slice(&a.finish().to_le_bytes());
+    id[8..].copy_from_slice(&b.finish().to_le_bytes());
+    id
+}
+
+fn identity_text(id: [u8; 16]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn generation() -> u128 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    (nanos << 32) | u128::from(NEXT.fetch_add(1, Ordering::Relaxed) as u32)
+}
+
+fn generation_name(name: &str, what: &str, t: NaiveDateTime, id: [u8; 16], ext: &str) -> String {
+    format!("{name} ({what} on {}) [{}-{:032x}].{ext}", stamp(t), identity_text(id), generation())
+}
+
+/// The identity and generation suffix on a current backup. Legacy names deliberately have no identity.
+fn suffix(file: &str) -> Option<(&str, &str, u128)> {
+    let stem = file.strip_suffix(".lemon").or_else(|| file.strip_suffix(".flp"))?;
+    let (base, tail) = stem.rsplit_once(" [")?;
+    let (id, generation) = tail.strip_suffix(']')?.split_once('-')?;
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) || generation.len() != 32 {
+        return None;
+    }
+    Some((base, id, u128::from_str_radix(generation, 16).ok()?))
+}
+
+pub(crate) fn belongs_to(file: &str, id: [u8; 16]) -> bool {
+    suffix(file).is_some_and(|(_, found, _)| found == identity_text(id))
+}
+
+pub(crate) fn generation_order(file: &str) -> u128 {
+    suffix(file).map_or(0, |(_, _, generation)| generation)
+}
+
 /// When file `file` was autosaved, if it is an autosave of `name`: (year, month, day, hour, minute).
 fn autosaved_at(file: &str, name: &str) -> Option<(u32, u32, u32, u32, u32)> {
     saved_at(file, name, "autosaved")
 }
 
-/// When backup `file` of `name` was written, if it is one of kind `what` ("autosaved" or "overwritten"): (year,
-/// month, day, hour, minute).
+/// Read both the current identity-qualified names and old names for manual legacy recovery.
 pub(crate) fn saved_at(file: &str, name: &str, what: &str) -> Option<(u32, u32, u32, u32, u32)> {
-    // Older backups are FLPs.
-    let rest = file.strip_prefix(name)?.strip_prefix(" (")?.strip_prefix(what)?.strip_prefix(" on ")?;
-    let rest = rest.strip_suffix(").lemon").or_else(|| rest.strip_suffix(").flp"))?;
+    let stem = suffix(file).map(|(base, _, _)| base)
+        .or_else(|| file.strip_suffix(".lemon").or_else(|| file.strip_suffix(".flp")))?;
+    let rest = stem.strip_prefix(name)?.strip_prefix(" (")?.strip_prefix(what)?.strip_prefix(" on ")?.strip_suffix(')')?;
     let (date, time) = rest.split_once(" at ")?;
     let mut d = date.split('-').map(str::parse::<u32>);
     let (Some(Ok(m)), Some(Ok(day)), Some(Ok(y)), None) = (d.next(), d.next(), d.next(), d.next()) else { return None };
@@ -86,33 +135,34 @@ pub(crate) fn saved_at(file: &str, name: &str, what: &str) -> Option<(u32, u32, 
     Some((y, m, day, h.parse().ok()?, min.parse().ok()?))
 }
 
-/// Deletes the oldest autosaves of `name` in `dir` beyond `max` (by the time in their names). Other projects' backups
-/// and "overwritten on" copies are left alone.
-pub fn prune(dir: &Path, name: &str, max: usize) {
+/// Prune only this project's identity. Same-named projects, legacy backups and overwritten copies are untouched.
+pub fn prune(dir: &Path, name: &str, id: [u8; 16], max: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut found: Vec<_> = entries
-        .flatten()
-        .filter_map(|e| {
-            let at = autosaved_at(e.file_name().to_str()?, name)?;
-            Some((at, e.path()))
-        })
-        .collect();
+    let mut found: Vec<_> = entries.flatten().filter_map(|e| {
+        let file = e.file_name().into_string().ok()?;
+        if !belongs_to(&file, id) || !e.file_type().ok()?.is_file() {
+            return None;
+        }
+        let at = autosaved_at(&file, name)?;
+        Some((at, generation_order(&file), e.path()))
+    }).collect();
     if found.len() > max {
         found.sort();
-        for (_, p) in &found[..found.len() - max] {
+        for (_, _, p) in &found[..found.len() - max] {
             let _ = std::fs::remove_file(p);
         }
     }
 }
 
-/// Before the project is saved over `target`: an existing file there is copied to the backup folder `dir` as
-/// `<name> (overwritten on ...).flp` (a copy of that name made earlier in the same minute is kept).
-pub fn keep_overwritten(target: &Path, dir: Option<PathBuf>) {
-    let Some(dir) = dir.filter(|_| target.is_file()) else { return };
-    let to = dir.join(file_name(&project_name(Some(target)), "overwritten", chrono::Local::now().naive_local()));
-    if !to.exists() && std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::copy(target, to);
-    }
+/// Preserve the file being replaced before the primary save can publish. Failure aborts that save.
+pub fn keep_overwritten(target: &Path, dir: Option<PathBuf>, fallback_id: [u8; 16]) -> Result<(), String> {
+    let Some(dir) = dir.filter(|_| target.is_file()) else { return Ok(()) };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create backup folder {}: {e}", dir.display()))?;
+    let id = std::fs::read(target).ok().and_then(|b| os_flp::FlpFile::parse(&b).ok())
+        .and_then(|f| crate::lemon_state::project_id(&f)).unwrap_or(fallback_id);
+    let ext = if target.extension().is_some_and(|e| e.eq_ignore_ascii_case("flp")) { "flp" } else { "lemon" };
+    let to = dir.join(generation_name(&project_name(Some(target)), "overwritten", chrono::Local::now().naive_local(), id, ext));
+    crate::durable_file::copy_new(target, &to).map_err(|e| format!("cannot preserve previous project at {}: {e}", to.display()))
 }
 
 impl App {
@@ -144,27 +194,30 @@ impl App {
 
     /// Whether the project changed since it was last backed up, and since it was last saved (or opened, or created).
     pub(crate) fn changed_since_backup(&self) -> bool {
-        self.unsaved() && self.backup.last.as_ref().is_none_or(|(p, t)| *p != self.state.project || *t != self.state.tempo)
+        self.unsaved() && self.backup.last.as_ref().is_none_or(|(p, t, native, revision)| {
+            *p != self.state.project || *t != self.state.tempo
+                || *native != crate::lemon_state::saved_form(&self.state, &self.plugins)
+                || *revision != self.state.plugin_edit_revision
+        })
     }
 
     /// Writes a backup of the project as it is now, named for local time `t`, then deletes its oldest autosaves beyond
-    /// Maximum (`prefs::BACKUP_MAXIMUM`). Returns the file (one already written in the same minute is not
-    /// overwritten); None while the project cannot be written now.
+    /// Maximum (`prefs::BACKUP_MAXIMUM`). Every successful call publishes a distinct generation, including repeated
+    /// edits in the same minute; None while the project cannot be written now.
     pub(crate) fn write_backup(&mut self, t: NaiveDateTime) -> Option<Result<PathBuf, String>> {
         let Some(dir) = crate::data_folder::backup_folder(&self.state, self.state.path.as_deref()) else { return Some(Err("no user folder".into())) };
         let name = project_name(self.state.path.as_deref());
-        let target = dir.join(file_name(&name, "autosaved", t));
-        if target.exists() {
-            return Some(Ok(target));
-        }
+        let id = self.state.recovery_id;
+        let target = dir.join(generation_name(&name, "autosaved", t, id, crate::project_files::EXT));
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return Some(Err(format!("{}: {e}", dir.display())));
         }
-        let snap = (self.state.project.clone(), self.state.tempo);
-        let done = self.save_copy(target.clone())?;
+        let snap = (self.state.project.clone(), self.state.tempo,
+            crate::lemon_state::saved_form(&self.state, &self.plugins), self.state.plugin_edit_revision);
+        let done = self.save_backup_copy(target.clone())?;
         if done.is_ok() {
             self.backup.last = Some(snap);
-            prune(&dir, &name, usize::from(prefs::number(&prefs::BACKUP_MAXIMUM)));
+            prune(&dir, &name, id, usize::from(prefs::number(&prefs::BACKUP_MAXIMUM)));
         }
         Some(done.map(|()| target))
     }
@@ -214,19 +267,21 @@ mod tests {
     fn prune_keeps_the_newest() {
         let dir = scratch("prune");
         std::fs::create_dir_all(&dir).unwrap();
+        let id = new_identity();
         let files = [
-            file_name("a", "autosaved", at(9, 30, 23, 59)),
-            file_name("a", "autosaved", at(10, 1, 0, 0)),
-            file_name("a", "autosaved", at(10, 1, 9, 5)),
-            file_name("a", "autosaved", at(10, 1, 10, 0)),
-            file_name("a", "overwritten", at(1, 1, 0, 0)),
-            file_name("ab", "autosaved", at(1, 1, 0, 0)),
+            generation_name("a", "autosaved", at(9, 30, 23, 59), id, "lemon"),
+            generation_name("a", "autosaved", at(10, 1, 0, 0), id, "lemon"),
+            generation_name("a", "autosaved", at(10, 1, 9, 5), id, "lemon"),
+            generation_name("a", "autosaved", at(10, 1, 10, 0), id, "lemon"),
+            generation_name("a", "overwritten", at(1, 1, 0, 0), id, "lemon"),
+            generation_name("a", "autosaved", at(1, 1, 0, 0), new_identity(), "lemon"),
+            file_name("a", "autosaved", at(1, 1, 0, 0)),
         ];
         for f in &files {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
-        prune(&dir, "a", 2);
-        let mut want = vec![files[2].clone(), files[3].clone(), files[4].clone(), files[5].clone()];
+        prune(&dir, "a", id, 2);
+        let mut want = files[2..].to_vec();
         want.sort();
         assert_eq!(names(&dir), want);
         let _ = std::fs::remove_dir_all(&dir);
@@ -290,22 +345,112 @@ mod tests {
         for i in 0..7 {
             app.state.tempo = 100.0 + f64::from(i);
             let t = at(10, 1 + i / 60, 12, i % 60);
-            assert_eq!(app.write_backup(t), Some(Ok(dir.join(file_name("song", "autosaved", t)))));
+            let path = app.write_backup(t).unwrap().unwrap();
+            assert!(belongs_to(path.file_name().unwrap().to_str().unwrap(), app.state.recovery_id));
         }
         let auto: Vec<String> = names(&dir).into_iter().filter(|n| autosaved_at(n, "song").is_some()).collect();
         assert_eq!(auto.len(), 5);
-        assert!(!auto.contains(&file_name("song", "autosaved", at(10, 1, 12, 0))) && !auto.contains(&file_name("song", "autosaved", at(10, 1, 12, 1))));
-        assert!(auto.contains(&file_name("song", "autosaved", at(10, 1, 12, 6))), "the newest");
+        assert!(auto.iter().all(|n| autosaved_at(n, "song").unwrap().4 >= 2));
+        assert!(auto.iter().any(|n| autosaved_at(n, "song") == Some((2026, 10, 1, 12, 6))), "the newest");
         // Lowered, nothing goes until the next backup.
         prefs::set_number(&prefs::BACKUP_MAXIMUM, 2);
         assert_eq!(names(&dir).into_iter().filter(|n| autosaved_at(n, "song").is_some()).count(), 5);
         app.state.tempo = 1.0;
         app.write_backup(at(10, 1, 13, 0)).unwrap().unwrap();
         let auto: Vec<String> = names(&dir).into_iter().filter(|n| autosaved_at(n, "song").is_some()).collect();
-        assert_eq!(auto, [file_name("song", "autosaved", at(10, 1, 12, 6)), file_name("song", "autosaved", at(10, 1, 13, 0))]);
+        assert_eq!(auto.iter().map(|n| autosaved_at(n, "song").unwrap()).collect::<Vec<_>>(), [(2026, 10, 1, 12, 6), (2026, 10, 1, 13, 0)]);
         prefs::set_number(&prefs::BACKUP_MAXIMUM, prefs::BACKUP_MAXIMUM.default);
         assert_eq!(app.state.path.as_deref(), Some(song.as_path()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_minute_and_same_named_projects_have_independent_generations() {
+        let dir = scratch("identities");
+        let mut a = App::new(None);
+        let mut b = App::new(None);
+        assert_ne!(a.state.recovery_id, b.state.recovery_id);
+        prefs::set_number(&prefs::BACKUP_MAXIMUM, 1);
+        let t = at(11, 2, 10, 15);
+        a.state.tempo = 101.0;
+        let a1 = a.write_backup(t).unwrap().unwrap();
+        b.state.tempo = 202.0;
+        let b1 = b.write_backup(t).unwrap().unwrap();
+        a.state.tempo = 103.0;
+        let a2 = a.write_backup(t).unwrap().unwrap();
+        assert_ne!(a1, a2, "same-minute edits must produce a new generation");
+        assert!(!a1.exists(), "only this identity's older generation is pruned");
+        assert!(b1.exists() && a2.exists());
+        assert_eq!(App::new(Some(b1)).state.tempo, 202.0);
+        assert_eq!(App::new(Some(a2)).state.tempo, 103.0);
+        prefs::set_number(&prefs::BACKUP_MAXIMUM, prefs::BACKUP_MAXIMUM.default);
+        TEST_DIR.with(|d| *d.borrow_mut() = None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_only_and_successive_plugin_only_edits_trigger_backups() {
+        let dir = scratch("metadata");
+        let mut app = App::new(None);
+        app.state.mixer.waveforms = !app.state.mixer.waveforms;
+        assert!(app.changed_since_backup());
+        app.write_backup(at(11, 2, 10, 20)).unwrap().unwrap();
+        assert!(!app.changed_since_backup());
+        app.state.mark_plugin_edited();
+        assert!(app.changed_since_backup());
+        app.write_backup(at(11, 2, 10, 20)).unwrap().unwrap();
+        assert!(!app.changed_since_backup());
+        app.state.mark_plugin_edited();
+        assert!(app.changed_since_backup(), "a sticky dirty boolean cannot represent the next plugin edit");
+        app.write_backup(at(11, 2, 10, 20)).unwrap().unwrap();
+        assert_eq!(names(&dir).len(), 3);
+        assert!(!app.changed_since_backup());
+        TEST_DIR.with(|d| *d.borrow_mut() = None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_identity_reopens_but_save_as_and_templates_get_new_identities() {
+        let dir = scratch("identity_save");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(None);
+        let first = app.state.recovery_id;
+        let song = dir.join("song.lemon");
+        app.save_to_result(song.clone()).unwrap();
+        let mut opened = App::new(Some(song.clone()));
+        assert_eq!(opened.state.recovery_id, first);
+        opened.save_to_result(dir.join("song_2.lemon")).unwrap();
+        assert_ne!(opened.state.recovery_id, first);
+        let mut template = App::new(None);
+        assert!(template.new_from_file(&song, "test"));
+        assert_ne!(template.state.recovery_id, first);
+        TEST_DIR.with(|d| *d.borrow_mut() = None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_backup_preservation_leaves_primary_and_dirty_state_unchanged() {
+        let dir = scratch("failed_preserve");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(None);
+        let song = dir.join("song.lemon");
+        app.save_to_result(song.clone()).unwrap();
+        let original = std::fs::read(&song).unwrap();
+        let blocked = dir.join("not_a_directory");
+        std::fs::write(&blocked, b"keep").unwrap();
+        TEST_DIR.with(|d| *d.borrow_mut() = Some(blocked));
+        app.state.tempo = 97.0;
+        let model = app.state.project.clone();
+        let id = app.state.recovery_id;
+        let result = app.save_to_result(song.clone());
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&song).unwrap(), original);
+        assert_eq!(app.state.project, model);
+        assert_eq!(app.state.recovery_id, id);
+        assert_eq!(app.state.path.as_ref(), Some(&song));
+        assert!(app.unsaved());
+        TEST_DIR.with(|d| *d.borrow_mut() = None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// File ▸ Backup: Autosave and Location are live combos, Maximum a live value box the wheel moves within 1 to 999.

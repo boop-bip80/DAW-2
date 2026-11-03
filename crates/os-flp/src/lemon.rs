@@ -39,19 +39,53 @@ pub const KEY_FOCUS: u8 = 200;
 pub const TRACK_LOCKS: u8 = 201;
 /// `LMex` event: the channels the live note sources are locked to (Receive notes from ▸).
 pub const NOTE_LOCKS: u8 = 202;
+/// `LMex` event: the project's durable identity, shared by its saves and recovery backups.
+pub const PROJECT_ID: u8 = 203;
+/// `LMex` event: hosted plugin identities and their persisted parameter ID order.
+pub const PLUGIN_IDENTITIES: u8 = 204;
+
+/// A native project whose header or metadata cannot be read safely by this version.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    #[error("invalid Lemon project header (expected one LMhd chunk first, with at least four bytes)")]
+    InvalidHeader,
+    #[error("Lemon project format version {found} is not supported (this program supports version {supported})")]
+    UnsupportedVersion { found: u16, supported: u16 },
+    #[error(transparent)]
+    Events(#[from] ReadError),
+}
 
 /// Whether `file` is a `.lemon` file (its first chunk is `LMhd`).
 pub fn is_lemon(file: &FlpFile) -> bool {
     file.chunks.first().is_some_and(|c| c.tag == HEADER)
 }
 
-/// The `.lemon` format version, `None` for an FLP.
+/// The `.lemon` format version, `None` for an FLP or a malformed native header.
 pub fn version(file: &FlpFile) -> Option<u16> {
     let c = file.chunks.first().filter(|c| c.tag == HEADER)?;
     match &c.body {
         ChunkBody::Raw(raw) => Some(u16::from_le_bytes(raw.get(..2)?.try_into().ok()?)),
         _ => None,
     }
+}
+
+/// Accepts an FLP or this program's native format. Call before loading a project so a newer format is never opened
+/// as an editable older one. Unknown header bytes and events of a supported version remain preserved on save.
+pub fn validate_version(file: &FlpFile) -> Result<(), Error> {
+    let mut headers = file.chunks.iter().filter(|c| c.tag == HEADER);
+    let Some(header) = headers.next() else { return Ok(()) };
+    if !is_lemon(file) || headers.next().is_some() {
+        return Err(Error::InvalidHeader);
+    }
+    let ChunkBody::Raw(raw) = &header.body else { return Err(Error::InvalidHeader) };
+    if raw.len() < 4 {
+        return Err(Error::InvalidHeader);
+    }
+    let found = u16::from_le_bytes([raw[0], raw[1]]);
+    if found != VERSION {
+        return Err(Error::UnsupportedVersion { found, supported: VERSION });
+    }
+    Ok(())
 }
 
 /// The `LMex` events, in file order (none for an FLP or a file without them).
@@ -77,7 +111,8 @@ pub fn data(file: &FlpFile, id: u8) -> Option<Vec<u8>> {
 /// Makes `file` a `.lemon` file: an `LMhd` chunk first (an existing one keeps its extra bytes, with the version
 /// written), and one `LMex` chunk last holding `extra` (an event of the same ID there is replaced; the others are kept
 /// in order). The FLP chunks are not touched.
-pub fn to_lemon(file: &mut FlpFile, extra: &[Event]) -> Result<(), ReadError> {
+pub fn to_lemon(file: &mut FlpFile, extra: &[Event]) -> Result<(), Error> {
+    validate_version(file)?;
     let mut kept = events(file)?;
     kept.retain(|e| !extra.iter().any(|x| x.id == e.id));
     kept.extend_from_slice(extra);
@@ -150,5 +185,40 @@ mod tests {
         assert_eq!(again.chunks.iter().filter(|c| c.tag == EXTRA).count(), 1);
         to_flp(&mut again);
         assert_eq!(again.to_bytes().unwrap(), plain.to_bytes().unwrap());
+    }
+
+    /// Neither an unsupported version nor a truncated/ambiguous header may be rewritten as a current file.
+    #[test]
+    fn incompatible_headers_are_rejected_without_mutation() {
+        assert_eq!(validate_version(&flp()), Ok(()));
+        for raw in [vec![], vec![1], vec![1, 0], vec![1, 0, 0], vec![0, 0, 0, 0], vec![2, 0, 0, 0], vec![255, 255, 0, 0]] {
+            let mut f = flp();
+            f.chunks.insert(0, Chunk { tag: HEADER, body: ChunkBody::Raw(raw) });
+            let before = f.clone();
+            assert!(validate_version(&f).is_err());
+            assert!(matches!(crate::project::load(&f), Err(crate::project::ProjectError::Native(_))));
+            assert!(matches!(crate::project::upgrade(&mut f), Err(crate::project::ProjectError::Native(_))));
+            assert_eq!(f, before, "format rejection precedes every conversion");
+            assert!(to_lemon(&mut f, &[saved_by("must not overwrite")]).is_err());
+            assert_eq!(f, before);
+        }
+        let header = Chunk { tag: HEADER, body: ChunkBody::Raw(vec![1, 0, 0, 0]) };
+        let mut misplaced = flp();
+        misplaced.chunks.push(header.clone());
+        assert_eq!(validate_version(&misplaced), Err(Error::InvalidHeader));
+        let mut duplicate = flp();
+        duplicate.chunks.insert(0, header.clone());
+        duplicate.chunks.push(header);
+        assert_eq!(validate_version(&duplicate), Err(Error::InvalidHeader));
+    }
+
+    #[test]
+    fn supported_header_extensions_are_preserved() {
+        let mut f = flp();
+        let raw = vec![1, 0, 0, 0, 17, 29, 43];
+        f.chunks.insert(0, Chunk { tag: HEADER, body: ChunkBody::Raw(raw.clone()) });
+        assert_eq!(validate_version(&f), Ok(()));
+        to_lemon(&mut f, &[saved_by("current")]).unwrap();
+        assert_eq!(f.chunks[0].body, ChunkBody::Raw(raw));
     }
 }

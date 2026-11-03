@@ -1728,7 +1728,9 @@ pub fn run(app: &mut App, c: MCmd) -> Option<String> {
     // A track's state takes its effects' settings from their instances.
     if let MCmd::SaveState(n) = c {
         let mut proj = app.state.project.clone();
-        crate::project_plugins::store_hosted(&mut proj, &app.plugins);
+        if let Err(e) = crate::project_plugins::store_hosted(&mut proj, &app.plugins) {
+            return Some(format!("Couldn't save the mixer track state: {e}"));
+        }
         let m = proj.mixer.iter().find(|m| m.index == n)?;
         return Some(match crate::mixer_state::save(&crate::mixer_state::TrackState::of(m), &name(&app.state, n)) {
             Ok(p) => format!("Saved the mixer track state \"{}\"", p.file_stem().unwrap_or_default().to_string_lossy()),
@@ -1776,7 +1778,9 @@ pub fn run(app: &mut App, c: MCmd) -> Option<String> {
     if let Some(name) = step {
         // The containers' members as their windows left them: what the step keeps and an undo brings back.
         if matches!(c, MCmd::Wrap(..) | MCmd::Member(..) | MCmd::MemberAdd(..) | MCmd::MemberAddInst(..) | MCmd::MemberReplace(..) | MCmd::MemberReplaceInst(..)) {
-            crate::container::store_members(&mut app.state.project, &app.plugins);
+            if let Err(e) = crate::container::store_members(&mut app.state.project, &app.plugins) {
+                return Some(e);
+            }
         }
         return crate::control::edit_app(app, name, Region::Project, |app| run_now(app, c));
     }
@@ -2309,6 +2313,7 @@ impl App {
         waiting.append(&mut self.state.mixer.pending);
         self.state.mixer.pending = waiting;
         if relink {
+            self.prepare_plugin_routing();
             self.transport.set_effects(self.plugins.effects());
             self.state.piano.dirty = true;
         }

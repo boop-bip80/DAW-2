@@ -12,7 +12,7 @@
 // spec: ui/one-click-recording.md
 
 use std::cell::UnsafeCell;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -292,7 +292,77 @@ pub struct Recorder {
     head: Arc<AtomicI64>,
     /// The WAV's rate, set before `finish` when it was not known at the start (an ASIO driver's).
     rate: Arc<AtomicU32>,
+    /// Kept here too, so even a panicking writer reports where its recoverable data is.
+    part: PathBuf,
     thread: Option<std::thread::JoinHandle<Result<(PathBuf, u64), String>>>,
+}
+
+/// Each line is a complete recovery checkpoint. Appending preserves the previous checkpoint if an update is torn.
+/// The raw file is interleaved little-endian f32 stereo; its complete frames are its byte length divided by eight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Recovery {
+    version: u8,
+    channels: u8,
+    rate: u32,
+    head: i64,
+}
+
+fn recovery_path(part: &Path) -> PathBuf {
+    part.with_extension("part.jsonl")
+}
+
+fn kept_error(part: &Path, error: impl std::fmt::Display) -> String {
+    format!("{error}. Raw audio retained: {}; recovery metadata: {}. Retry with --recover-recording and the raw-audio path.", part.display(), recovery_path(part).display())
+}
+
+fn checkpoint(file: &mut std::fs::File, value: Recovery) -> io::Result<()> {
+    serde_json::to_writer(&mut *file, &value)?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+/// Reserve the actual on-disk identity, after callers have sanitized their names. Neither a previous take nor an
+/// abandoned raw take or recovery journal is reused. create_new also makes simultaneous recorders safe.
+fn reserve_take(requested: &Path, rate: u32) -> io::Result<(PathBuf, PathBuf, std::fs::File, std::fs::File)> {
+    let stem = requested.file_stem().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "take needs a file name"))?;
+    for number in 0u32..100_000 {
+        let file = if number == 0 {
+            requested.to_path_buf()
+        } else {
+            let mut name = stem.to_os_string();
+            name.push(format!(" ({}).wav", number + 1));
+            requested.with_file_name(name)
+        };
+        let part = file.with_extension("wav.part");
+        let meta = recovery_path(&part);
+        if file.try_exists()? || meta.try_exists()? {
+            continue;
+        }
+        let raw = match std::fs::File::create_new(&part) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let mut journal = match std::fs::File::create_new(&meta) {
+            Ok(journal) => journal,
+            Err(e) => {
+                drop(raw);
+                let _ = std::fs::remove_file(&part);
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = checkpoint(&mut journal, Recovery { version: 1, channels: 2, rate, head: 0 }) {
+            drop((raw, journal));
+            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(&meta);
+            return Err(e);
+        }
+        return Ok((file, part, raw, journal));
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "too many recordings with this name"))
 }
 
 impl Recorder {
@@ -306,41 +376,56 @@ impl Recorder {
         if let Some(d) = file.parent() {
             std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
-        let part = file.with_extension("wav.part");
-        let raw = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+        // Reject invalid rates before reserving files or starting a writer.
+        os_engine::wav::write_f32_stereo_header(&mut io::sink(), rate, 0).map_err(|e| e.to_string())?;
+        let (file, part, raw, mut journal) = reserve_take(&file, rate).map_err(|e| format!("{}: {e}", file.display()))?;
         let stop = Arc::new(AtomicBool::new(false));
         let head = Arc::new(AtomicI64::new(0));
+        let mut saved = Recovery { version: 1, channels: 2, rate, head: 0 };
         let rate = Arc::new(AtomicU32::new(rate));
         let (s, h, r) = (stop.clone(), head.clone(), rate.clone());
+        let thread_part = part.clone();
         let thread = std::thread::Builder::new()
             .name("audio recorder".into())
             .spawn(move || {
+                let part = thread_part;
                 let mut w = BufWriter::new(raw);
                 let mut buf = Vec::with_capacity(1 << 16);
-                let mut samples = 0u64;
-                loop {
-                    let last = s.load(Ordering::Acquire);
-                    buf.clear();
-                    drain(&mut buf);
-                    for x in &buf {
-                        w.write_all(&x.to_le_bytes()).map_err(|e| e.to_string())?;
+                let written = (|| -> io::Result<()> {
+                    loop {
+                        let last = s.load(Ordering::Acquire);
+                        let current = Recovery { rate: r.load(Ordering::Acquire), head: h.load(Ordering::Acquire), ..saved };
+                        if current != saved || last {
+                            checkpoint(&mut journal, current)?;
+                            saved = current;
+                        }
+                        buf.clear();
+                        drain(&mut buf);
+                        if buf.len() % 2 != 0 {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, "capture supplied an incomplete stereo frame"));
+                        }
+                        for x in &buf {
+                            w.write_all(&x.to_le_bytes())?;
+                        }
+                        if last {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
                     }
-                    samples += buf.len() as u64;
-                    if last {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    w.flush()?;
+                    w.get_ref().sync_all()
+                })();
+                if let Err(e) = written {
+                    // Preserve everything the OS will still accept, including a buffered tail on a recoverable error.
+                    let _ = w.flush();
+                    let _ = w.get_ref().sync_all();
+                    return Err(kept_error(&part, e));
                 }
-                let raw = w.into_inner().map_err(|e| e.to_string())?;
-                drop(raw);
-                let frames = samples / 2;
-                let head = h.load(Ordering::Acquire);
-                let n = to_wav(&part, &file, r.load(Ordering::Acquire), head, frames).map_err(|e| e.to_string());
-                let _ = std::fs::remove_file(&part);
-                Ok((file, n?))
+                drop((w, journal));
+                finalize_take(&part, &file, saved).map_err(|e| kept_error(&part, e))
             })
-            .map_err(|e| e.to_string())?;
-        Ok(Recorder { stop, head, rate, thread: Some(thread) })
+            .map_err(|e| kept_error(&part, e))?;
+        Ok(Recorder { stop, head, rate, part, thread: Some(thread) })
     }
 
     /// The take starts at frame `head` of what came in (negative: that much silence first).
@@ -363,22 +448,100 @@ impl Recorder {
 
     /// The WAV and its frames.
     pub fn join(mut self) -> Result<(PathBuf, u64), String> {
-        self.thread.take().ok_or("already joined")?.join().map_err(|_| "the recorder stopped".to_string())?
+        self.thread.take().ok_or("already joined")?.join().map_err(|_| kept_error(&self.part, "the recorder stopped unexpectedly"))?
     }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        // Do not leave an abandoned recording thread running, and never block the UI while it drains and finalizes.
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn finalize_take(part: &Path, file: &Path, recovery: Recovery) -> io::Result<(PathBuf, u64)> {
+    let bytes = std::fs::metadata(part)?.len();
+    if bytes % 8 != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "raw audio ends in an incomplete stereo frame"));
+    }
+    let frames = to_wav(part, file, recovery.rate, recovery.head, bytes / 8)?;
+    // Only a complete, flushed and synced WAV lets us remove the original. A cleanup failure is harmless: it leaves
+    // a redundant recovery copy, never a missing take.
+    if std::fs::remove_file(part).is_ok() {
+        let _ = std::fs::remove_file(recovery_path(part));
+    }
+    Ok((file.to_path_buf(), frames))
+}
+
+/// Retry a retained take after correcting a full disk or other finalization failure. A torn final checkpoint is
+/// ignored in favour of the previous complete line. An existing destination is never replaced.
+pub fn recover_take(part: &Path) -> Result<(PathBuf, u64), String> {
+    let read = || -> io::Result<(PathBuf, u64)> {
+        if part.extension().is_none_or(|e| e != "part") {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected a .wav.part recording"));
+        }
+        let file = std::fs::File::open(recovery_path(part))?;
+        let mut recovery = None;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if let Ok(value) = serde_json::from_str::<Recovery>(&line) {
+                if value.version == 1 && value.channels == 2 {
+                    recovery = Some(value);
+                }
+            }
+        }
+        let value = recovery.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no complete recovery checkpoint"))?;
+        let original = part.with_extension("");
+        let stem = original.file_stem().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "recording has no file name"))?;
+        for number in 0u64.. {
+            let output = if number == 0 {
+                original.clone()
+            } else {
+                let mut name = stem.to_os_string();
+                name.push(format!(" (recovered {number}).wav"));
+                original.with_file_name(name)
+            };
+            match finalize_take(part, &output, value) {
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                result => return result,
+            }
+        }
+        unreachable!("recording generation space exhausted")
+    };
+    read().map_err(|e| kept_error(part, e))
 }
 
 /// Makes WAV `wav` (32-bit float stereo at `rate`) of the raw frames in `part` from frame `head` on; returns its frames.
 fn to_wav(part: &Path, wav: &Path, rate: u32, head: i64, frames: u64) -> std::io::Result<u64> {
     let skip = head.max(0) as u64;
-    let pad = (-head).max(0) as u64;
-    let n = frames.saturating_sub(skip) + pad;
-    let mut out = BufWriter::new(std::fs::File::create(wav)?);
-    os_engine::wav::write_f32_stereo_header(&mut out, rate, n)?;
-    out.write_all(&vec![0u8; (pad * 8) as usize])?;
+    let pad = if head < 0 { head.unsigned_abs() } else { 0 };
+    let n = frames.saturating_sub(skip).checked_add(pad).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "recording length overflow"))?;
+    let mut header = Vec::with_capacity(44);
+    os_engine::wav::write_f32_stereo_header(&mut header, rate, n)?;
+    let bytes = frames.checked_mul(8).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raw recording length overflow"))?;
     let mut r = std::fs::File::open(part)?;
+    if r.metadata()?.len() != bytes {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "raw recording length changed or is incomplete"));
+    }
     r.seek(SeekFrom::Start(skip.min(frames) * 8))?;
-    std::io::copy(&mut r.take(frames.saturating_sub(skip) * 8), &mut out)?;
-    out.flush()?;
+    // Convert into a sibling and publish exclusively only when the complete WAV is flushed and synced.
+    // A crash during conversion leaves the original raw audio and journal available for recovery.
+    crate::durable_file::create_with(wav, |output| {
+        let mut out = BufWriter::new(output);
+        out.write_all(&header)?;
+        let silence = [0u8; 8192];
+        let mut left = pad * 8; // The checked RIFF header above bounds this multiplication.
+        while left > 0 {
+            let count = left.min(silence.len() as u64) as usize;
+            out.write_all(&silence[..count])?;
+            left -= count as u64;
+        }
+        let expected = frames.saturating_sub(skip) * 8;
+        if io::copy(&mut r.take(expected), &mut out)? != expected {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "raw recording ended during conversion"));
+        }
+        out.flush()
+    })?;
     Ok(n)
 }
 
@@ -423,11 +586,96 @@ mod tests {
         let b = std::fs::read(&wav).unwrap();
         let data: Vec<f32> = b[44..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
         assert_eq!(data, [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let wav = dir.join("padded.wav");
         assert_eq!(to_wav(&part, &wav, 48000, -1, 4).unwrap(), 5);
         let b = std::fs::read(&wav).unwrap();
         assert_eq!(b.len(), 44 + 5 * 8);
         assert_eq!(&b[44..52], &[0u8; 8]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn take_dir(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("lemon_take_{name}_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn writer(file: PathBuf, value: f32) -> Recorder {
+        let mut samples = vec![value; 32];
+        Recorder::start_from(file, 48000, move |out| out.append(&mut samples)).unwrap()
+    }
+
+    #[test]
+    fn simultaneous_names_and_existing_takes_never_overwrite_audio() {
+        let dir = take_dir("collision");
+        let requested = dir.join("session.v1_same.wav");
+        std::fs::write(&requested, b"previous take").unwrap();
+        let a = writer(requested.clone(), 0.25);
+        let b = writer(requested.clone(), 0.75);
+        a.finish();
+        b.finish();
+        let (a, an) = a.join().unwrap();
+        let (b, bn) = b.join().unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, requested);
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("session.v1_same ("));
+        assert_eq!((an, bn), (16, 16));
+        assert_eq!(std::fs::read(requested).unwrap(), b"previous take");
+        assert_eq!(&std::fs::read(a).unwrap()[44..48], &0.25f32.to_le_bytes());
+        assert_eq!(&std::fs::read(b).unwrap()[44..48], &0.75f32.to_le_bytes());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_finalization_keeps_audio_and_metadata_and_can_be_retried() {
+        let dir = take_dir("recovery");
+        let wav = dir.join("take.wav");
+        let w = writer(wav.clone(), 0.5);
+        let part = w.part.clone();
+        // A competing writer wins the destination after this recorder reserved its raw file.
+        std::fs::write(&wav, b"unrelated recording").unwrap();
+        w.set_head(3);
+        w.set_rate(44100);
+        w.finish();
+        let error = w.join().unwrap_err();
+        assert!(error.contains(&part.display().to_string()), "{error}");
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 32 * 4);
+        assert_eq!(std::fs::read(&wav).unwrap(), b"unrelated recording");
+        let journal = recovery_path(&part);
+        // Simulate a power loss in the middle of the next journal checkpoint.
+        std::fs::OpenOptions::new().append(true).open(&journal).unwrap().write_all(b"{\"rate\":").unwrap();
+        let recovered = dir.join("take (recovered 1).wav");
+        assert_eq!(recover_take(&part).unwrap(), (recovered.clone(), 13));
+        assert_eq!(std::fs::read(wav).unwrap(), b"unrelated recording");
+        let b = std::fs::read(recovered).unwrap();
+        assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), 44100);
+        assert_eq!(b.len(), 44 + 13 * 8);
+        assert!(!part.exists() && !journal.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_conversion_and_riff_limit_leave_original_bytes_untouched() {
+        let dir = take_dir("invalid");
+        let part = dir.join("take.wav.part");
+        let wav = dir.join("take.wav");
+        let original = 0.125f32.to_le_bytes().repeat(4);
+        std::fs::write(&part, &original).unwrap();
+        for (head, frames) in [(0, 3), (i64::MIN, 2), (0, u64::MAX)] {
+            assert!(to_wav(&part, &wav, 48000, head, frames).is_err());
+            assert!(!wav.exists());
+            assert_eq!(std::fs::read(&part).unwrap(), original);
+        }
+        let w = writer(wav.clone(), 0.5);
+        let raw = w.part.clone();
+        w.set_head(-((u32::MAX as i64 / 8) + 1));
+        w.finish();
+        let error = w.join().unwrap_err();
+        assert!(error.contains("RIFF WAV limit"), "{error}");
+        assert!(raw.exists() && recovery_path(&raw).exists());
+        assert!(!raw.with_extension("").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A real input device takes in (needs one: `cargo test -- --ignored`).

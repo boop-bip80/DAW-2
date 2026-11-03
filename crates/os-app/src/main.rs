@@ -14,6 +14,7 @@
 
 mod app;
 mod arrange;
+mod assets;
 mod audio_clipboard;
 mod help_links;
 mod diagnostics;
@@ -42,6 +43,7 @@ mod cpu;
 mod data_folder;
 mod device;
 mod dialog;
+mod durable_file;
 mod floating;
 mod filedlg;
 mod enable_groups;
@@ -1847,6 +1849,21 @@ fn main() {
     #[cfg(windows)]
     attach_console();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Recovery needs no window, audio device or plugin loading, including after a native-plugin crash.
+    if args.first().map(String::as_str) == Some("--recover-recording") {
+        if args.len() != 2 {
+            eprintln!("Usage: lemonstudio --recover-recording <take.wav.part>");
+            std::process::exit(2);
+        }
+        match capture::recover_take(std::path::Path::new(&args[1])) {
+            Ok((path, frames)) => println!("Recovered {frames} frames to {}", path.display()),
+            Err(e) => {
+                eprintln!("Recording recovery failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     // A plugin scanner process (spec: ui/plugin-manager.md §4): loads one file, prints its plugins, ends.
     if args.first().map(String::as_str) == Some(plugin_scan::ARG) {
         plugin_scan::child_main(&args[1..]);

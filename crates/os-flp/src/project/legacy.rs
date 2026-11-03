@@ -79,13 +79,16 @@ pub fn is_legacy(events: &[Event]) -> bool {
 /// 0x7000 with the last track as track 501, send levels and link ids in the current form, and a 105-track mixer grown to
 /// 127 tracks.
 pub fn upgrade(file: &mut FlpFile) -> Result<bool, ProjectError> {
+    crate::lemon::validate_version(file)?;
     let ppq = file.header().and_then(Header::ppq).unwrap_or(96);
-    let events = events_of_mut(file)?;
+    let events = events_of(file)?;
     if !is_legacy(events) {
         return Ok(false);
     }
     let version = saved_by(events);
-    let mut ev = std::mem::take(events);
+    validate_records(events)?;
+    // Conversion is transactional: a rejected stream must not empty or partially rewrite the caller's file.
+    let mut ev = events.to_vec();
     if version.0 <= 11 {
         text_to_utf16(&mut ev);
     }
@@ -97,10 +100,53 @@ pub fn upgrade(file: &mut FlpFile) -> Result<bool, ProjectError> {
     }
     playlist(&mut ev, version);
     mixer(&mut ev, version);
-    let events = events_of_mut(file)?;
-    *events = ev;
-    scan(events)?;
+    scan(&ev)?;
+    *events_of_mut(file)? = ev;
     Ok(true)
+}
+
+/// Check records before the transforms inspect or expand them. Older playlist tracks legitimately have fewer than
+/// 70 bytes and mixer flags fewer than 12, but still need their number and flags respectively. Parameter/control
+/// records keep their existing trailing bytes; the transforms only address whole records of those lists.
+fn validate_records(events: &[Event]) -> Result<(), ProjectError> {
+    let mut mixer_tracks = 0usize;
+    let mut saw_mixer_params = false;
+    for (i, e) in events.iter().enumerate() {
+        let bad = |why: &str| ProjectError::Structure(format!("legacy event #{i} (id {}): {why}", e.id));
+        match e.id {
+            id::PL_TRACK => {
+                let data = e.data().filter(|d| d.len() >= 4).ok_or_else(|| bad("playlist track record needs at least four bytes"))?;
+                let number = u32::from_le_bytes(data[..4].try_into().expect("checked length"));
+                if number > PLAYLIST_TRACKS {
+                    return Err(bad("playlist track number exceeds the supported track count"));
+                }
+            }
+            id::ARR_CLIPS => {
+                let data = e.data().ok_or_else(|| bad("playlist clip list has no data"))?;
+                if !data.is_empty() && list_clip_len(data).is_none() {
+                    return Err(bad("playlist clip list does not contain complete supported records"));
+                }
+            }
+            id::PAT_NOTES => {
+                let data = e.data().ok_or_else(|| bad("note list has no data"))?;
+                if data.len() % NOTE_LEN != 0 {
+                    return Err(bad("note list ends with an incomplete record"));
+                }
+            }
+            id::MX_FLAGS => {
+                if e.data().is_none_or(|d| d.len() < 5) {
+                    return Err(bad("mixer track record needs at least five bytes"));
+                }
+                mixer_tracks += 1;
+                if saw_mixer_params || mixer_tracks > usize::from(MX_SPECIAL_TRACK) + 1 {
+                    return Err(bad("mixer track lies after its parameter block or exceeds the supported track count"));
+                }
+            }
+            id::MX_PARAMS => saw_mixer_params = true,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn text_to_utf16(ev: &mut [Event]) {
@@ -700,6 +746,40 @@ mod tests {
         let before = file.to_bytes().unwrap();
         assert!(!upgrade(&mut file).unwrap());
         assert_eq!(file.to_bytes().unwrap(), before);
+    }
+
+    /// The container can be well formed while a legacy record is truncated. Import returns an error and leaves the
+    /// parsed file unchanged instead of indexing a short playlist record or losing the stream during conversion.
+    #[test]
+    fn malformed_legacy_records_are_rejected_without_mutation() {
+        let mut bad: Vec<Event> = (0..4).map(|n| Event::new(id::PL_TRACK, Value::var(vec![0; n]))).collect();
+        bad.push(Event::new(id::PL_TRACK, Value::var(u32::MAX.to_le_bytes())));
+        bad.push(Event::new(id::ARR_CLIPS, Value::var(vec![0; 31])));
+        bad.push(Event::new(id::PAT_NOTES, Value::var(vec![0; NOTE_LEN - 1])));
+        bad.extend((0..5).map(|n| Event::new(id::MX_FLAGS, Value::var(vec![0; n]))));
+        for record in bad {
+            let mut file = create(&Project { ppq: 96, ..Default::default() }).unwrap();
+            *events_of_mut(&mut file).unwrap() = vec![Event::new(id::VERSION, ansi("12.3")), record];
+            let mut file = FlpFile::parse(&file.to_bytes().unwrap()).unwrap();
+            let before = file.clone();
+            assert!(matches!(upgrade(&mut file), Err(ProjectError::Structure(_))));
+            assert_eq!(file, before);
+        }
+    }
+
+    #[test]
+    fn valid_short_legacy_playlist_records_still_upgrade() {
+        let mut file = create(&Project { ppq: 96, ..Default::default() }).unwrap();
+        *events_of_mut(&mut file).unwrap() = vec![
+            Event::new(id::VERSION, ansi("12.3")),
+            Event::new(id::CH_START, Value::U16(0)),
+            Event::new(id::PL_TRACK, Value::var(1u32.to_le_bytes())),
+        ];
+        assert!(upgrade(&mut file).unwrap());
+        let tracks: Vec<_> = events_of(&file).unwrap().iter().filter(|e| e.id == id::PL_TRACK).collect();
+        assert_eq!(tracks.len(), PLAYLIST_TRACKS as usize);
+        assert!(tracks.iter().all(|e| e.data().unwrap().len() == 70));
+        assert!(load(&file).is_ok());
     }
 
     #[test]

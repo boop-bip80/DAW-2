@@ -24,7 +24,7 @@ use std::time::Instant;
 pub use os_host::{set_waker, wake, Descriptor};
 
 use host::{from_utf16, null_shared, null_static, Com, EventList, Frame, Handler, HostApp, ParamChanges, Shared, Stream};
-use vst3_sys::base::{kResultOk, kResultTrue, IPluginBase, IPluginFactory, IPluginFactory2, IPluginFactory3, PClassInfo, PClassInfo2, PClassInfoW, PFactoryInfo};
+use vst3_sys::base::{kNotImplemented, kResultOk, kResultTrue, IPluginBase, IPluginFactory, IPluginFactory2, IPluginFactory3, PClassInfo, PClassInfo2, PClassInfoW, PFactoryInfo};
 use vst3_sys::gui::{IPlugView, IPlugViewContentScaleSupport, ViewRect};
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::vst::{
@@ -51,6 +51,7 @@ const RELOAD_COMPONENT: i32 = 1;
 const IO_CHANGED: i32 = 2;
 const LATENCY_CHANGED: i32 = 8;
 const PARAM_TITLES_CHANGED: i32 = 16;
+const MIDI_CC_ASSIGNMENT_CHANGED: i32 = 32;
 
 // `ProcessContext::state` flags (spec §5).
 const PLAYING: u32 = 1 << 1;
@@ -444,6 +445,7 @@ impl os_host::Library for Module {
 enum NoteKind {
     On,
     Off,
+    OffChannel,
     /// Tuning of the key's sounding note, `velocity` = semitones.
     Tune,
 }
@@ -493,6 +495,7 @@ pub struct Plugin {
     rate: u32,
     wanted_rate: AtomicU32,
     processing: bool,
+    offline: bool,
     max_frames: u32,
     /// Channel count of each audio input / output bus, and whether the plug-in takes notes.
     ins: Vec<usize>,
@@ -513,7 +516,8 @@ pub struct Plugin {
     /// (id, step count) of each parameter in list order: the position is the automation index. A parameter whose
     /// info could not be read keeps its place with id `u32::MAX` (VST 3's "no parameter").
     param_ids: Vec<(u32, i32)>,
-    /// The parameter the controller maps each MIDI controller to (IMidiMapping, MIDI channel 1): controllers 0..127,
+    param_order: os_host::ParamOrder,
+    /// The parameter the controller maps each MIDI controller to (IMidiMapping, all 16 channels): controllers 0..127,
     /// then channel pressure (128) and pitch bend (129); `u32::MAX` = none (spec: ui/midi-settings.md §4).
     midi_map: Vec<u32>,
     /// Glides as pitch bend (through `midi_map`) for a plug-in whose controller lists no tuning note expression (spec:
@@ -603,6 +607,7 @@ impl Plugin {
                 rate: 0,
                 wanted_rate: AtomicU32::new(0),
                 processing: false,
+                offline: false,
                 max_frames: MAX_FRAMES,
                 ins: Vec::new(),
                 outs: Vec::new(),
@@ -617,6 +622,7 @@ impl Plugin {
                 from_processor: Vec::with_capacity(256),
                 pending_since: None,
                 param_ids: Vec::new(),
+                param_order: os_host::ParamOrder::default(),
                 midi_map: Vec::new(),
                 bend: None,
                 bend_range: os_engine::instrument::DEFAULT_BEND_RANGE,
@@ -771,12 +777,16 @@ impl Plugin {
         if let Ok(mut a) = self.shared.automatable.lock() {
             *a = automatable;
         }
+        self.param_order.update(&self.param_ids.iter().map(|p| p.0).collect::<Vec<_>>());
+        self.shared.attention.raise();
         self.midi_map.clear();
         if let Some(m) = c.cast::<dyn IMidiMapping>() {
-            for cc in 0..130i16 {
-                let mut id = u32::MAX;
-                let ok = unsafe { m.get_midi_controller_assignment(0, 0, cc, &mut id) } == kResultOk;
-                self.midi_map.push(if ok { id } else { u32::MAX });
+            for channel in 0..16i16 {
+                for cc in 0..130i16 {
+                    let mut id = u32::MAX;
+                    let ok = unsafe { m.get_midi_controller_assignment(0, channel, cc, &mut id) } == kResultOk;
+                    self.midi_map.push(if ok { id } else { u32::MAX });
+                }
             }
         }
         // A plug-in that lists the tuning expression takes glides as one; another glides by pitch bend when it maps
@@ -800,7 +810,7 @@ impl Plugin {
             return true;
         }
         self.deactivate();
-        let setup = ProcessSetup { process_mode: 0, symbolic_sample_size: 0, max_samples_per_block: self.max_frames as i32, sample_rate: f64::from(rate) };
+        let setup = ProcessSetup { process_mode: self.process_mode(), symbolic_sample_size: 0, max_samples_per_block: self.max_frames as i32, sample_rate: f64::from(rate) };
         unsafe {
             if self.processor.setup_processing(&setup) != kResultOk {
                 if debug() {
@@ -833,6 +843,24 @@ impl Plugin {
             eprintln!("[os-vst3] {} active at {rate} Hz (latency {}, ins {:?}, outs {:?})", self.desc.name, self.latency, self.ins, self.outs);
         }
         true
+    }
+
+    fn process_mode(&self) -> i32 {
+        if self.offline { 2 } else { 0 } // VST3 ProcessModes::kOffline / kRealtime
+    }
+
+    /// Processing mode is part of setupProcessing, which must run while the component is inactive. A completed or
+    /// cancelled export calls this again with false before the live stream resumes.
+    pub fn set_offline(&mut self, offline: bool) {
+        if self.offline == offline {
+            return;
+        }
+        let rate = self.rate;
+        self.deactivate();
+        self.offline = offline;
+        if rate != 0 {
+            self.activate(rate);
+        }
     }
 
     fn deactivate(&mut self) {
@@ -878,7 +906,7 @@ impl Plugin {
         } else if wanted != 0 && wanted != self.rate {
             self.activate(wanted);
         }
-        if flags & (RELOAD_COMPONENT | PARAM_TITLES_CHANGED) != 0 {
+        if flags & (RELOAD_COMPONENT | PARAM_TITLES_CHANGED | MIDI_CC_ASSIGNMENT_CHANGED) != 0 {
             self.refresh_param_ids();
         }
         if let Some(c) = &self.controller {
@@ -918,7 +946,7 @@ impl Plugin {
         self.auto.clear();
         self.params_out.get().clear();
         let mut data = ProcessData {
-            process_mode: 0,
+            process_mode: self.process_mode(),
             symbolic_sample_size: 0,
             num_samples: 0,
             num_inputs: 0,
@@ -949,7 +977,8 @@ impl Plugin {
     /// Automation (audio thread): parameter `index` of the list to normalized `value`, `offset` frames into the next
     /// process call (spec §5). A stepped parameter gets its nearest step; unknown indexes are ignored.
     fn automate(&mut self, offset: u32, index: u32, value: f64) {
-        let Some(&(id, steps)) = self.param_ids.get(index as usize) else { return };
+        let Some(index) = self.param_order.index(index as usize) else { return };
+        let Some(&(id, steps)) = self.param_ids.get(index) else { return };
         if id == u32::MAX || self.auto.len() >= MAX_AUTO {
             return;
         }
@@ -1078,19 +1107,17 @@ impl Plugin {
             if self.component.get_state(s.shared()) != kResultOk {
                 return None;
             }
-            let mut st = fl_state::FlState { component: s.get().bytes(), controller: None, params: Vec::new() };
+            let mut st = fl_state::FlState { component: s.get().bytes(), controller: None, params: self.param_order.ids().to_vec() };
             if let Some(c) = &self.controller {
                 // A single-component plug-in's controller is the same object: its state is the component's.
                 if self.separate {
                     let s = Stream::create(Vec::new());
-                    st.controller = Some(if c.get_state(s.shared()) == kResultOk { s.get().bytes() } else { Vec::new() });
+                    match c.get_state(s.shared()) {
+                        kResultOk => st.controller = Some(s.get().bytes()),
+                        kNotImplemented => {}, // Optional controller state.
+                        _ => return None,
+                    }
                 }
-                st.params = (0..c.get_parameter_count().max(0))
-                    .filter_map(|i| {
-                        let mut info: ParameterInfo = std::mem::zeroed();
-                        (c.get_parameter_info(i, &mut info) == kResultOk).then_some(info.id)
-                    })
-                    .collect();
             }
             Some(st.to_bytes())
         }
@@ -1099,12 +1126,19 @@ impl Plugin {
     /// Restores `save_state` bytes; also a `.vstpreset` (what Lemon Studio saved before, and preset files; one of
     /// another class is refused) and a bare component state (imports, other hosts' chunks).
     pub fn load_state(&mut self, data: &[u8]) -> bool {
+        let mut saved_ids = None;
         let p = if data.starts_with(b"VST3") {
             match preset::Preset::parse(data) {
                 Some(p) if p.class_id.eq_ignore_ascii_case(&self.desc.id) => p,
                 _ => return false,
             }
         } else if let Some(st) = fl_state::FlState::parse(data) {
+            if !os_host::ParamOrder::valid(&st.params) {
+                return false;
+            }
+            if !st.params.is_empty() {
+                saved_ids = Some(st.params);
+            }
             preset::Preset { class_id: self.desc.id.clone(), component: st.component, controller: st.controller.unwrap_or_default() }
         } else {
             preset::Preset { class_id: self.desc.id.clone(), component: data.to_vec(), controller: Vec::new() }
@@ -1116,12 +1150,21 @@ impl Plugin {
             }
             if let (Some(c), true) = (&self.controller, self.separate) {
                 let s = Stream::create(p.component);
-                c.set_component_state(s.shared());
+                let result = c.set_component_state(s.shared());
+                if result != kResultOk && result != kNotImplemented {
+                    return false;
+                }
                 if !p.controller.is_empty() {
                     let s = Stream::create(p.controller);
-                    c.set_state(s.shared());
+                    if c.set_state(s.shared()) != kResultOk {
+                        return false;
+                    }
                 }
             }
+        }
+        self.refresh_param_ids();
+        if let Some(ids) = saved_ids {
+            self.param_order.restore(&ids, &self.param_ids.iter().map(|p| p.0).collect::<Vec<_>>());
         }
         true
     }
@@ -1177,7 +1220,7 @@ impl Plugin {
                     }
                     match e.kind {
                         NoteKind::On => self.ledger.start(e.key, -1),
-                        NoteKind::Off => self.ledger.release(e.key),
+                        NoteKind::Off | NoteKind::OffChannel => self.ledger.release(e.key),
                         NoteKind::Tune => {}
                     }
                 }
@@ -1239,7 +1282,7 @@ impl Plugin {
             self.bus_out.push(AudioBusBuffers { num_channels: ch as i32, silence_flags: 0, buffers: unsafe { self.ptrs.as_mut_ptr().add(start) } });
         }
         let mut data = ProcessData {
-            process_mode: 0,
+            process_mode: self.process_mode(),
             symbolic_sample_size: 0,
             num_samples: n as i32,
             num_inputs: self.bus_in.len() as i32,
@@ -1302,8 +1345,9 @@ impl NoteIds {
                 let on = NoteOnEvent { channel: i16::from(n.ch & 15), pitch: i16::from(n.key), tuning: 0.0, velocity: n.velocity, length: 0, note_id: id };
                 (NOTE_ON_EVENT, EventData { note_on: on })
             }
-            NoteKind::Off => {
-                (NOTE_OFF_EVENT, EventData { note_off: NoteOffEvent { channel: i16::from(self.chs[key]), pitch: i16::from(n.key), velocity: 0.0, note_id: -1, tuning: 0.0 } })
+            NoteKind::Off | NoteKind::OffChannel => {
+                let channel = if n.kind == NoteKind::OffChannel { n.ch & 15 } else { self.chs[key] };
+                (NOTE_OFF_EVENT, EventData { note_off: NoteOffEvent { channel: i16::from(channel), pitch: i16::from(n.key), velocity: 0.0, note_id: -1, tuning: 0.0 } })
             }
             NoteKind::Tune => {
                 let id = self.ids[key];
@@ -1368,12 +1412,33 @@ impl os_host::Plugin for Plugin {
         if self.rate == 0 { 0 } else { self.latency }
     }
 
+    fn set_offline(&mut self, offline: bool) {
+        Plugin::set_offline(self, offline);
+    }
+
     fn param_count(&self) -> usize {
-        self.controller.as_ref().map_or(0, |c| unsafe { c.get_parameter_count() }.max(0) as usize)
+        self.param_order.ids().len()
+    }
+
+    fn parameter_ids(&self) -> Vec<u32> {
+        self.param_order.ids().to_vec()
+    }
+
+    fn restore_parameter_ids(&mut self, ids: &[u32]) -> bool {
+        let restored = self.param_order.restore(ids, &self.param_ids.iter().map(|p| p.0).collect::<Vec<_>>());
+        if restored {
+            self.shared.attention.raise();
+        }
+        restored
+    }
+
+    fn param_revision(&self) -> u64 {
+        self.param_order.revision()
     }
 
     fn param_info(&self, index: usize) -> Option<os_host::ParamInfo> {
         let c = self.controller.as_ref()?;
+        let index = self.param_order.index(index)?;
         unsafe {
             let mut info: ParameterInfo = std::mem::zeroed();
             if c.get_parameter_info(index as i32, &mut info) != kResultOk {
@@ -1469,7 +1534,7 @@ impl os_engine::Instrument for Plugin {
     /// (spec: audio/voices.md §3). Note offs still waiting for that block stay queued: Stop resets, and Play resets
     /// again before any block has run.
     fn reset(&mut self) {
-        self.queue.retain(|n| matches!(n.kind, NoteKind::Off));
+        self.queue.retain(|n| matches!(n.kind, NoteKind::Off | NoteKind::OffChannel));
         self.sounding = false;
         let mut sent = [false; 128];
         for n in &mut self.queue {
@@ -1505,6 +1570,9 @@ impl os_engine::Instrument for Plugin {
     fn note_off(&mut self, offset: u32, key: u8) {
         self.queue.push(Note { time: offset, kind: NoteKind::Off, key, velocity: 0.0, ch: 0 });
     }
+    fn note_end(&mut self, offset: u32, key: u8, channel: u8) {
+        self.queue.push(Note { time: offset, kind: NoteKind::OffChannel, key, velocity: 0.0, ch: channel & 15 });
+    }
 
     /// A controller message (spec: ui/midi-settings.md §4): VST3 takes controllers, channel pressure and pitch bend as
     /// the parameters its controller maps them to (IMidiMapping); other messages, and controllers it maps nowhere, are
@@ -1517,7 +1585,8 @@ impl os_engine::Instrument for Plugin {
             0xE0 => (129, f64::from(u16::from(d1) | u16::from(d2) << 7) / 16383.0),
             _ => return,
         };
-        let Some(&id) = self.midi_map.get(cc) else { return };
+        let channel = usize::from(bytes[0] & 15);
+        let Some(&id) = self.midi_map.get(channel * 130 + cc) else { return };
         if id == u32::MAX || self.auto.len() >= MAX_AUTO {
             return;
         }

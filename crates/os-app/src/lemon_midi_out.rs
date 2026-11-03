@@ -559,6 +559,7 @@ impl crate::app::App {
             }
         }
         if changed {
+            self.prepare_plugin_routing();
             self.transport.set_instruments(self.plugins.instruments());
         }
     }
@@ -615,6 +616,7 @@ impl crate::app::App {
             s.control.settle(&mut s.project);
             s.piano.dirty = true;
             app.sync_midi_outs();
+            app.prepare_plugin_routing();
             app.transport.set_instruments(app.plugins.instruments());
             app.open_channel_window(rows[0]);
         });

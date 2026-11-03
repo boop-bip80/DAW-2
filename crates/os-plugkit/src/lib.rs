@@ -13,6 +13,41 @@
 pub mod linked;
 pub mod live;
 pub mod vals;
+
+/// The JSON in a nih-plug state, either bare or after its eight-byte little-endian length.
+///
+/// Compare the entire length: the low byte of a valid prefix may itself be `b'{'` (123),
+/// so checking the first byte to distinguish framed from bare JSON corrupts such states.
+/// An invalid length falls back to the original bytes, whose JSON parser must reject malformed
+/// input instead of silently skipping an unverified header.
+pub fn plugin_state_json(blob: &[u8]) -> &[u8] {
+    let framed = blob.get(..8)
+        .and_then(|prefix| <[u8; 8]>::try_from(prefix).ok())
+        .and_then(|prefix| usize::try_from(u64::from_le_bytes(prefix)).ok())
+        .is_some_and(|length| length == blob.len() - 8);
+    if framed { &blob[8..] } else { blob }
+}
+
+#[cfg(test)]
+mod state_json_tests {
+    use super::plugin_state_json;
+
+    #[test]
+    fn framed_json_with_open_brace_length_byte_and_unframed_json() {
+        let mut json = br#"{"fields":{"x":1}}"#.to_vec();
+        json.resize(123, b' ');
+        let mut blob = 123u64.to_le_bytes().to_vec();
+        blob.extend_from_slice(&json);
+        assert_eq!(blob[0], b'{');
+        assert_eq!(plugin_state_json(&blob), json);
+        assert_eq!(plugin_state_json(&json), json);
+        let mut mismatch = blob.clone();
+        mismatch[1] ^= 1;
+        assert_eq!(plugin_state_json(&mismatch), mismatch);
+        assert_eq!(plugin_state_json(b"{}"), b"{}");
+        assert_eq!(plugin_state_json(&[]), b"");
+    }
+}
 #[cfg(windows)]
 pub mod win;
 #[cfg(target_os = "linux")]

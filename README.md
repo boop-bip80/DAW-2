@@ -9,7 +9,7 @@
 <h3>A free and open-source digital audio workstation, written in Rust.</h3>
 
 <p>
-  <a href="https://github.com/ItsAlphaNeon/Lemon-Studio/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ItsAlphaNeon/Lemon-Studio/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://github.com/boop-bip80/DAW-2/actions/workflows/ci.yml"><img alt="This fork's CI workflow (qualification not yet verified)" src="https://img.shields.io/badge/fork_CI-verify_on_this_commit-lightgrey?style=flat-square"></a>
   <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e57324?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platform: Windows | Linux | macOS" src="https://img.shields.io/badge/platform-Windows_%7C_Linux_%7C_macOS-0078d4?style=flat-square">
@@ -43,8 +43,13 @@ piano roll, arrange them on a playlist, and mix them through a routable mixer. I
 ground up in Rust, with a sample-accurate audio engine, a fast CPU-rendered interface and hosting for
 CLAP, VST3 and VST2 plugins.
 
-Lemon Studio runs on Windows, Linux and macOS, and every change is built and tested on all three. macOS is supported
-at the same level as Linux; the few differences are listed in the [macOS notes](#macos).
+Lemon Studio targets Windows, Linux and macOS. CI is configured to build, test and qualify a staged executable on
+each; a successful build is not proof of stability with real audio hardware or third-party plugins. macOS-specific
+behaviour is described in the [macOS notes](#macos).
+
+**Production release status: NO-GO.** The code has active stabilization work, and the release-candidate workflow is
+not a signed installer or a substitute for the external project corpus, physical-device and plug-in tests. The
+[production-readiness gates](docs/production-readiness.md) state exactly what must pass before a post-beta release.
 
 A central goal is **interoperability**: Lemon Studio opens and saves FL Studio projects (`.flp`). The
 project reader is built to round-trip: anything in a file that Lemon Studio does not understand yet is
@@ -57,8 +62,12 @@ young, so read the warning below before trying it on real work.
 >
 > - **Greyed-out controls are not implemented yet.** Many menus and buttons are already laid out but do
 >   nothing so far; they are drawn dim and say "not available yet".
-> - **No prebuilt binaries** will be published until Lemon Studio reaches a usable state. Until then it
->   can only be built from source.
+> - **No production binaries or installers are released.** CI uploads short-lived, qualified portable
+>   candidates from passing Windows, Linux and macOS jobs as GitHub Actions artifacts for testing only.
+>   These are unsigned (macOS: ad-hoc-signed), have not passed real hardware/third-party compatibility
+>   qualification, and should not be used for irreplaceable work. Building from source remains supported.
+> - **Native sessions use `.lemon`**. Save to a new `.lemon` file for Lemon Studio work; treat importing/exporting
+>   `.flp` as an interoperability operation and preserve the original file.
 > - **Projects saved by FL Studio 10 or later open** (25 and 26 included). Projects older than 24.2 are
 >   converted to the current layout as they open and are saved in it, so the version that wrote them may not
 >   read the saved copy.
@@ -75,21 +84,21 @@ Where Lemon Studio stands against what a complete DAW offers:
 | Piano roll | ✅ | Full tool set, velocity and event lanes, quantize (FL's templates), chop (FL's patterns), randomize (melodies and levels), strum, arpeggiate, flam, claw machine, flip, level scaling, limit, LFO and more |
 | Song arrangement | ✅ | Playlist with pattern, audio and automation clips, clip groups, markers and several arrangements |
 | Mixing and routing | ✅ | Mixer tracks, sends, effect slots and meters; sidechain inputs for a project's Fruity Limiter slots and for CLAP and VST3 effects |
-| Plugin hosting | ✅ | CLAP, VST3 and VST2 instruments and effects with their editors; "Create automation clip" in CLAP and VST3 plugins' own parameter menus; a parameter menu for every plugin parameter (automation clips, controller links, typed and set values); on Windows a crashing plugin is stopped instead of closing Lemon Studio; no 32-bit plugins |
+| Plugin hosting | 🚧 | CLAP, VST3 and VST2 instruments and effects with their editors; "Create automation clip" in CLAP and VST3 plugins' own parameter menus; a parameter menu for every plugin parameter (automation clips, controller links, typed and set values); supported native exceptions have limited in-process containment on Windows only. A crashing plugin can still terminate the host, especially on macOS/Linux. No 32-bit plugins |
 | Plugin management | ✅ | Plugin manager with your own search folders, a crash-safe background scan, favourites and hidden plugins; presets of your own and factory presets, import of `.vstpreset`, `.fxp` and `.fxb` files, and preset files dropped onto a plugin |
 | Time-stretching | ✅ | All twelve stretch methods for samples and audio clips, played by one open-source stretcher |
 | Playback engine | 🚧 | Renders ahead of the audio device so edits do not cause dropouts; voice limits, cut groups, glides, layer channels; one audio thread for now |
 | Automation | 🚧 | Clips for channel, mixer and plugin parameters with every curve shape, their range and their LFO; channel volume and pan moves record into a pattern; not yet recording into automation clips |
 | Project files | 🚧 | Opens and saves projects from FL Studio 10 and later (older layouts are converted as they open). Keep backups |
 | Built-in instruments and effects | 🚧 | Instruments: Lemon Sampler (long samples can play straight from disk), Lemon Trio (three oscillators), Citrus (a six-operator synth that plays Sytrus patches), Lemon Slicer (a loop cut into slices that plays Fruity Slicer channels) and Lemon Drum Sampler (32 pads of velocity-layered samples that plays FPC kits). Effects: Lemon Parametric EQ (all of FL's quality modes: HQ+, HQ Enhanced, linear phase), Limiter, Reverb, Delay, Chorus, Stereo Shaper, Stereo Enhancer, Balance, Soft Clipper, Fast Distortion, Transient Processor, Filter, Flanger and Phaser, plus Pulp Filter (a pattern-controlled multi-filter) and Press (a multiband maximiser). All built in, and also VST3 and CLAP plugins for other DAWs; a project's Fruity Limiter slots play Lemon Limiter's sound, sidechain included |
-| Exporting audio | ✅ | Song, pattern or selection to WAV, FLAC, MP3 and OGG at once; bit depth, sample rate, interpolation, dither, mono, tails, stems and WAV markers; a pattern rendered as an audio clip (Quick render, Render and replace) |
+| Exporting audio | 🚧 | Song, pattern or selection to WAV, FLAC, MP3 and OGG; bit depth, sample rate, interpolation, dither, mono, tails, stems and WAV markers. Native-rate 32-bit float WAV streams to disk; other codecs and resampling currently have a bounded buffer and may refuse long exports. Multi-stem publication rolls back ordinary failures but is not crash-atomic |
 | MIDI file import / export | ✅ | Import into a new project, the open one or a piano roll channel (tracks, channels, tempo changes, time signatures, markers); export a pattern or the song's patterns |
 | Note input | 🚧 | Mouse, computer keyboard, MIDI controllers (velocity curves, sustain pedal, pitch bend, aftertouch) and the touch controller; note recording into patterns with loop record, precount and Start on input; step edit |
 | MIDI controllers and sync | ✅ | Link any knob, fader or plugin parameter to a controller (or many at once with Multilink); MIDI clock and time code out, external clock in |
 | Undo | 🚧 | One history for the whole project, with redo and the browser's History: edits, knobs and faders, the mixer, channels added and deleted, the tempo and project settings, and plugin parameters, those changed in their own windows too |
 | Scripting and assistants | 🚧 | Scripts, tests and AI assistants read and edit projects over a local socket, every change undoable; see [docs/control-plane.md](docs/control-plane.md) |
 | Audio drivers | 🚧 | WASAPI (shared and exclusive) and ASIO® (output, and inputs for audio recording) on Windows, ALSA (and PipeWire / PulseAudio through it) on Linux, Core Audio on macOS; no JACK yet |
-| Platforms | 🚧 | Windows 10 / 11, Linux (X11, and Wayland through XWayland) and macOS 11 or newer; macOS is supported at the same level as Linux |
+| Platforms | 🚧 | Targets Windows 10 / 11, Linux (X11, and Wayland through XWayland) and macOS 11 or newer. CI build/smoke is required on all three; physical-device, native-plugin and clean-install acceptance is not complete |
 | Look and themes | 🚧 | Lemon and Citrus (formerly Classic) skins; 25 built-in themes, your own themes and `.flstheme` files colour either skin, with live adjustments and a colour picker; Lemon plugin editors in the Lemon design only |
 | Settings | 🚧 | Every page works: MIDI, Audio, Recording, General, File, Plugins, Theme, Project and Info |
 | Audio recording | 🚧 | Armed mixer tracks record into the playlist at their record source; one-click audio recording into the playlist or the audio editor, from ASIO or system inputs; Tesla records what reaches its mixer slot |
@@ -118,9 +127,9 @@ Per-area details are in [docs/status.md](docs/status.md). The full, item-by-item
 
 ## Getting started
 
-No prebuilt binaries are provided at this stage: Lemon Studio is built from source. Each platform below goes from a fresh
+No public prebuilt binaries are provided at this stage: Lemon Studio is built from source. Each platform below goes from a fresh
 machine to Lemon Studio installed with its icon, and Lemon Studio's own plugins installed for any DAW. All three need
-**Rust**, stable toolchain 1.89 or newer, installed through [rustup](https://rustup.rs/), and a clone of this repository:
+**Rust**, using the toolchain pinned by `rust-toolchain.toml` (currently 1.99.1), installed through [rustup](https://rustup.rs/), and a clone of this repository:
 
 ```bash
 git clone https://github.com/ItsAlphaNeon/Lemon-Studio.git
@@ -173,7 +182,9 @@ and `...\CLAP`, where DAWs find them. To build and install them without starting
 
 **Notes**
 
-- A plugin that crashes is stopped (its slot passes the sound through) instead of closing Lemon Studio.
+- Windows has limited in-process containment for certain native exceptions from hosted plugins. It is not a guarantee
+  against heap corruption, aborts or faults in plugin-owned threads. macOS and Linux do **not** recover from native
+  plugin faults: the process can exit. Save frequently and keep backups; full isolation requires plugin subprocesses.
 - `lemonstudio.exe` is a Windows GUI program: started from Explorer, the Start menu or a shortcut it opens no console
   window. Under `cargo run` its output goes to the terminal as before. Started directly from a terminal it prints there
   too, but the terminal does not wait for it: for `--render`, add `| Out-Default` in PowerShell (or use
@@ -217,6 +228,8 @@ application menu (the desktop entry also names the icon under native Wayland):
 cargo install --path crates/os-app
 install -Dm644 crates/os-app/assets/lemonstudio.png ~/.local/share/icons/hicolor/256x256/apps/lemonstudio.png
 install -Dm644 crates/os-app/assets/lemonstudio.desktop ~/.local/share/applications/lemonstudio.desktop
+xdg-mime install --mode user crates/os-app/assets/lemonstudio-mime.xml
+update-desktop-database ~/.local/share/applications
 ```
 
 **Plugins:** `cargo run -p os-app --release` installs Lemon Studio's plugins in `~/.vst3` and `~/.clap`. To build and
@@ -246,8 +259,9 @@ Windows (or detach, from their window menu). A few things differ from Windows fo
 
 ### macOS
 
-macOS 11 or newer. macOS is supported at the same level as Linux, with the same features, and
-continuous integration builds and tests every change on macOS alongside Windows and Linux.
+macOS 11 or newer. The same core feature set is targeted as on Linux; full parity and compatibility with real
+devices and plugins have not yet passed release qualification. CI runs source builds and an owned executable smoke
+on macOS alongside Windows and Linux when the workflow is executed.
 
 **Prerequisites:** the Xcode Command Line Tools, which bring the compiler and libclang: `xcode-select --install`. Xcode
 itself is not needed (only to regenerate the app icon, see `tools/logo/macos-icon.sh`).
@@ -260,7 +274,8 @@ cargo run -p os-app --release
 
 **Install** Lemon Studio as an app, `Lemon Studio.app` in `~/Applications`, with its icon: it opens from Launchpad,
 Spotlight or the Dock (on macOS 26 and later its icon follows the light, dark, tinted and clear icon styles), and the
-Finder opens `.flp` projects with it. Without `--install` the app is only written to `target/bundled/`.
+Finder opens native `.lemon` sessions or imported `.flp` projects with it. Without `--install` the app is only written
+to `target/bundled/`. The locally generated bundle is **ad-hoc signed**, not Developer ID signed or notarized.
 
 ```bash
 cargo run -p bundle-app -- --install
@@ -309,6 +324,13 @@ render runs without a window, hosting the same plugins the app would and without
 cargo run -p os-app --release -- --render path/to/project.flp out.wav [--rate 48000] [--seconds 30] [--from TICK] [--builtin-only]
 ```
 
+If a recording is interrupted, the recovery command can finish a retained `.wav.part` take without replacing an
+existing WAV at the original destination:
+
+```bash
+cargo run -p os-app --release -- --recover-recording path/to/take.wav.part
+```
+
 `--builtin-only` hosts only Lemon Studio's own plugins, for a render that is the same on every machine.
 Settings > Theme picks the skin (Lemon, or Citrus, the look formerly called Classic) and the theme; the choice is
 remembered.
@@ -328,6 +350,15 @@ cargo test --workspace
 Tests that need an audio device are marked `#[ignore]` and run with `cargo test -p os-app -- --ignored`.
 Project-file corpus tests run when `OPENSTUDIO_FLP_CORPUS` points to a text file listing `.flp` paths;
 project files are never committed to this repository.
+The three-platform CI additionally stages the actual release executable and all 25 VST3/CLAP plugin pairs, checks
+native module types, ships GPL and third-party notices, generates SHA-256 manifests, and runs
+`tools/qualification/owned_workflow.py` on that staged executable (native save, cold-open EQ, two finite deterministic
+renders and interrupted-take recovery). Licensed external fixture tests run **separately**, fail closed when required
+fixtures are missing, and remain a release blocker: see [production readiness](docs/production-readiness.md).
+On a successful three-platform CI run, download the `lemon-<platform>-<commit>` artifact from the corresponding
+[GitHub Actions run](https://github.com/boop-bip80/DAW-2/actions/workflows/ci.yml); it contains the portable archive,
+its SHA-256 sidecar, staging JSON and the owned synthetic-workflow report/logs. Artifacts expire after 14 days.
+An artifact is **not** a signed, installed, hardware-qualified or production-ready release.
 The watermark test (`cargo test -p watermark`) checks that every source file opens with its header: a copyright line
 for each of its copyright holders, its SPDX licence identifier and the project's name.
 

@@ -92,9 +92,21 @@ pub fn plugin_ref(d: &Descriptor, state: Vec<u8>) -> PluginRef {
 /// plugin holding the plugin's identity and current state. A channel or slot the file already held as a wrapped
 /// plugin keeps the wrapper records Lemon Studio does not edit. A copy in another format that stands in for the plugin
 /// the file names, and that the user has not edited, leaves the file's wrapper as it is ([`untouched_stand_in`]).
-pub fn store_hosted(proj: &mut Project, plugins: &Plugins) {
+pub fn store_hosted(proj: &mut Project, plugins: &Plugins) -> Result<(), String> {
+    if let Some(error) = &plugins.identity_error {
+        return Err(error.clone());
+    }
+    // A failed capture must not turn a valid saved state into an empty/default plugin, nor leave a partly
+    // updated project behind. Only publish this snapshot after every required plugin supplied its state.
+    let mut snapshot = proj.clone();
+    store_hosted_into(&mut snapshot, plugins)?;
+    *proj = snapshot;
+    Ok(())
+}
+
+fn store_hosted_into(proj: &mut Project, plugins: &Plugins) -> Result<(), String> {
     // Containers keep their effects' states in their own slot state.
-    crate::container::store_members(proj, plugins);
+    crate::container::store_members(proj, plugins)?;
     for key in plugins.hosted.range(..crate::plugins::MEMBER_KEY).map(|(&k, _)| k).collect::<Vec<_>>() {
         let Some(d) = plugins.descriptor(key) else { continue };
         if d.format == Format::Native {
@@ -103,9 +115,8 @@ pub fn store_hosted(proj: &mut Project, plugins: &Plugins) {
             if plugins.hosted.get(&key).is_some_and(|h| h.keep_file_state) {
                 continue;
             }
-            if let Some(state) = plugins.state(key) {
-                store_native(proj, key, state);
-            }
+            let state = plugins.state(key).ok_or_else(|| format!("{} could not save its state; the project was not saved", d.name))?;
+            store_native(proj, key, state);
             continue;
         }
         if !is_wrapped(&d) || plays_fl_slot(proj, key, &d) {
@@ -114,7 +125,8 @@ pub fn store_hosted(proj: &mut Project, plugins: &Plugins) {
         if untouched_stand_in(proj, plugins, key, &d) {
             continue;
         }
-        let r = plugin_ref(&d, plugins.state(key).unwrap_or_default());
+        let state = plugins.state(key).ok_or_else(|| format!("{} could not save its state; the project was not saved", d.name))?;
+        let r = plugin_ref(&d, state);
         match fx_of(key) {
             None => {
                 let Some(ch) = proj.channels.get_mut(key).filter(|c| c.kind == ChannelKind::Plugin) else { continue };
@@ -130,6 +142,7 @@ pub fn store_hosted(proj: &mut Project, plugins: &Plugins) {
             }
         }
     }
+    Ok(())
 }
 
 /// Whether the built-in effect `d` hosted under `key` plays a slot that `proj` stores as the FL effect it recreates
@@ -331,10 +344,21 @@ impl crate::app::App {
             if self.past_deadline() {
                 break;
             }
-            let made = find(&self.plugins.available, &r).map(|i| {
+            let owner = self.state.project.channels[row].id.0;
+            let index = match self.plugins.saved_identities.get(&owner) {
+                Some(identity) => self.plugins.index_of_uid(&identity.uid),
+                None => find(&self.plugins.available, &r),
+            };
+            let made = index.map(|i| {
                 let other = switched_format(&self.plugins.available[i].desc, &r);
                 let state = other.is_none().then_some(r.state.as_slice());
-                (other, self.plugins.create_with(row, i, state))
+                let result = self.plugins.create_with(row, i, state).and_then(|name| {
+                    self.plugins.restore_identity(row, owner).map(|()| name)
+                });
+                if result.is_err() {
+                    self.plugins.drop_key(row);
+                }
+                (other, result)
             });
             match made {
                 Some((other, Ok(_))) => {
@@ -371,10 +395,22 @@ impl crate::app::App {
             if self.past_deadline() {
                 break;
             }
-            let made = find(&self.plugins.effects, &r).map(|i| {
+            let key = fx_key(t, k);
+            let owner = crate::control::command::key_owner(&self.state, key).unwrap_or(0);
+            let index = match self.plugins.saved_identities.get(&owner) {
+                Some(identity) => self.plugins.effect_index_of_uid(&identity.uid),
+                None => find(&self.plugins.effects, &r),
+            };
+            let made = index.map(|i| {
                 let other = switched_format(&self.plugins.effects[i].desc, &r);
                 let state = other.is_none().then_some(r.state.as_slice());
-                (other, self.plugins.create_effect(t, k, i, state))
+                let result = self.plugins.create_effect(t, k, i, state).and_then(|name| {
+                    self.plugins.restore_identity(key, owner).map(|()| name)
+                });
+                if result.is_err() {
+                    self.plugins.drop_key(key);
+                }
+                (other, result)
             });
             match made {
                 Some((other, Ok(_))) => {
@@ -415,6 +451,25 @@ impl crate::app::App {
         if added.0 || added.1 || !missing.is_empty() {
             self.state.piano.dirty = true;
             self.invalidate();
+        }
+    }
+
+    /// Instances created by builtin/container routes take their owner's persisted mapping after `follow_ids` assigns
+    /// owners. Wrapped plugins use the same restoration before they are attached to the transport.
+    pub(crate) fn restore_plugin_identities(&mut self) {
+        let pending: Vec<_> = self.plugins.hosted.iter().filter(|(_, h)| !h.identity_restored && !h.owner.is_none())
+            .map(|(&key, h)| (key, h.owner.0)).collect();
+        let mut failed = Vec::new();
+        for (key, owner) in pending {
+            if let Err(error) = self.plugins.restore_identity(key, owner) {
+                self.plugins.drop_key(key);
+                failed.push(error);
+            }
+        }
+        if !failed.is_empty() {
+            self.transport.set_instruments(self.plugins.instruments());
+            self.transport.set_effects(self.plugins.effects());
+            self.state.message = Some(format!("Plugin automation could not be restored; saved bytes retained: {}", failed.join("; ")));
         }
     }
 
@@ -523,9 +578,11 @@ impl crate::app::App {
             }
         }
         if added.0 {
+            self.prepare_plugin_routing();
             self.transport.set_instruments(self.plugins.instruments());
         }
         if added.1 {
+            self.prepare_plugin_routing();
             self.transport.set_effects(self.plugins.effects());
         }
         let mut parts = Vec::new();
@@ -590,7 +647,9 @@ impl crate::app::App {
             list.retain(|k| !all.contains(k));
         }
         if !swap.is_empty() {
+            self.prepare_plugin_routing();
             self.transport.set_instruments(self.plugins.instruments());
+            self.prepare_plugin_routing();
             self.transport.set_effects(self.plugins.effects());
             self.state.piano.dirty = true;
         }
@@ -614,11 +673,170 @@ impl crate::app::App {
     }
 }
 
+/// One native-file position and the runtime owner it currently names. Owners follow moves/undo; file positions
+/// resolve them again on a cold open, when the control plane assigns new runtime IDs.
+#[derive(Clone, Copy)]
+struct IdentityPlace {
+    kind: u8,
+    number: u16,
+    slot: u8,
+    member: u32,
+    owner: u32,
+}
+
+fn identity_places(s: &crate::app::State) -> Vec<IdentityPlace> {
+    let mut places = Vec::new();
+    let mut add = |kind, number, slot, owner, container: Option<&[u8]>| {
+        places.push(IdentityPlace { kind, number, slot, member: 0, owner });
+        if let Some(members) = container.and_then(crate::container::decode) {
+            for member in members {
+                if let Some(owner) = crate::control::command::member_owner(owner, member.id) {
+                    places.push(IdentityPlace { kind, number, slot, member: member.id, owner });
+                }
+            }
+        }
+    };
+    for (row, channel) in s.project.channels.iter().enumerate() {
+        if let Ok(row) = u16::try_from(row) {
+            add(0, row, 0, channel.id.0, channel.plugin_state.as_deref());
+        }
+    }
+    for track in &s.project.mixer {
+        for (slot, plugin) in track.slots.iter().enumerate().filter_map(|(k, p)| p.as_ref().map(|p| (k, p))) {
+            add(1, track.index, slot as u8, plugin.id.0, Some(&plugin.state));
+        }
+    }
+    places
+}
+
+/// LMex204, layout1: count u32; per entry kind u8 (0 channel/1 mixer slot), number u16, slot u8, member u32
+/// (0 for the containing instance), UTF-8 UID length u32 and bytes, parameter count u32 and IDs u32. The plugin's
+/// own saved state stays byte-for-byte in the wrapper/container. Unresolved instances keep their original metadata.
+pub fn native_identity_event(s: &crate::app::State, plugins: &Plugins) -> os_flp::Event {
+    let mut identities = plugins.saved_identities.clone();
+    for (&key, h) in &plugins.hosted {
+        if h.stand_in || h.identity.uid.is_empty() {
+            continue;
+        }
+        let owner = if h.owner.is_none() { crate::control::command::key_owner(s, key) } else { Some(h.owner.0) };
+        if let Some(owner) = owner.filter(|&id| id != 0) {
+            identities.insert(owner, h.identity.clone());
+        }
+    }
+    let entries: Vec<_> = identity_places(s).into_iter().filter_map(|place| identities.get(&place.owner).map(|identity| (place, identity))).collect();
+    let mut bytes = vec![1];
+    bytes.extend((entries.len() as u32).to_le_bytes());
+    for (place, identity) in entries {
+        bytes.push(place.kind);
+        bytes.extend(place.number.to_le_bytes());
+        bytes.push(place.slot);
+        bytes.extend(place.member.to_le_bytes());
+        bytes.extend((identity.uid.len() as u32).to_le_bytes());
+        bytes.extend(identity.uid.as_bytes());
+        bytes.extend((identity.parameters.len() as u32).to_le_bytes());
+        for id in &identity.parameters {
+            bytes.extend(id.to_le_bytes());
+        }
+    }
+    os_flp::Event::new(os_flp::lemon::PLUGIN_IDENTITIES, os_flp::Value::var(bytes))
+}
+
+pub fn read_native_identities(s: &crate::app::State, plugins: &mut Plugins, data: &[u8]) -> Result<(), String> {
+    struct Read<'a>(&'a [u8]);
+    impl<'a> Read<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let value = self.0.get(..n)?;
+            self.0 = &self.0[n..];
+            Some(value)
+        }
+        fn byte(&mut self) -> Option<u8> { Some(self.take(1)?[0]) }
+        fn word(&mut self) -> Option<u32> { Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?)) }
+    }
+    let invalid = || "The project's plugin identity metadata is invalid; the original project must be kept".to_string();
+    let mut read = Read(data);
+    if read.byte() != Some(1) {
+        return Err(invalid());
+    }
+    let count = read.word().ok_or_else(invalid)? as usize;
+    if count > 65_536 || count > read.0.len() / 16 {
+        return Err(invalid());
+    }
+    let places = identity_places(s);
+    let mut found = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let kind = read.byte().ok_or_else(invalid)?;
+        let number = u16::from_le_bytes(read.take(2).ok_or_else(invalid)?.try_into().map_err(|_| invalid())?);
+        let slot = read.byte().ok_or_else(invalid)?;
+        let member = read.word().ok_or_else(invalid)?;
+        let length = read.word().ok_or_else(invalid)? as usize;
+        if length > 4096 { return Err(invalid()); }
+        let uid = std::str::from_utf8(read.take(length).ok_or_else(invalid)?).map_err(|_| invalid())?.to_owned();
+        let length = read.word().ok_or_else(invalid)? as usize;
+        if length > 65_536 { return Err(invalid()); }
+        let parameters: Vec<_> = read.take(length.checked_mul(4).ok_or_else(invalid)?).ok_or_else(invalid)?
+            .chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        if uid.is_empty() || !os_host::ParamOrder::valid(&parameters) { return Err(invalid()); }
+        if let Some(place) = places.iter().find(|p| (p.kind, p.number, p.slot, p.member) == (kind, number, slot, member)) {
+            if place.owner != 0 && found.insert(place.owner, crate::plugins::PluginIdentity { uid, parameters }).is_some() {
+                return Err(invalid());
+            }
+        }
+    }
+    if !read.0.is_empty() { return Err(invalid()); }
+    plugins.saved_identities = found;
+    plugins.identity_error = None;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::App;
     use crate::plugins::{fx_key, LEMON_EQ, LEMON_SAMPLER};
+
+    #[test]
+    fn native_plugin_metadata_survives_cold_owner_ids_missing_plugins_and_moves() {
+        use crate::plugins::PluginIdentity;
+        let mut a = App::new(None);
+        a.state.project = crate::app::test_project();
+        a.state.project.channels[0].id = os_model::Id(101);
+        a.state.project.channels[1].id = os_model::Id(102);
+        let member = crate::container::Member { id: 2, instrument: false, uid: "clap:missing-effect".into(), name: "Missing effect".into(), wet: 1.0, dry: 0.0, state: vec![5, 6] };
+        a.state.project.mixer[0].slots[0] = Some(SlotPlugin { id: os_model::Id(202), name: crate::container::CONTAINER.into(), state: crate::container::encode(&[member]) });
+        a.plugins.clear();
+        let instrument = PluginIdentity { uid: "clap:missing-instrument".into(), parameters: vec![73, 42] };
+        let effect = PluginIdentity { uid: "clap:missing-effect".into(), parameters: vec![12, 18] };
+        a.plugins.saved_identities.insert(101, instrument.clone());
+        a.plugins.saved_identities.insert(crate::control::command::member_owner(202, 2).unwrap(), effect.clone());
+        let event = native_identity_event(&a.state, &a.plugins);
+        let original = event.data().unwrap().to_vec();
+
+        let mut b = App::new(None);
+        b.plugins.clear();
+        b.state.project = a.state.project.clone();
+        b.state.project.channels[0].id = os_model::Id(901);
+        b.state.project.channels[1].id = os_model::Id(902);
+        b.state.project.mixer[0].slots[0].as_mut().unwrap().id = os_model::Id(903);
+        read_native_identities(&b.state, &mut b.plugins, &original).unwrap();
+        assert_eq!(b.plugins.saved_identities.get(&901), Some(&instrument));
+        assert_eq!(b.plugins.saved_identities.get(&crate::control::command::member_owner(903, 2).unwrap()), Some(&effect));
+        assert_eq!(native_identity_event(&b.state, &b.plugins).data().unwrap(), original.as_slice(), "saving without loaded plugins retains all metadata");
+
+        b.state.project.channels.swap(0, 1);
+        let moved = native_identity_event(&b.state, &b.plugins);
+        let mut c = App::new(None);
+        c.plugins.clear();
+        c.state.project = b.state.project.clone();
+        c.state.project.channels[1].id = os_model::Id(1234);
+        read_native_identities(&c.state, &mut c.plugins, moved.data().unwrap()).unwrap();
+        assert_eq!(c.plugins.saved_identities.get(&1234), Some(&instrument), "a rack move follows its owner into the saved file");
+
+        let before = c.plugins.saved_identities.clone();
+        let mut malformed = moved.data().unwrap().to_vec();
+        malformed.pop();
+        assert!(read_native_identities(&c.state, &mut c.plugins, &malformed).is_err());
+        assert_eq!(c.plugins.saved_identities, before, "a partial metadata read cannot replace good mappings");
+    }
 
     /// A hosted plugin channel and a mixer slot plugin are saved as wrapped plugins holding their identity and state,
     /// and the reopened project hosts them again with that state; a second save keeps working on the saved file

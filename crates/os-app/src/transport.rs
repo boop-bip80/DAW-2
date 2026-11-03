@@ -71,7 +71,7 @@ const MARGIN_MAX: f64 = 0.006;
 /// tick (a tick at 10 BPM and 24 PPQ at 192 kHz is 96 000 samples).
 const QUEUE_SAMPLES: usize = 1 << 19;
 const QUEUE_TICKS: usize = 1 << 12;
-const TICK_ROOM: usize = 1 << 17;
+
 /// Frames the queue is filled with before a stream starts (the device's block size is not known yet).
 const PREFILL_FRAMES: usize = 1024;
 
@@ -100,6 +100,9 @@ pub struct Shared {
     sample_rate: AtomicU32,
     /// An export is running, its progress in 1/1000 of the song, and its outcome once done.
     exporting: AtomicBool,
+    /// Cancellation can be requested by the UI while the audio thread is synchronously rendering. Commands on
+    /// that same queue cannot interrupt a render, so a separate atomic must be observed between render ticks.
+    cancel_export: AtomicBool,
     export_permille: AtomicU32,
     export_result: Mutex<Option<Result<(f64, Vec<PathBuf>), String>>>,
     /// Peak of the last block, f32 bits, per side.
@@ -112,6 +115,9 @@ pub struct Shared {
     tap: Mutex<Tap>,
     /// The playback's last block: how the position moves through it while the device plays it (`Transport::tick`).
     pace: Mutex<Option<Pace>>,
+    /// Fixed storage of device timing segments for timestamped recording after delayed UI polling.
+    pace_history: Mutex<PaceHistory>,
+    input_late: AtomicU64,
     /// Peaks per mixer track (L, R) since the mixer meters last read them (`TrackPeaks`).
     tracks: Mutex<TrackPeaks>,
     /// Device blocks the queue could not fill since the program started.
@@ -312,7 +318,44 @@ struct Pace {
     rate: u32,
 }
 
+/// A bounded history: insertion in the device callback never allocates. Old or discontinuous timestamps clamp
+/// to an observed boundary and are counted, rather than pretending the current UI tick was the arrival time.
+struct PaceHistory { records: [Option<Pace>; 1024], next: usize, len: usize }
+impl Default for PaceHistory {
+    fn default() -> Self { Self { records: [None; 1024], next: 0, len: 0 } }
+}
+impl PaceHistory {
+    fn push(&mut self, pace: Pace) {
+        self.records[self.next] = Some(pace);
+        self.next = (self.next + 1) % self.records.len();
+        self.len = (self.len + 1).min(self.records.len());
+    }
+    fn tick_at(&self, at: Instant) -> Option<(f64, bool)> {
+        if self.len == 0 { return None; }
+        let first = (self.next + self.records.len() - self.len) % self.records.len();
+        let oldest = self.records[first]?;
+        if at < oldest.at { return Some((oldest.from.1, true)); }
+        for step in 0..self.len {
+            let i = (self.next + self.records.len() - 1 - step) % self.records.len();
+            let p = self.records[i]?;
+            if p.at <= at { return Some((p.at(at).1, false)); }
+        }
+        Some((oldest.from.1, true))
+    }
+}
+
 impl Pace {
+    /// Project a MIDI ingress timestamp onto the audio clock in either direction from the most recent callback.
+    /// An input drained after a new callback often predates `at`; mapping every such event to `from` destroys
+    /// its 2–5 ms separation even before render-ahead clamping is considered.
+    fn input_frame(&self, at: Instant) -> u64 {
+        let frames = |d: Duration| (d.as_secs_f64() * f64::from(self.rate)).round() as u64;
+        match at.checked_duration_since(self.at) {
+            Some(d) => self.from.0.saturating_add(frames(d)),
+            None => self.from.0.saturating_sub(frames(self.at.duration_since(at))),
+        }
+    }
+
     /// How far through the block the device is by `now`, 0..1.
     fn share(&self, now: Instant) -> f64 {
         let length = self.frames as f64 / f64::from(self.rate);
@@ -337,6 +380,7 @@ impl Pace {
 impl Shared {
     /// Back to the start: position, meters and lit keys.
     fn rewind(&self, tick: f64) {
+        if let Ok(mut history) = self.pace_history.lock() { *history = PaceHistory::default(); }
         self.position.store(0, Ordering::Relaxed);
         self.tick.store(tick.to_bits(), Ordering::Relaxed);
         self.tempo.store(0, Ordering::Relaxed);
@@ -404,6 +448,9 @@ enum Cmd {
     NoteOff(usize, u16),
     /// A controller message for a channel (rack position): message, pitch bend range in cents (`Engine::midi`).
     Midi(usize, [u8; 3], f64),
+    InputOn(usize, u16, u8, u8, u64, Instant),
+    InputOff(usize, u16, u8, u64, Instant),
+    InputMidi(usize, [u8; 3], f64, Instant),
     /// A tap on the Tempo tapper: a click, accented or not, at the metronome's volume (dB), like a live note.
     TapClick(bool, i8),
     /// An instrument's editor opened or the last one closed (`Transport::listen`).
@@ -581,8 +628,17 @@ impl Transport {
         self.shared.generation.fetch_add(1, Ordering::AcqRel);
         self.shared.state.store(STOPPED, Ordering::Release);
         self.shared.export_permille.store(0, Ordering::Relaxed);
+        self.shared.cancel_export.store(false, Ordering::Release);
         self.shared.exporting.store(true, Ordering::Release);
         let _ = self.tx.send(Cmd::Export(Box::new(project.clone()), mode, rate, Box::new(job)));
+    }
+
+    /// Ask the synchronous offline renderer to stop at its next tick. A cancelled streaming render drops its raw
+    /// spool files and does not replace any output. A completed export still reports through `export_status`.
+    pub fn cancel_export(&self) -> bool {
+        if !self.shared.exporting.load(Ordering::Acquire) { return false; }
+        self.shared.cancel_export.store(true, Ordering::Release);
+        true
     }
 
     /// The running export's progress, or its outcome once (then `Idle` again).
@@ -651,8 +707,10 @@ impl Transport {
         let rate = info.as_ref().map_or(48000, |d| d.rate);
         let block = u64::from(self.block().max(64));
         let margin = (f64::from(rate) * MARGIN_MAX) as u64;
+        let asio = info.as_ref().is_some_and(|d| d.host == crate::device::ASIO);
         let device = info.filter(|d| d.host == crate::device::ASIO).map_or(0, |d| u64::from(d.latency.unwrap_or(0)) + u64::from(d.input_latency.unwrap_or(0)));
-        device + 2 * block + margin + tick + block + margin
+        let conversion = if asio { 0 } else { crate::device::system_input::conversion_delay() };
+        device + conversion + 2 * block + margin + tick + block + margin
     }
 
     /// What plays next may not be what `update` last sent: its next project goes whole.
@@ -698,6 +756,16 @@ impl Transport {
     /// Start a live note: mixed into playback while playing, else on the live stream (kept open, so
     /// only the first note pays for opening the device). The live stream uses the project from the
     /// last `play` / `update`.
+    pub fn note_on_input(&self, row: usize, key: u16, velocity: u8, midi: u8, id: u64, at: Instant) {
+        let _ = self.tx.send(Cmd::InputOn(row,key,velocity,midi,id,at));
+    }
+    pub fn note_off_input(&self, row: usize, key: u16, midi: u8, id: u64, at: Instant) {
+        let _ = self.tx.send(Cmd::InputOff(row,key,midi,id,at));
+    }
+    pub fn midi_at(&self, row: usize, bytes: [u8;3], bend_cents: f64, at: Instant) {
+        let _ = self.tx.send(Cmd::InputMidi(row,bytes,bend_cents,at));
+    }
+
     pub fn note_on(&self, channel: usize, key: u16, velocity: u8) {
         self.note_on_midi(channel, key, velocity, 0);
     }
@@ -807,6 +875,20 @@ impl Transport {
     pub fn tick(&self) -> f64 {
         self.paced().map_or_else(|| f64::from_bits(self.shared.tick.load(Ordering::Relaxed)), |p| p.at(Instant::now()).1)
     }
+
+    /// Song position at MIDI ingress, using retained device blocks instead of the time the UI drains its queue.
+    pub fn tick_at(&self, at: Instant) -> f64 {
+        if !self.playing() { return self.tick(); }
+        if let Some((tick, late)) = self.shared.pace_history.lock().ok().and_then(|h| h.tick_at(at)) {
+            if late { self.shared.input_late.fetch_add(1, Ordering::Relaxed); }
+            return tick;
+        }
+        self.shared.input_late.fetch_add(1, Ordering::Relaxed);
+        self.tick()
+    }
+
+    /// Inputs whose requested position had already been rendered, or predates the bounded recording clock history.
+    pub fn late_inputs(&self) -> u64 { self.shared.input_late.load(Ordering::Relaxed) }
 
     pub fn seconds(&self) -> f64 {
         let rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
@@ -964,6 +1046,7 @@ struct Queue {
     ended: AtomicBool,
     /// Largest number of frames the device asked for at once (0 until it asked).
     block: AtomicUsize,
+    pace: Mutex<Option<Pace>>,
 }
 
 impl Queue {
@@ -978,6 +1061,7 @@ impl Queue {
             ticks_read: AtomicU64::new(0),
             ended: AtomicBool::new(false),
             block: AtomicUsize::new(0),
+            pace: Mutex::new(None),
         }
     }
 
@@ -986,14 +1070,16 @@ impl Queue {
         self.written.load(Ordering::Acquire).saturating_sub(self.read.load(Ordering::Acquire))
     }
 
-    /// Room for one more tick.
-    fn has_room(&self) -> bool {
-        self.queued() as usize + TICK_ROOM <= QUEUE_SAMPLES
-            && self.ticks_written.load(Ordering::Relaxed) - self.ticks_read.load(Ordering::Acquire) < QUEUE_TICKS as u64 - 1
+    /// Available complete frames, with room for a corresponding timing record.
+    fn room(&self) -> usize {
+        if self.ticks_written.load(Ordering::Relaxed).saturating_sub(self.ticks_read.load(Ordering::Acquire)) >= QUEUE_TICKS as u64 - 1 { return 0; }
+        let room = QUEUE_SAMPLES.saturating_sub(self.queued() as usize);
+        room / self.w * self.w
     }
 
-    /// Feeder: appends one tick (call `has_room` first).
-    fn push(&self, s: &[f32], tick: f64, frame: u64, held: bool, tick_frames: u64) {
+    /// Appends only a complete, admitted chunk. A too-large write cannot overwrite unread samples.
+    fn push(&self, s: &[f32], tick: f64, frame: u64, held: bool, tick_frames: u64) -> bool {
+        if s.is_empty() || s.len() % self.w != 0 || s.len() > self.room() { return false; }
         let w = self.written.load(Ordering::Relaxed);
         for (i, &v) in s.iter().enumerate() {
             self.samples[(w as usize + i) % QUEUE_SAMPLES].store(v.to_bits(), Ordering::Relaxed);
@@ -1008,6 +1094,7 @@ impl Queue {
         rec[5].store(tick_frames, Ordering::Relaxed);
         self.ticks_written.store(tw + 1, Ordering::Release);
         self.written.store(w + s.len() as u64, Ordering::Release);
+        true
     }
 
     /// Callback: copies up to `out.len()` samples and returns how many.
@@ -1058,6 +1145,9 @@ struct Feeder {
     rendered: u64,
     /// The engine's voices after the last fill (registered in `Shared::engine_voices`).
     voices: Arc<AtomicU32>,
+    pending: Vec<f32>,
+    pending_at: usize,
+    pending_meta: (f64, u64, bool, u64),
 }
 
 /// Frames a stream keeps queued beyond a device block of `block` frames (see `MARGIN_MIN`).
@@ -1073,7 +1163,7 @@ impl Feeder {
     fn fill(&mut self, block: usize) {
         let block = block.max(self.queue.block.load(Ordering::Relaxed)) as u64;
         let w = self.queue.w as u64;
-        let want = w * (block + margin(block, self.rate));
+        let want = (w * (block + margin(block, self.rate))).min((QUEUE_SAMPLES / self.queue.w * self.queue.w) as u64);
         let Ok(mut e) = self.engine.lock() else { return };
         // Song playback loops over the loop points as they are now.
         if self.ctl.report.load(Ordering::Relaxed) {
@@ -1091,25 +1181,35 @@ impl Feeder {
         }
         let t0 = Instant::now();
         let mut frames = 0u64;
-        while self.queue.queued() < want && self.queue.has_room() {
-            match e.next_tick() {
-                None => {
-                    self.queue.ended.store(true, Ordering::Release);
-                    break;
-                }
-                Some((s, tick, frame, held, tick_frames)) => {
-                    frames += s.len() as u64 / w;
-                    let at = self.queue.written.load(Ordering::Relaxed) / w;
-                    self.queue.push(s, tick, frame, held, tick_frames);
-                    // The playback's meters wait for the device to play this tick.
-                    if self.meters && self.ctl.report.load(Ordering::Relaxed) {
-                        if let Ok(mut t) = self.shared.tracks.lock() {
-                            t.tick(at, &mut e);
+        while self.queue.queued() < want && self.queue.room() > 0 {
+            if self.pending_at >= self.pending.len() {
+                match e.next_tick() {
+                    None => { self.queue.ended.store(true, Ordering::Release); break; }
+                    Some((samples,tick,frame,held,tick_frames)) => {
+                        frames += samples.len() as u64 / w;
+                        self.pending.clear();
+                        self.pending.extend_from_slice(samples);
+                        self.pending_at = 0;
+                        self.pending_meta = (tick,frame,held,tick_frames);
+                        let at = self.queue.written.load(Ordering::Relaxed) / w;
+                        if self.meters && self.ctl.report.load(Ordering::Relaxed) {
+                            if let Ok(mut t) = self.shared.tracks.lock() { t.tick(at, &mut e); }
                         }
                     }
-                    self.queue.ended.store(e.finished(), Ordering::Release);
                 }
             }
+            let n = (self.pending.len() - self.pending_at).min(self.queue.room());
+            let n = n.min((want - self.queue.queued()) as usize).max(self.queue.w) / self.queue.w * self.queue.w;
+            let into = (self.pending_at / self.queue.w) as u64;
+            let (tick,frame,held,tick_frames) = self.pending_meta;
+            let tick = if held { tick } else { tick + into as f64 / tick_frames.max(1) as f64 };
+            // A paused/count-in tick can straddle multiple queue chunks. Its *audio* advances within the tick,
+            // but its published song frame must not: adding `into` to a held chunk caused a one-frame (or larger)
+            // playhead creep when the queue cut a held tick at a device-block boundary.
+            let position_frame = if held {frame} else {frame + into};
+            if !self.queue.push(&self.pending[self.pending_at..self.pending_at+n], tick, position_frame, held, tick_frames) { break; }
+            self.pending_at += n;
+            self.queue.ended.store(self.pending_at == self.pending.len() && e.finished(), Ordering::Release);
             // The song came to a Marker pause: the transport is paused there, as by the Play button (spec:
             // audio/transport.md "Time markers in SONG mode").
             if let Some(t) = e.take_marker_pause() {
@@ -1277,35 +1377,72 @@ fn engine(project: &Project, library: &mut SampleLibrary, rate: u32, mode: PlayM
 /// `job`; returns the written length in seconds and the files. Runs on the audio thread with no stream open.
 // spec: audio/export.md
 fn export(project: &Project, mode: PlayMode, rate: u32, job: &crate::export::Job, library: &mut SampleLibrary, inst: &Instruments, shared: &Shared) -> Result<(f64, Vec<PathBuf>), String> {
+    const CANCELLED: &str = "Export cancelled; existing output files were preserved";
+    if shared.cancel_export.load(Ordering::Acquire) { return Err(CANCELLED.into()); }
     let o = &job.options;
     let mut e = engine(project, library, rate, mode, inst, true);
     e.set_interpolation(o.points);
     e.set_effects(o.insert_fx, o.master_fx);
+    if o.tail == crate::export::Tail::Fixed {
+        e.set_tail_frames(Some(u64::from(rate) * crate::export::FIXED_TAIL_SECONDS));
+    }
     match job.span {
         Some((a, b)) => e.set_span(a, b),
         // A whole song follows its start and skip markers (spec: audio/song-structure.md "Time markers").
         None if mode == PlayMode::Song => e.follow_markers(),
         None => {}
     }
-    e.set_track_capture(o.split);
+    if job.tracks.is_empty() { e.set_track_capture(o.split); }
+    else { e.set_track_capture_selection(&job.tracks.iter().map(|&t| usize::from(t)).collect::<Vec<_>>()); }
     let len = e.frames_left().max(1);
-    // Cut needs nothing past the song's end.
-    let cap = if o.tail == crate::export::Tail::Cut { len } else { len + u64::from(rate) * EXPORT_TAIL_MAX_SECS };
-    let mut audio: Vec<f32> = Vec::with_capacity(2 * (len as usize + rate as usize));
-    loop {
-        let done = e.render_ticks(32, &mut audio);
-        let frames = audio.len() as u64 / 2;
-        shared.export_permille.store((frames * 1000 / len).min(999) as u32, Ordering::Relaxed);
-        if done || frames >= cap {
-            break;
-        }
+    let cap = match o.tail {
+        crate::export::Tail::Cut => len,
+        crate::export::Tail::Fixed => len.saturating_add(u64::from(rate)*crate::export::FIXED_TAIL_SECONDS),
+        _ => len.saturating_add(u64::from(rate)*EXPORT_TAIL_MAX_SECS),
+    };
+    let streaming=crate::export::can_stream(job,rate);
+    let track_count=if !job.tracks.is_empty() {job.tracks.len()+1} else if o.split {project.mixer.len().max(1)+1} else {1};
+    let ratio=if o.rate==0 {1.0} else {(f64::from(o.rate)/f64::from(rate)).max(1.0)};
+    if !streaming && (len as f64*2.0*track_count as f64*ratio) > crate::export::BUFFERED_SAMPLE_LIMIT as f64 {
+        return Err("This codec/resampling export exceeds the bounded buffer limit. Use 32-bit float WAV at the device rate, or export a shorter range.".into());
     }
-    let tracks = e.take_track_audio();
+    let mut sink=if streaming {Some(crate::export::WaveStream::new(job,rate,len)?)} else {None};
+    let mut audio=Vec::new();
+    let mut tracks:Vec<Vec<f32>>=Vec::new();
+    let mut block=Vec::new();
+    let mut frames=0u64;
+    loop {
+        if shared.cancel_export.load(Ordering::Acquire) { return Err(CANCELLED.into()); }
+        block.clear();
+        let done=e.render_ticks(1,&mut block);
+        let take=((cap.saturating_sub(frames) as usize).saturating_mul(2)).min(block.len());
+        block.truncate(take);
+        let mut tick_tracks=e.take_track_audio();
+        for track in &mut tick_tracks {track.truncate(take);}
+        frames+=block.len() as u64/2;
+        if let Some(sink)=&mut sink {
+            sink.push(&block,&tick_tracks)?;
+        } else {
+            let held=audio.len()+tracks.iter().map(Vec::len).sum::<usize>();
+            let next=block.len()+tick_tracks.iter().map(Vec::len).sum::<usize>();
+            if (held.saturating_add(next) as f64*ratio)>crate::export::BUFFERED_SAMPLE_LIMIT as f64 {
+                return Err("Export reached the bounded codec buffer limit; use native-rate 32-bit float WAV or a shorter range. Existing output files were preserved.".into());
+            }
+            audio.extend_from_slice(&block);
+            tracks.resize_with(tick_tracks.len(),Vec::new);
+            for (out,tick) in tracks.iter_mut().zip(tick_tracks) {out.extend_from_slice(&tick);}
+        }
+        shared.export_permille.store((frames.saturating_mul(1000)/len).min(999) as u32,Ordering::Relaxed);
+        if done || frames>=cap {break;}
+    }
     drop(e);
-    // The file's length: the song, plus the tail when it rings out.
-    let frames = if o.tail == crate::export::Tail::Ring { audio.len() as u64 / 2 } else { len };
-    let files = crate::export::write(job, rate, audio, tracks, len)?;
-    Ok((frames as f64 / f64::from(rate), files))
+    if shared.cancel_export.load(Ordering::Acquire) { return Err(CANCELLED.into()); }
+    let frames=if matches!(o.tail,crate::export::Tail::Ring|crate::export::Tail::Fixed) {frames} else {len};
+    let files=match sink {
+        Some(s)=>s.finish_with_cancel(||shared.cancel_export.load(Ordering::Acquire))?,
+        None=>crate::export::write(job,rate,audio,tracks,len)?,
+    };
+    Ok((frames as f64/f64::from(rate),files))
 }
 
 /// Silences every hosted instrument (voices, tails, queued notes) and effect (tails, delay lines). Only called while no
@@ -1417,7 +1554,7 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
         match rx.recv_timeout(Duration::from_millis(10)) {
             // The output is closed by Auto close: previews and live notes find no stream and open none.
             // So is a device that failed, until it opens again.
-            Ok(Cmd::Preview(_) | Cmd::PreviewFor(..) | Cmd::PreviewSong(_) | Cmd::NoteOn(..) | Cmd::Midi(..) | Cmd::TapClick(..)) if closed || lost.is_some() => {}
+            Ok(Cmd::Preview(_) | Cmd::PreviewFor(..) | Cmd::PreviewSong(_) | Cmd::NoteOn(..) | Cmd::Midi(..) | Cmd::InputOn(..) | Cmd::InputMidi(..) | Cmd::TapClick(..)) if closed || lost.is_some() => {}
             Ok(Cmd::LiveEdits(edits)) => {
                 for s in [session.as_mut(), live.as_mut()].into_iter().flatten() {
                     if let Ok(mut e) = s.engine.lock() {
@@ -1464,7 +1601,7 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
                     s.feed.wake();
                 }
             }
-            Ok(cmd @ (Cmd::NoteOn(..) | Cmd::Midi(..) | Cmd::TapClick(..))) => {
+            Ok(cmd @ (Cmd::NoteOn(..) | Cmd::Midi(..) | Cmd::InputOn(..) | Cmd::InputMidi(..) | Cmd::TapClick(..))) => {
                 // A click needs no channel: it also opens the live stream before any project was sent.
                 let empty = Project::default();
                 let project = live_project.as_ref().or(matches!(cmd, Cmd::TapClick(..)).then_some(&empty));
@@ -1488,9 +1625,26 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
                         match cmd {
                             Cmd::NoteOn(ch, key, vel, midi) => e.note_on_midi(ch, key, vel, midi),
                             Cmd::Midi(ch, bytes, bend) => e.midi(ch, bytes, bend),
+                            Cmd::InputOn(ch,key,vel,midi,id,at) => {
+                                let frame = s.input_frame(&e,at,&shared);
+                                e.note_on_input(ch,key,vel,midi,id,frame);
+                            }
+                            Cmd::InputMidi(ch,bytes,bend,at) => {
+                                let frame = s.input_frame(&e,at,&shared);
+                                e.midi_input(ch,bytes,bend,frame);
+                            }
                             Cmd::TapClick(accent, db) => e.tap_click(accent, db),
                             _ => {}
                         }
+                    }
+                    s.feed.wake();
+                }
+            }
+            Ok(Cmd::InputOff(ch,key,midi,id,at)) => {
+                for s in [session.as_ref(),live.as_ref()].into_iter().flatten() {
+                    if let Ok(mut e) = s.engine.lock() {
+                        let frame = s.input_frame(&e,at,&shared);
+                        e.note_off_input(ch,key,midi,id,frame);
                     }
                     s.feed.wake();
                 }
@@ -1998,6 +2152,7 @@ impl Drop for Detach {
 
 struct Session {
     _detach: Detach,
+    queue: Arc<Queue>,
     /// Renders ahead of the stream; stopped after the stream leaves the device (fields drop in order).
     feed: FeedThread,
     kind: Kind,
@@ -2012,9 +2167,59 @@ struct Session {
     rate: u32,
     /// "Play truncated notes on transport" as this playback started with (a move to new audio settings keeps it).
     truncated: bool,
+    /// Carries the same timestamp-to-render-frame displacement across a short burst of live MIDI. A per-message
+    /// clamp to the feeder's moving next frame would collapse adjacent note-ons and note-offs onto one sample.
+    input_schedule: Mutex<InputSchedule>,
+}
+
+/// A stream's MIDI ingress clock, kept separately from the recording clock. Audio already handed to the render-ahead
+/// queue cannot be changed. We add a single bounded displacement to a burst of arrival timestamps and keep it stable
+/// while the feeder advances, instead of independently clamping every message to the next rendered tick.
+#[derive(Default)]
+struct InputSchedule {
+    displacement: u64,
+    last_at: Option<Instant>,
+}
+
+impl InputSchedule {
+    fn frame(&mut self, at: Instant, desired: u64, next: u64, rate: u32, guard: u64) -> (u64, bool) {
+        const BURST_GAP: Duration = Duration::from_millis(80);
+        let new_burst = self.last_at.is_none_or(|prev| at < prev || at.saturating_duration_since(prev) > BURST_GAP);
+        if new_burst {
+            self.displacement = 0;
+        }
+        self.last_at = Some(at);
+        // Reserve the guard once for a burst, not anew on every note. Requiring a fresh guard on every message
+        // would itself introduce timestamp drift as the feeder moves to another tick between MIDI messages.
+        let earliest = next.saturating_add(if new_burst {guard} else {0});
+        let shifted = desired.saturating_add(self.displacement);
+        // The original timestamp is late if its audio is already rendered. If even the displaced burst deadline
+        // expires (e.g. an unresponsive audio thread), re-anchor and count the timing loss explicitly.
+        let late = desired < next || (self.displacement != 0 && shifted < earliest);
+        if shifted < earliest {
+            self.displacement = earliest.saturating_sub(desired);
+        }
+        (desired.saturating_add(self.displacement).min(next.saturating_add(u64::from(rate))), late)
+    }
 }
 
 impl Session {
+    fn input_frame(&self, e: &Engine, at: Instant, shared: &Shared) -> u64 {
+        let next = e.next_input_frame();
+        let desired = self.queue.pace.lock().ok().and_then(|p| *p).map(|p| {
+            p.input_frame(at).saturating_add(u64::from(self.rate) / 100) // 10 ms, independent of UI drain time.
+        }).unwrap_or(next);
+        // Leave space for two ticks the feeder may render before the next event in a burst. A 5 ms minimum at high
+        // PPQ preserves closely spaced MIDI events; at coarse PPQ the guard grows (bounded at 40 ms).
+        let tick_frames = (60.0 * f64::from(self.rate) / (e.tempo().max(1.0) * f64::from(self.project.ppq.max(1))))
+            .ceil() as u64;
+        let guard = (u64::from(self.rate) / 200).max(tick_frames.saturating_mul(2).min(u64::from(self.rate) * 4 / 100));
+        let (frame, late) = self.input_schedule.lock().map(|mut clock| clock.frame(at,desired,next,self.rate,guard))
+            .unwrap_or((next.saturating_add(guard),true));
+        if late { shared.input_late.fetch_add(1, Ordering::Relaxed); }
+        frame
+    }
+
     fn paused(&self) -> bool {
         self.ctl.paused.load(Ordering::Relaxed) || self.ctl.held.load(Ordering::Relaxed)
     }
@@ -2076,7 +2281,7 @@ impl Session {
         feeder.meters = kind != Kind::Preview;
         feeder.fill(PREFILL_FRAMES.max(fixed.unwrap_or(0) as usize));
         let feed = FeedThread::spawn(feeder);
-        let mut r = Renderer::new(queue, ctl.clone(), done.clone(), shared.clone(), rate);
+        let mut r = Renderer::new(queue.clone(), ctl.clone(), done.clone(), shared.clone(), rate);
         r.tap = kind != Kind::Preview;
         r.wake = feed.thread();
         // Started in the middle of the song, it comes in from silence.
@@ -2085,7 +2290,8 @@ impl Session {
         }
         let detach = Detach(r.detach.clone());
         device.add(Box::new(r))?;
-        Ok(Session { _detach: detach, feed, kind, engine, done, ctl, generation, project: project.clone(), mode, rate, truncated: at.truncated })
+        Ok(Session { _detach: detach, queue, feed, kind, engine, done, ctl, generation, project: project.clone(), mode, rate, truncated: at.truncated,
+            input_schedule: Mutex::new(InputSchedule::default()) })
     }
 }
 
@@ -2096,7 +2302,8 @@ impl Feeder {
             v.retain(|w| w.strong_count() > 0);
             v.push(Arc::downgrade(&voices));
         }
-        Feeder { engine, queue, shared, ctl, meters: true, rate, busy: Duration::ZERO, rendered: 0, voices }
+        Feeder { engine, queue, shared, ctl, meters: true, rate, busy: Duration::ZERO, rendered: 0, voices,
+            pending: Vec::with_capacity(4096), pending_at: 0, pending_meta: (0.0,0,false,1) }
     }
 }
 
@@ -2202,13 +2409,19 @@ impl Renderer {
         // Every stream frees the tick records it has played (`heard`); only playback publishes where it is (not in the
         // block it may still play after its session went: the next playback publishes from its start).
         let heard = self.queue.heard();
+        let pace = heard.map(|(frame,tick)| Pace { from: from.unwrap_or((frame,tick)), to: (frame,tick),
+            read: (read, read + (got / w) as u64), frames: (got / w) as u64, at: Instant::now(),
+            rate: self.shared.sample_rate.load(Ordering::Relaxed) });
+        if let Ok(mut p) = self.queue.pace.try_lock() { *p = pace; }
         if self.ctl.report.load(Ordering::Relaxed) && !self.detach.load(Ordering::Acquire) {
             if let Some((frame, tick)) = heard {
                 self.shared.position.store(frame, Ordering::Relaxed);
                 self.shared.tick.store(tick.to_bits(), Ordering::Relaxed);
                 if let Ok(mut p) = self.shared.pace.try_lock() {
-                    let rate = self.shared.sample_rate.load(Ordering::Relaxed);
-                    *p = Some(Pace { from: from.unwrap_or((frame, tick)), to: (frame, tick), read: (read, read + (got / w) as u64), frames: (got / w) as u64, at: Instant::now(), rate });
+                    *p = pace;
+                }
+                if let (Some(pace), Ok(mut history)) = (pace, self.shared.pace_history.try_lock()) {
+                    history.push(pace);
                 }
             }
         }
@@ -2261,6 +2474,71 @@ impl Source for Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn burst_input_scheduler_preserves_two_and_five_ms_spacing_as_feeder_advances() {
+        // At 48 kHz with a 1,024-frame device block, the feeder has already rendered ahead of the heard
+        // timestamp. Two more whole ticks render between the three MIDI callbacks. Independent max(next, desired)
+        // clipping changes the intervals or puts events on the same sample; the shared displacement does not.
+        let t = Instant::now();
+        // The UI drained a burst *after* a later device callback. The backward clock projection still
+        // preserves the actual ingress times, unlike an old checked_duration_since(...).unwrap_or(from) clamp.
+        let pace = Pace {from:(4_800,0.0),to:(5_824,1.0),read:(0,1_024),frames:1_024,
+            at:t+Duration::from_millis(10),rate:48_000};
+        assert_eq!((pace.input_frame(t),pace.input_frame(t+Duration::from_millis(2)),
+            pace.input_frame(t+Duration::from_millis(5))),(4_320,4_416,4_560));
+        let mut clock = InputSchedule::default();
+        let a = clock.frame(t, 480, 1_024, 48_000, 500);
+        let b = clock.frame(t + Duration::from_millis(2), 576, 1_274, 48_000, 500);
+        let c = clock.frame(t + Duration::from_millis(5), 720, 1_524, 48_000, 500);
+        assert_eq!((a.0,b.0,c.0), (1_524,1_620,1_764));
+        assert_eq!((b.0-a.0,c.0-b.0), (96,144));
+        assert!(a.1 && b.1 && c.1, "raw timestamps had already passed the render head");
+        // A real stalled callback cannot rewrite already rendered audio: record the lost deadline and re-anchor.
+        let slipped = clock.frame(t + Duration::from_millis(7), 816, 1_900, 48_000, 500);
+        assert_eq!(slipped, (1_900,true));
+    }
+
+    #[test]
+    fn oversized_multichannel_tick_is_chunked_without_overwriting_unread_audio() {
+        let (_,mut project)=looping_engine();project.ppq=24;project.tempo=Some(10.0);
+        let make=|| {let mut e=Engine::new(&project,&mut SampleLibrary::default(),192000,PlayMode::Pattern(1));e.set_device(8,None);e};
+        let mut reference=make();let expected=reference.next_tick().unwrap().0.to_vec();
+        assert_eq!(expected.len(),768000);
+        let queue=Arc::new(Queue::new(16));
+        assert!(!queue.push(&expected,0.0,0,false,48000));
+        assert_eq!(queue.queued(),0);
+        let ctl=Arc::new(Ctl {paused:AtomicBool::new(false),held:AtomicBool::new(false),report:AtomicBool::new(false)});
+        let shared=Arc::new(Shared::default());
+        let mut feeder=Feeder::new(Arc::new(Mutex::new(make())),queue.clone(),shared,ctl,192000);
+        let mut actual=Vec::new();let mut block=vec![0.0;4096*16];
+        while actual.len()<expected.len() {
+            feeder.fill(4096);
+            assert!(queue.queued()<=QUEUE_SAMPLES as u64);
+            let n=block.len().min(expected.len()-actual.len());
+            let got=queue.pop(&mut block[..n]);
+            assert!(got>0);
+            actual.extend_from_slice(&block[..got]);queue.heard();
+        }
+        assert_eq!(actual,expected);
+    }
+
+    #[test]
+    fn recording_clock_history_uses_ingress_time_and_bounds_old_events() {
+        let start=Instant::now();let mut history=PaceHistory::default();
+        for i in 0..10u64 {
+            history.push(Pace {from:(i*480, i as f64),to:((i+1)*480,(i+1) as f64),
+                read:(i*480,(i+1)*480),frames:480,at:start+Duration::from_millis(i*10),rate:48000});
+        }
+        assert_eq!(history.tick_at(start+Duration::from_millis(15)),Some((1.5,false)));
+        assert_eq!(history.tick_at(start-Duration::from_millis(1)),Some((0.0,true)));
+        for i in 10..1100u64 {
+            history.push(Pace {from:(i*480,i as f64),to:((i+1)*480,(i+1) as f64),
+                read:(i*480,(i+1)*480),frames:480,at:start+Duration::from_millis(i*10),rate:48000});
+        }
+        assert_eq!(history.len,1024);
+        assert_eq!(history.tick_at(start),Some((76.0,true)));
+    }
 
     fn looping_engine() -> (Engine, Project) {
         let mut project = crate::app::test_project();
@@ -2433,6 +2711,49 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn cancel_offline_export_during_hosted_effect_preserves_existing_wav_and_cleans_spools() {
+        struct Slow(Arc<AtomicBool>);
+        impl os_engine::HostedEffect for Slow {
+            fn process_fx(&mut self, _rate: u32, _left: &mut [f32], _right: &mut [f32]) {
+                if !self.0.swap(true, Ordering::AcqRel) {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            }
+        }
+        let (_, project) = looping_engine();
+        let entered = Arc::new(AtomicBool::new(false));
+        let t = Transport::new(None);
+        t.set_effects(vec![(0,0,Arc::new(Mutex::new(Slow(entered.clone()))))]);
+        let folder = std::env::temp_dir().join(format!("lemon_cancel_export_{}_{}",std::process::id(),
+            Instant::now().elapsed().as_nanos()));
+        // Tests can run in parallel: create_new directory names need a deterministic unique nonce independent of
+        // the process ID. The per-thread unique ID is sufficient for these test-only temporary paths.
+        let folder = folder.with_extension(format!("{:?}",std::thread::current().id()));
+        std::fs::create_dir(&folder).unwrap();
+        let target = folder.join("take.wav");
+        std::fs::write(&target,b"previous successful export").unwrap();
+        t.export(&project,PlayMode::Pattern(1),48000,crate::export::Job::wav(&target));
+        let since = Instant::now();
+        while !entered.load(Ordering::Acquire) {
+            assert!(since.elapsed()<Duration::from_secs(10),"effect was never entered");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(t.cancel_export());
+        loop {
+            match t.export_status() {
+                Export::Done(Err(e)) => {assert!(e.contains("cancelled"),"{e}");break;}
+                Export::Done(r) => panic!("unexpected cancellation result: {r:?}"),
+                _ if since.elapsed()>Duration::from_secs(10) => panic!("cancelled export never exited"),
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(std::fs::read(&target).unwrap(),b"previous successful export");
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(),1,"no raw export spool survives cancellation");
+        assert!(!t.cancel_export());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
     /// An export renders one pass of the pattern (not a loop) on the audio thread, with progress, into a WAV file.
     #[test]
     fn export_writes_a_wav_file() {
@@ -2452,7 +2773,7 @@ mod tests {
         assert_eq!(t.export_status(), Export::Idle, "the result is handed out once");
         assert_eq!(t.state(), State::Stopped);
         // One bar at 130 BPM is about 1.85 s; the sampler's ring-out adds a little, a loop would never end.
-        assert!(secs > 1.8 && secs < 8.0, "length {secs}");
+        assert!(secs > 11.8 && secs < 12.0, "explicit ten-second tail: {secs}");
         let bytes = std::fs::read(&path).expect("file written");
         let _ = std::fs::remove_file(&path);
         assert_eq!(&bytes[..4], b"RIFF");
@@ -2522,11 +2843,18 @@ mod tests {
             r.render(&mut block);
         }
         engine.lock().unwrap().pause();
-        // What was queued before the pause and the fade play out first (under 2000 frames).
-        for _ in 0..8 {
+        // Drain queued pre-pause audio and the tick straddling the hold boundary. Its length need not align
+        // exactly to an output block: with fractional tick rounding the final frame can arrive one block later.
+        let mut held = at(&shared);
+        let mut stable = 0;
+        for _ in 0..24 {
             r.render(&mut block);
+            let now = at(&shared);
+            stable = if now == held {stable + 1} else {0};
+            held = now;
+            if stable >= 3 {break;}
         }
-        let held = at(&shared);
+        assert!(stable >= 3, "paused render position never stabilized");
         for _ in 0..10 {
             r.render(&mut block);
             assert_eq!(at(&shared), held, "position held");

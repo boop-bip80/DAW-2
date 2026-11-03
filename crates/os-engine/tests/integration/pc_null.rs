@@ -198,7 +198,8 @@ fn formula_controller_nulls_against_fl_exports() {
 /// Runs every case of the directory `var` names.
 fn run_dir(var: &str) {
     let Some(dir) = std::env::var_os(var) else {
-        eprintln!("{var} not set: the null test against FL's exports is skipped");
+        assert!(std::env::var_os("LEMON_REQUIRE_EXTERNAL_FIXTURES").is_none(), "{var} is required for external qualification");
+        eprintln!("SKIPPED external fixture: {var} is unset");
         return;
     };
     let mut cases: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -218,6 +219,10 @@ fn run_dir(var: &str) {
                 continue;
             }
         };
+        if std::env::var_os("LEMON_REQUIRE_EXTERNAL_FIXTURES").is_some() && !case.judge {
+            failed.push(format!("{name}: required qualification cannot include an unjudged case"));
+            continue;
+        }
         match run(&case) {
             Ok((d, k)) if !case.judge => println!("{name}: {d:.2e} over {k} ticks (not judged)"),
             Ok((d, k)) if d <= case.limit && k > 0 => println!("{name}: {d:.2e} over {k} ticks"),

@@ -51,19 +51,35 @@ pub fn events(s: &State, plugins: &Plugins) -> Vec<Event> {
     v.push(Event::new(lemon::KEY_FOCUS, Value::var([LAYOUT, u8::from(editor_keys())])));
     v.push(track_locks(s));
     v.push(note_locks(s));
+    let mut identity = vec![LAYOUT];
+    identity.extend_from_slice(&s.recovery_id);
+    v.push(Event::new(lemon::PROJECT_ID, Value::var(identity)));
+    v.push(crate::project_plugins::native_identity_event(s, plugins));
     v
 }
 
 /// The bytes [`events`] would write: a change to them is an unsaved change, as an edit of the project is. Set keyboard
 /// focus of all plugins to ▸ is left out: it is a switch for the whole program, with no undo step, so it marks no
-/// project changed.
+/// project changed. The internal recovery identity is excluded for the same reason.
 pub fn saved_form(s: &State, plugins: &Plugins) -> Vec<u8> {
     let mut b = Vec::new();
-    for e in events(s, plugins).into_iter().filter(|e| e.id != lemon::KEY_FOCUS) {
+    for e in events(s, plugins).into_iter().filter(|e| e.id != lemon::KEY_FOCUS && e.id != lemon::PROJECT_ID) {
         b.push(e.id);
         b.extend_from_slice(e.data().unwrap_or_default());
     }
     b
+}
+
+/// A native project's persistent recovery identity; malformed or unknown layouts have no usable identity.
+pub(crate) fn project_id(file: &FlpFile) -> Option<[u8; 16]> {
+    if !lemon::is_lemon(file) {
+        return None;
+    }
+    let data = lemon::data(file, lemon::PROJECT_ID)?;
+    if data.len() != 17 || data[0] != LAYOUT {
+        return None;
+    }
+    data[1..].try_into().ok()
 }
 
 /// Puts the state a `.lemon` file holds into `s` and `plugins` (a project just opened, its ids given). An FLP has
@@ -72,6 +88,15 @@ pub fn apply(s: &mut State, plugins: &mut Plugins, file: &FlpFile) {
     if !lemon::is_lemon(file) {
         from_flp(s);
         return;
+    }
+    if let Some(data) = lemon::data(file, lemon::PLUGIN_IDENTITIES) {
+        if let Err(error) = crate::project_plugins::read_native_identities(s, plugins, &data) {
+            plugins.identity_error = Some(error.clone());
+            s.message = Some(error);
+        }
+    }
+    if let Some(id) = project_id(file) {
+        s.recovery_id = id;
     }
     let read = |id| lemon::data(file, id).filter(|d| d.first() == Some(&LAYOUT));
     if let Some(&flags) = read(lemon::MIXER).as_deref().and_then(|d| d.get(1)) {
@@ -452,7 +477,7 @@ mod tests {
         want.extend([lemon::SCALING, lemon::CHANNEL_CHECKS]);
         #[cfg(any(windows, target_os = "macos"))]
         want.push(lemon::KEY_FOCUS);
-        want.extend([lemon::TRACK_LOCKS, lemon::NOTE_LOCKS]);
+        want.extend([lemon::TRACK_LOCKS, lemon::NOTE_LOCKS, lemon::PROJECT_ID, lemon::PLUGIN_IDENTITIES]);
         assert_eq!(ids, want);
         let mut back = App::new(None);
         back.open(path.clone());

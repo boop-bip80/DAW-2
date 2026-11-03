@@ -146,19 +146,26 @@ pub fn backup_folder(s: &State, path: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-/// Where sample `src` goes in folder `samples` (spec: ui/data-folder.md §4, Lemon Studio rule for name clashes): a file
-/// of its name and size there is used as it is (the sample itself, or a copy made before); a different file of that
-/// name gives `name (2).ext`, `name (3).ext`, and so on. Returns the place and whether a copy must be made there.
+/// A verified copy of `src` in `samples`, or a free portable name. Equal length alone never identifies a sample;
+/// existing names are compared without case so a collected folder also works on case-insensitive filesystems.
 pub fn copy_target(src: &Path, samples: &Path) -> Option<(PathBuf, bool)> {
-    let size = std::fs::metadata(src).ok().filter(|m| m.is_file())?.len();
+    std::fs::metadata(src).ok().filter(|m| m.is_file())?;
     let stem = src.file_stem()?.to_string_lossy().into_owned();
     let ext = src.extension().map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
+    let mut existing: Vec<PathBuf> = match std::fs::read_dir(samples) {
+        Ok(entries) => entries.filter_map(Result::ok).map(|e| e.path()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return None,
+    };
+    existing.sort();
     for n in 1u32.. {
         let to = if n == 1 { samples.join(src.file_name()?) } else { samples.join(format!("{stem} ({n}){ext}")) };
-        match std::fs::metadata(&to) {
-            Ok(m) if m.is_file() && m.len() == size => return Some((to, false)),
-            Ok(_) => continue,
-            Err(_) => return Some((to, true)),
+        let name = to.file_name()?.to_string_lossy();
+        let occupied = existing.iter().find(|p| p.file_name().is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(&name)));
+        if let Some(found) = occupied {
+            if crate::assets::same_content(src, found).unwrap_or(false) { return Some((found.clone(), false)) }
+        } else if !to.exists() {
+            return Some((to, true));
         }
     }
     None
@@ -166,7 +173,10 @@ pub fn copy_target(src: &Path, samples: &Path) -> Option<(PathBuf, bool)> {
 
 /// Copies `src` to `to`, which keeps the original's file times (spec: ui/data-folder.md §4).
 pub fn copy_keeping_times(src: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::copy(src, to)?;
+    crate::durable_file::copy_new(src, to)?;
+    if !crate::assets::same_content(src, to)? {
+        return Err(std::io::Error::other("the source changed while it was copied; the original reference was kept"));
+    }
     let m = std::fs::metadata(src)?;
     let mut times = std::fs::FileTimes::new();
     if let Ok(t) = m.modified() {
@@ -180,18 +190,25 @@ pub fn copy_keeping_times(src: &Path, to: &Path) -> std::io::Result<()> {
         use std::os::windows::fs::FileTimesExt;
         times = times.set_created(t);
     }
-    std::fs::OpenOptions::new().write(true).open(to)?.set_times(times)
+    let file = std::fs::OpenOptions::new().write(true).open(to)?;
+    file.set_times(times)?;
+    file.sync_all()
 }
 
 /// Copies sample `src` into `<dir>/Samples` (`copy_target`): where the channel finds it now.
 pub fn copy_sample(src: &Path, dir: &Path) -> std::io::Result<PathBuf> {
     let samples = dir.join(SAMPLES_DIR);
-    let Some((to, copy)) = copy_target(src, &samples) else { return Err(std::io::ErrorKind::NotFound.into()) };
-    if copy {
-        std::fs::create_dir_all(&samples)?;
-        copy_keeping_times(src, &to)?;
+    std::fs::create_dir_all(&samples)?;
+    for _ in 0..128 {
+        let Some((to, copy)) = copy_target(src, &samples) else { return Err(std::io::ErrorKind::NotFound.into()) };
+        if !copy { return Ok(to) }
+        match copy_keeping_times(src, &to) {
+            Ok(()) => return Ok(to),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    Ok(to)
+    Err(std::io::Error::other("sample destination is changing; no existing file was replaced"))
 }
 
 /// A sample about to be loaded into a channel: while Copy used samples to the project folder is ticked and the project
@@ -247,31 +264,42 @@ impl App {
     /// Copies every sample the project uses into `<dir>/Samples`, as `copy_used_samples` does for the data folder (the
     /// Save as and New project forms copy into the folder they make). Returns the message.
     pub(crate) fn copy_used_samples_to(&mut self, dir: &Path) -> String {
-        let (mut copied, mut failed) = (0, 0);
-        for row in 0..self.state.project.channels.len() {
-            // A hosted Lemon Sampler's own sample is the one it plays; it loads the copy too.
-            let hosted = self.plugins.sampler_path(row);
-            let listed = self.state.project.channels[row].sample_path.as_deref().filter(|p| !p.is_empty()).map(crate::plugins::resolve_sample);
-            let Some(src) = hosted.clone().filter(|p| !p.is_empty()).or(listed) else { continue };
-            match copy_sample(Path::new(&src), dir) {
-                Ok(to) => {
-                    let to = to.to_string_lossy().into_owned();
-                    if hosted.is_some_and(|h| h != to) {
-                        self.plugins.load_sample(row, &to);
-                    }
-                    self.state.project.channels[row].sample_path = Some(to);
-                    copied += 1;
-                }
-                Err(_) => failed += 1,
+        match self.collect_assets_to(dir) {
+            Ok(change) => {
+                let more = if change.opaque.is_empty() { String::new() } else {
+                    format!("; external dependencies of {} require their plugin's own collection command", change.opaque.iter().cloned().collect::<Vec<_>>().join(", "))
+                };
+                format!("Copied {} samples to {}{more}", change.files, dir.join(SAMPLES_DIR).display())
             }
+            Err(e) => format!("Samples were not relinked: {e}"),
         }
+    }
+
+    /// Copy every known reference first, then relink the model and live plugins as one reversible change. A failed
+    /// copy leaves the project's paths untouched; successful copies are kept for recovery/retry.
+    pub(crate) fn collect_assets_to(&mut self, dir: &Path) -> Result<crate::assets::Change, String> {
+        let project = crate::assets::snapshot(self)?;
+        let inventory = crate::assets::inspect(&project)?;
+        let mut paths = crate::assets::Paths::new();
+        let mut unique = std::collections::BTreeSet::new();
+        for (_, stored) in &inventory.references {
+            let source = crate::plugins::resolve_sample(stored);
+            if !unique.insert(source.clone()) { continue }
+            let to = copy_sample(Path::new(&source), dir).map_err(|e| format!("{stored}: {e}"))?;
+            let relative = to.strip_prefix(dir).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+            crate::assets::map_path(&mut paths, stored, relative);
+        }
+        let candidate = crate::assets::rewritten(&project, &paths)?;
+        let mut change = crate::assets::apply(self, candidate, &paths, Some(dir))?;
+        change.files = unique.len();
+        change.opaque = inventory.opaque;
+        // The new folder is searched first even while Save As has not yet adopted its filename.
+        let mut dirs = vec![dir.to_path_buf(), dir.join(SAMPLES_DIR)];
+        dirs.extend(crate::missing::search_folders(&self.state, &self.missing.picked).into_iter().filter(|d| ![dir, dir.join(SAMPLES_DIR).as_path()].contains(&d.as_path())));
+        os_engine::sample::set_search_folders(dirs);
         reread(&self.state);
         self.invalidate();
-        let to = dir.join(SAMPLES_DIR);
-        match failed {
-            0 => format!("Copied {copied} samples to {}", to.display()),
-            n => format!("Copied {copied} samples to {} ({n} not found or not copied)", to.display()),
-        }
+        Ok(change)
     }
 
     /// The folder button (or the path beside it): a folder picker, then what to do with the project (spec:
@@ -306,18 +334,40 @@ impl App {
                 self.show_msg(m.labelled(&CHANGED_LABELS));
             }
             (DThen::Picked, _) => {}
-            // Save to the folder: the project goes to `<folder>/<name>.flp`, its samples to `<folder>/Samples` while Copy
+            // Save to the folder: the project goes to `<folder>/<name>.lemon`, its samples to `<folder>/Samples` while Copy
             // is ticked; the old folder and file stay. Don't save to the folder: the folder only (Lemon Studio rule).
             (DThen::Changed(dir), _) => {
-                self.set_data_folder(&dir);
-                self.state.message = Some(format!("Data folder: {}", dir.display()));
+                let name = crate::backup::project_name(self.state.path.as_deref());
+                let target = dir.join(format!("{name}.{}", crate::project_files::EXT));
+                if yes && target.exists() && self.state.path.as_ref() != Some(&target) {
+                    self.tell(Kind::Error, "Save project", spans(&["", &target.display().to_string(), " already exists. Choose a different folder or project name."]));
+                    return;
+                }
                 if yes {
-                    if crate::prefs::check(&crate::prefs::COPY_USED_SAMPLES) {
-                        self.copy_used_samples();
+                    let before = self.state.project.clone();
+                    let change = if crate::prefs::check(&crate::prefs::COPY_USED_SAMPLES) {
+                        match self.collect_assets_to(&dir) {
+                            Ok(change) => Some(change),
+                            Err(e) => { self.state.message = Some(format!("Save to folder stopped: {e}")); return; }
+                        }
+                    } else { None };
+                    self.set_data_folder(&dir);
+                    if let Err(e) = self.save_to_result(target) {
+                        let restore = change.map(|c| c.rollback(self)).transpose();
+                        self.state.project = before;
+                        crate::missing::apply(self);
+                        self.state.message = Some(match restore {
+                            Err(r) => format!("Save to folder failed: {e}; {r}"),
+                            Ok(_) => format!("Save to folder failed: {e}; the original project and sample paths were restored"),
+                        });
+                    } else {
+                        crate::assets::collection_notice(self, change.as_ref());
+                        crate::missing::apply(self);
                     }
-                    let name = crate::backup::project_name(self.state.path.as_deref());
-                    self.save_to(dir.join(format!("{name}.flp")));
                     reread(&self.state);
+                } else {
+                    self.set_data_folder(&dir);
+                    self.state.message = Some(format!("Data folder: {}", dir.display()));
                 }
             }
             (DThen::Rename { name, folder }, _) => {
@@ -332,7 +382,7 @@ impl App {
     }
 
     /// Rename (spec: ui/data-folder.md §6), confirmed: with `folder_name`, the data folder is renamed to it, the project
-    /// file inside it to `<name>.flp`, and the samples inside it are found in the renamed folder; without, only the
+    /// file inside it to `<name>.lemon`, and the samples inside it are found in the renamed folder; without, only the
     /// project file is renamed, in its folder (Lemon Studio rule). Then the project is saved (the file it replaces goes
     /// to the backups, as on any save). A name that is taken is refused with a message, and nothing changes.
     pub(crate) fn rename_project(&mut self, name: &str, folder_name: Option<&str>) {
@@ -350,7 +400,7 @@ impl App {
             Some((old, new)) => file.strip_prefix(old).map_or_else(|_| file.clone(), |rel| new.join(rel)),
             None => file.clone(),
         };
-        let target = file_after.with_file_name(format!("{}.flp", name.trim()));
+        let target = file_after.with_file_name(format!("{}.{}", name.trim(), crate::project_files::EXT));
         // Both names are checked before anything is renamed (the file's new name where the file is now).
         if let Some((_, new)) = folder_move.as_ref().filter(|(_, new)| new.exists()) {
             return self.rename_refused(new);
@@ -362,34 +412,72 @@ impl App {
         if target_now != file && target_now.exists() {
             return self.rename_refused(&target_now);
         }
-        if let Some((old, new)) = &folder_move {
-            if let Err(e) = std::fs::rename(old, new) {
-                return self.rename_failed(old, &e);
+        let before = self.state.project.clone();
+        let mut change = None;
+        let mut moved_folder = false;
+        let result = (|| -> Result<(), String> {
+            let project = crate::assets::snapshot(self)?;
+            let inventory = crate::assets::inspect(&project)?;
+            if folder_move.is_some() && !inventory.opaque.is_empty() {
+                return Err(format!("the data folder cannot be moved while external dependencies of {} are unknown; rename the project file alone", inventory.opaque.iter().cloned().collect::<Vec<_>>().join(", ")));
             }
-            self.state.path = Some(file_after.clone());
-            // The samples inside the folder are found in the renamed one.
-            for row in 0..self.state.project.channels.len() {
-                let hosted = self.plugins.sampler_path(row);
-                let ch = &mut self.state.project.channels[row];
-                let Some(p) = hosted.clone().filter(|p| !p.is_empty()).or_else(|| ch.sample_path.as_deref().map(crate::plugins::resolve_sample)) else { continue };
-                let Ok(rel) = Path::new(&p).strip_prefix(old) else { continue };
-                let moved = new.join(rel).to_string_lossy().into_owned();
-                ch.sample_path = Some(moved.clone());
-                if hosted.is_some() {
-                    self.plugins.load_sample(row, &moved);
+            let mut paths = crate::assets::Paths::new();
+            if let Some((old, new)) = &folder_move {
+                for (_, path) in &inventory.references {
+                    let resolved = crate::plugins::resolve_sample(path);
+                    if let Ok(relative) = Path::new(&resolved).strip_prefix(old) {
+                        let to = new.join(relative).to_string_lossy().into_owned();
+                        paths.insert(resolved, to.clone());
+                        // Relative stored paths already follow the project. Runtime absolute overrides still move.
+                        paths.insert(path.clone(), if Path::new(path).is_relative() && !path.contains(':') && !path.starts_with('%') { path.clone() } else { to });
+                    }
                 }
             }
-            if let Some(df) = self.state.project.data_folder.as_mut().filter(|d| d.choice == DataFolder::SPECIFIED) {
-                df.folder = folder_text(new);
+            let mut candidate = crate::assets::rewritten(&project, &paths)?;
+            if let Some((old, new)) = &folder_move {
+                if let Some(df) = candidate.data_folder.as_mut().filter(|d| d.choice == DataFolder::SPECIFIED) {
+                    df.folder = folder_text(new);
+                }
+                std::fs::rename(old, new).map_err(|e| format!("{}: {e}", old.display()))?;
+                moved_folder = true;
+                self.state.path = Some(file_after.clone());
             }
-        }
-        if target != file_after {
-            if let Err(e) = std::fs::rename(&file_after, &target) {
-                return self.rename_failed(&file_after, &e);
+            change = Some(crate::assets::apply(self, candidate, &paths, folder_move.as_ref().map(|(_, new)| new.as_path()))?);
+            crate::missing::apply(self);
+            // Keep the previous native file until the replacement is durable. Renaming an imported FLP retains it.
+            if target != file_after && !crate::project_files::is_flp(&file_after) {
+                crate::backup::keep_overwritten(&file_after, backup_folder(&self.state, Some(&file_after)), self.state.recovery_id)?;
             }
+            // Rename preserves the recovery lineage, unlike Save As.
             self.state.path = Some(target.clone());
+            self.save_to_result(target.clone())?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            if moved_folder {
+                if let Some((old, new)) = &folder_move {
+                    if let Err(restore) = std::fs::rename(new, old) {
+                        self.state.path = Some(file_after.clone());
+                        self.state.message = Some(format!("Rename failed: {e}. The data remains in {} because restoring its folder name failed: {restore}", new.display()));
+                        return;
+                    }
+                }
+            }
+            self.state.path = Some(file);
+            let restored = change.map(|c| c.rollback(self)).transpose();
+            self.state.project = before;
+            crate::missing::apply(self);
+            let detail = match restored { Ok(_) => String::new(), Err(r) => format!("; {r}") };
+            self.state.message = Some(format!("Rename failed: {e}{detail}"));
+            self.tell(Kind::Error, "Rename project", spans(&["The original project was kept. ", &e, &detail]));
+            return;
         }
-        self.save_to(target);
+        if target != file_after && !crate::project_files::is_flp(&file_after) {
+            if let Err(e) = std::fs::remove_file(&file_after) {
+                self.state.message = Some(format!("Saved {}; the previous copy {} was retained: {e}", target.display(), file_after.display()));
+            }
+        }
+        crate::missing::apply(self);
         reread(&self.state);
     }
 
@@ -671,12 +759,15 @@ mod tests {
         app.dialog_click(crate::dialog::DHit::Button(0));
         let copy = dir.join("song").join(SAMPLES_DIR).join("kick.wav");
         assert!(copy.is_file());
-        assert_eq!(app.state.project.channels[0].sample_path.as_deref(), Some(copy.to_string_lossy().as_ref()));
+        assert_eq!(app.state.project.channels[0].sample_path.as_deref(), Some("Samples/kick.wav"), "portable project paths stay relative");
+        assert_eq!(crate::plugins::resolve_sample("Samples/kick.wav"), copy.to_string_lossy());
         assert!(app.unsaved(), "a change of the project");
         // The next save writes the new path.
-        app.save_to(dir.join("song").join("song.flp"));
-        let opened = App::new(Some(dir.join("song").join("song.flp")));
-        assert_eq!(opened.state.project.channels[0].sample_path.as_deref(), Some(copy.to_string_lossy().as_ref()));
+        let native = dir.join("song").join("song.lemon");
+        app.save_to(native.clone());
+        let opened = App::new(Some(native));
+        assert_eq!(opened.state.project.channels[0].sample_path.as_deref(), Some("Samples/kick.wav"));
+        assert_eq!(crate::plugins::resolve_sample("Samples/kick.wav"), copy.to_string_lossy());
         // A sample loaded while it is ticked.
         let snare = dir.join("lib").join("snare.wav");
         file(&snare, 5);
@@ -688,7 +779,7 @@ mod tests {
     }
 
     /// The folder button: a picker titled "Select a directory", then Attention. Save to the folder saves the project as
-    /// `<folder>/<name>.flp` with the specified folder (and copies the samples while Copy is ticked); the old file stays.
+    /// `<folder>/<name>.lemon` with the specified folder (and copies the samples while Copy is ticked); the old file stays.
     /// Don't save to the folder only sets the folder.
     #[test]
     fn the_folder_button() {
@@ -714,13 +805,55 @@ mod tests {
         crate::dialog::fake::answer(Some(other.clone()));
         app.data_folder_pick();
         app.dialog_click(crate::dialog::DHit::Button(0));
-        assert_eq!(app.state.path, Some(other.join("song.flp")));
+        assert_eq!(app.state.path, Some(other.join("song.lemon")));
         assert!(!app.unsaved());
-        let opened = App::new(Some(other.join("song.flp")));
+        let opened = App::new(Some(other.join("song.lemon")));
         assert_eq!(opened.state.project.data_folder, Some(DataFolder { choice: DataFolder::SPECIFIED, folder: folder_text(&other) }));
         let copy = other.join(SAMPLES_DIR).join("kick.wav");
-        assert_eq!(opened.state.project.channels[0].sample_path.as_deref(), Some(copy.to_string_lossy().as_ref()));
+        assert_eq!(opened.state.project.channels[0].sample_path.as_deref(), Some("Samples/kick.wav"));
+        assert_eq!(crate::plugins::resolve_sample("Samples/kick.wav"), copy.to_string_lossy());
         assert!(dir.join("song").join("song.flp").is_file(), "the old file stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_targets_are_checked_before_data_folder_save_or_rename() {
+        let dir = scratch("native_collisions");
+        let mut app = saved_with_folder(&dir, "song");
+        let source = app.state.path.clone();
+        let data_folder = app.state.project.data_folder.clone();
+        let other = dir.join("other");
+        std::fs::create_dir(&other).unwrap();
+        let target = other.join("song.lemon");
+        std::fs::write(&target, b"an existing native project").unwrap();
+        app.data_folder_done(DThen::Changed(other), Reply::Button(Answer::Yes));
+        assert_eq!(std::fs::read(&target).unwrap(), b"an existing native project");
+        assert_eq!(app.state.path, source);
+        assert_eq!(app.state.project.data_folder, data_folder);
+        app.dialog_click(crate::dialog::DHit::Button(0));
+        let taken = dir.join("song").join("Taken.lemon");
+        std::fs::write(&taken, b"another native project").unwrap();
+        app.rename_project("Taken", None);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"another native project");
+        assert_eq!(app.state.path, source);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renaming_an_import_creates_a_native_file_and_preserves_the_flp() {
+        let dir = scratch("rename_import");
+        let mut app = saved_with_folder(&dir, "Imported");
+        let source = app.state.path.clone().unwrap();
+        let original = std::fs::read(&source).unwrap();
+        app.state.project.pdc_off = true;
+        app.state.mixer.slot_names.insert((2, 1), "Native slot name".into());
+        app.rename_project("Native", None);
+        let target = dir.join("Imported").join("Native.lemon");
+        assert_eq!(app.state.path, Some(target.clone()));
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        let opened = App::new(Some(target));
+        assert!(opened.state.project.pdc_off);
+        assert_eq!(opened.state.mixer.slot_names.get(&(2, 1)).map(String::as_str), Some("Native slot name"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -737,7 +870,7 @@ mod tests {
         let kick = dir.join("t2spec").join(SAMPLES_DIR).join("kick.wav");
         file(&kick, 12);
         app.state.project.channels[0].sample_path = Some(kick.to_string_lossy().into_owned());
-        app.save_to(dir.join("t2spec").join("t2spec.flp"));
+        app.save_to(dir.join("t2spec").join("t2spec.lemon"));
         app.open_rename();
         let form = |app: &App| match &app.state.dialogs.last().unwrap().body {
             crate::dialog::Body::Project(Form::Rename(f)) => f.clone(),
@@ -753,19 +886,20 @@ mod tests {
         assert_eq!(top_msg(&app).map(|m| (m.0, m.1)), Some(("Confirmation".into(), "Are you sure you want to rename this project and its data folder?".into())));
         app.dialog_click(crate::dialog::DHit::Button(0));
         let new = dir.join("T3");
-        assert!(!dir.join("t2spec").exists() && new.join("T3.flp").is_file() && !new.join("t2spec.flp").exists());
-        assert_eq!(app.state.path, Some(new.join("T3.flp")));
+        assert!(!dir.join("t2spec").exists() && new.join("T3.lemon").is_file() && !new.join("t2spec.lemon").exists());
+        assert_eq!(app.state.path, Some(new.join("T3.lemon")));
         let moved = new.join(SAMPLES_DIR).join("kick.wav");
-        let opened = App::new(Some(new.join("T3.flp")));
+        let opened = App::new(Some(new.join("T3.lemon")));
         assert_eq!(opened.state.project.channels[0].sample_path.as_deref(), Some(moved.to_string_lossy().as_ref()));
         assert_eq!(opened.state.project.data_folder.unwrap().folder, folder_text(&new), "the save wrote the folder");
         let backups: Vec<String> = std::fs::read_dir(new.join(BACKUP_DIR)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-        assert!(backups.iter().any(|n| n.starts_with("T3 (overwritten on ")), "the replaced file went to Backup: {backups:?}");
+        assert!(backups.iter().any(|n| n.starts_with("t2spec (overwritten on ") && crate::backup::belongs_to(n, app.state.recovery_id)),
+            "the renamed old file is retained under its original basename and this project's recovery identity: {backups:?}");
         // A folder name that is taken: refused, nothing changes.
         std::fs::create_dir_all(dir.join("Taken")).unwrap();
         app.rename_project("Taken", Some("Taken"));
         assert_eq!(top_msg(&app).map(|m| m.0), Some(Rename::TITLE.to_string()));
-        assert!(new.join("T3.flp").is_file() && app.state.path == Some(new.join("T3.flp")));
+        assert!(new.join("T3.lemon").is_file() && app.state.path == Some(new.join("T3.lemon")));
         app.dialog_click(crate::dialog::DHit::Button(0));
         // Unticked: only the file.
         app.open_rename();
@@ -774,7 +908,7 @@ mod tests {
         app.key(&Key::Named(NamedKey::Enter), false, false);
         assert_eq!(top_msg(&app).map(|m| m.1), Some("Are you sure you want to rename this project?".into()));
         app.dialog_click(crate::dialog::DHit::Button(0));
-        assert!(new.join("T4.flp").is_file() && !new.join("T3.flp").exists());
+        assert!(new.join("T4.lemon").is_file() && !new.join("T3.lemon").exists());
         // Cancel and an empty name do nothing.
         app.open_rename();
         app.key(&Key::Named(NamedKey::Backspace), false, false);
@@ -783,7 +917,7 @@ mod tests {
         app.dialog_click(crate::dialog::DHit::Button(0));
         app.key(&Key::Named(NamedKey::Escape), false, false);
         assert!(app.state.dialogs.is_empty());
-        assert!(new.join("T4.flp").is_file());
+        assert!(new.join("T4.lemon").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

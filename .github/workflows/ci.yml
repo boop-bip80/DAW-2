@@ -1,5 +1,5 @@
-# Builds and tests Lemon Studio on Windows, Linux and macOS for every push to main and every pull request, so a change
-# that breaks any platform shows up before it is merged.
+# Builds, tests, stages and exercises the candidate executable on each host OS.
+# Distribution, external compatibility, physical hardware and signing remain separate release gates.
 name: CI
 
 on:
@@ -25,10 +25,19 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
+            platform: windows
+            executable: target/release/lemonstudio.exe
+            staged_executable: bin/lemonstudio.exe
           - name: Linux
             os: ubuntu-24.04
+            platform: linux
+            executable: target/release/lemonstudio
+            staged_executable: bin/lemonstudio
           - name: macOS
             os: macos-latest
+            platform: macos
+            executable: target/release/lemonstudio
+            staged_executable: Lemon Studio.app/Contents/MacOS/lemonstudio
     steps:
       - uses: actions/checkout@v4
 
@@ -39,9 +48,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libjack-jackd2-dev libwayland-dev libclang-dev pkg-config
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Match rust-toolchain.toml exactly; a floating `stable` would not be reproducible.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Build
         run: cargo build --workspace --all-targets --locked
@@ -60,3 +74,49 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # macOS already built its release binary in bundle-app. Linux/Windows build here after tests.
+      - name: Build release application
+        if: runner.os != 'macOS'
+        run: cargo build --release --locked -p os-app --bin lemonstudio
+
+      - name: Stage licensed and checksummed release candidate
+        run: >-
+          python tools/qualification/stage.py stage
+          --platform "${{ matrix.platform }}"
+          --binary "${{ matrix.executable }}"
+          --bundled "target/bundled"
+          --output "${{ runner.temp }}/lemon-candidate"
+          --commit "${{ github.sha }}"
+
+      # This verifies only the existing ad-hoc signature, not trusted Developer ID or notarization.
+      - name: Verify staged macOS bundle's ad-hoc signature
+        if: runner.os == 'macOS'
+        run: codesign --verify --verbose=2 "${{ runner.temp }}/lemon-candidate/payload/Lemon Studio.app"
+
+      # Exercise the actual staged executable with a synthetic native session, cold reopen, render and take recovery.
+      - name: Qualify staged executable with owned synthetic project
+        run: >-
+          python tools/qualification/owned_workflow.py
+          --binary "${{ runner.temp }}/lemon-candidate/payload/${{ matrix.staged_executable }}"
+          --output "${{ runner.temp }}/lemon-qualified"
+
+      - name: Verify packaged file and archive hashes after qualification
+        run: python tools/qualification/stage.py verify --output "${{ runner.temp }}/lemon-candidate"
+
+      # Only successful, hash-verified candidates are downloadable. These are short-lived,
+      # unsigned (macOS: ad-hoc-signed) test artifacts, NOT production releases.
+      - name: Upload qualified portable candidate and test evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemon-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/lemon-candidate/*.zip
+            ${{ runner.temp }}/lemon-candidate/*.tar.gz
+            ${{ runner.temp }}/lemon-candidate/*.sha256
+            ${{ runner.temp }}/lemon-candidate/stage-result.json
+            ${{ runner.temp }}/lemon-qualified/result.json
+            ${{ runner.temp }}/lemon-qualified/*.log
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

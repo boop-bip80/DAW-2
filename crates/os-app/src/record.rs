@@ -555,9 +555,14 @@ impl App {
     /// A note went down (typing keyboard, MIDI, Touch controller): recorded from the playback position while
     /// recording (spec §2 Taking notes).
     pub(crate) fn record_down_with(&mut self, src: Src, key: u16, velocity: u8, extra: Extra) {
+        self.record_down_at(src, key, velocity, extra, std::time::Instant::now());
+    }
+
+    /// A timestamp captured at MIDI ingress survives UI polling and is also used by retrospective score logging.
+    pub(crate) fn record_down_at(&mut self, src: Src, key: u16, velocity: u8, extra: Extra, at: std::time::Instant) {
         let target = extra.channel.or_else(|| crate::piano::channel(&self.state));
         if let Some(channel) = target {
-            self.state.rec.log.down(src, key, velocity, channel, std::time::Instant::now());
+            self.state.rec.log.down(src, key, velocity, channel, at);
         }
         self.start_on_input(Opt::Notes);
         if !self.rec_live(Opt::Notes) {
@@ -568,7 +573,7 @@ impl App {
         if song && self.state.rec.punched_out {
             return;
         }
-        let start = self.transport.tick();
+        let start = self.transport.tick_at(at);
         self.open_take(song);
         let Some(at) = self.rec_pattern_tick(start, song) else { return };
         let r = &mut self.state.rec;
@@ -581,12 +586,16 @@ impl App {
 
     /// A note went up: written when it was being recorded.
     pub(crate) fn record_up_with(&mut self, src: Src, release: Option<u8>) {
-        self.state.rec.log.up(src, std::time::Instant::now());
+        self.record_up_at(src, release, std::time::Instant::now());
+    }
+
+    pub(crate) fn record_up_at(&mut self, src: Src, release: Option<u8>, at: std::time::Instant) {
+        self.state.rec.log.up(src, at);
         let r = &mut self.state.rec;
         let Some(i) = r.held.iter().position(|h| h.src == src) else { return };
         let mut h = r.held.remove(i);
         h.release = release;
-        let now = if self.transport.playing() && !self.transport.paused() { Some(self.transport.tick()) } else { r.last };
+        let now = if self.transport.playing() && !self.transport.paused() { Some(self.transport.tick_at(at)) } else { r.last };
         self.write_held(h, now);
     }
 

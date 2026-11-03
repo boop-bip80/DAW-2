@@ -96,6 +96,7 @@ impl crate::app::App {
             }
         }
         if added {
+            self.prepare_plugin_routing();
             self.transport.set_instruments(self.plugins.instruments());
             self.state.piano.dirty = true;
         }

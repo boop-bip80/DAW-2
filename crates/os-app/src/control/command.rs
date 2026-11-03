@@ -675,6 +675,8 @@ impl Command {
 
     /// Applies the command to the project; see `Done`. Nothing is changed when it fails.
     pub fn apply(self, s: &mut State) -> Result<Done, Error> {
+        let plugin_edit = matches!(&self, Command::SetParam { .. })
+            || matches!(&self, Command::Put(t) if matches!(**t, Taken::Param(..) | Taken::Plugin(..)));
         let taken = match &self {
             // A parameter's undo: its other side is the value it moves from.
             Command::Put(t) => match &**t {
@@ -694,6 +696,9 @@ impl Command {
             _ => self.take(s)?,
         };
         let result = self.change(s)?;
+        if plugin_edit {
+            s.mark_plugin_edited();
+        }
         s.piano.dirty = true;
         Ok(Done { undo: Command::Put(Box::new(taken)), result })
     }

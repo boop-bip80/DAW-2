@@ -61,7 +61,7 @@ pub fn plugin_state_from_fl(fl: &[u8]) -> Vec<u8> {
 
 /// The Maximus state inside a plugin state blob; `Some(empty)` for an instance on its starting state.
 pub fn fl_from_plugin_state(blob: &[u8]) -> Option<Vec<u8>> {
-    let json = if blob.len() > 8 && blob[0] != b'{' { &blob[8..] } else { blob };
+    let json = os_plugkit::plugin_state_json(blob);
     let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(json).ok()?).ok()?;
     let field = v.get("fields")?.get(STATE_FIELD)?.as_str()?;
     serde_json::from_str::<StateBytes>(field).ok().map(|s| s.0)
@@ -266,6 +266,22 @@ mod tests {
         assert_eq!(state_of(&fl), State::new_default());
         assert_eq!(state_of(&[]), State::new_default());
         assert_eq!(state_of(&[1, 2, 3]), State::new_default());
+    }
+
+    #[test]
+    fn state_with_open_brace_in_length_header_is_not_misread_as_json() {
+        let fl = vec![0, 1, 2, 255];
+        let mut blob = plugin_state_from_fl(&fl);
+        let padding = (123 + 256 - (blob.len() - 8) % 256) % 256;
+        blob.extend(std::iter::repeat_n(b' ', padding));
+        let size = (blob.len() - 8) as u64;
+        blob[..8].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(blob[0], b'{');
+        assert_eq!(fl_from_plugin_state(&blob), Some(fl.clone()));
+        assert_eq!(fl_from_plugin_state(&blob[8..]), Some(fl));
+        // A malformed prefix must not cause the decoder to silently skip eight bytes.
+        blob[1] ^= 1;
+        assert_eq!(fl_from_plugin_state(&blob), None);
     }
 
     /// An editor edit reaches the sound without a restart; a state replaced from outside is applied.

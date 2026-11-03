@@ -188,11 +188,7 @@ impl App {
                 let path = params.get("path").and_then(Value::as_str).map(std::path::PathBuf::from).or_else(|| self.state.path.clone());
                 let path = path.ok_or_else(|| bad("the project has no file yet: give `path`"))?;
                 if c.saves {
-                    self.save_to(path.clone());
-                    let msg = self.state.message.clone().unwrap_or_default();
-                    if !msg.starts_with("Saved") {
-                        return Err(failed(msg));
-                    }
+                    self.save_to_result(path.clone()).map_err(failed)?;
                     Ok(json!({ "saved": path.display().to_string() }))
                 } else {
                     self.ask_save(&c.name, path.clone());

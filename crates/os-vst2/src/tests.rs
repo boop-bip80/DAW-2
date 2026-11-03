@@ -142,6 +142,30 @@ fn notes_go_on_their_midi_channel() {
 }
 
 #[test]
+fn controller_messages_keep_their_midi_channels_and_sample_offsets() {
+    let (_m, mut p) = synth();
+    p.activate(48000);
+    p.midi(5, [0xB3, 7, 64]);
+    p.midi(11, [0xBF, 64, 127]);
+    p.midi(17, [0xE5, 1, 65]);
+    let (mut l, mut r) = ([0.0; 32], [0.0; 32]);
+    p.process(48000, &mut l, &mut r);
+    assert_eq!(probe(|p| p.midi.clone()), [(5, 0xB3, 7, 64), (11, 0xBF, 64, 127), (17, 0xE5, 1, 65)]);
+}
+
+#[test]
+fn same_pitch_notes_on_different_channels_end_on_their_own_channel() {
+    let (_m, mut p) = synth();
+    p.activate(48000);
+    p.note_start(0, 60, 1.0, 0.0, os_engine::NoteLevels { channel: 3, ..Default::default() });
+    p.note_start(1, 60, 1.0, 0.0, os_engine::NoteLevels { channel: 7, ..Default::default() });
+    p.note_end(7, 60, 3);
+    let (mut l, mut r) = ([0.0; 32], [0.0; 32]);
+    p.process(48000, &mut l, &mut r);
+    assert_eq!(probe(|p| p.midi.iter().map(|m| (m.0, m.1)).collect::<Vec<_>>()), [(0, 0x93), (1, 0x97), (7, 0x83)]);
+}
+
+#[test]
 fn notes_reach_the_plugin_at_their_frames() {
     let (_m, mut p) = synth();
     p.activate(48000);

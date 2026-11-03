@@ -545,6 +545,7 @@ pub(crate) unsafe fn attend(host: *const clap_host) {
 enum Kind {
     On,
     Off,
+    OffChannel,
     Choke,
     /// Tuning of a key's voices (note expression); `velocity` holds the semitones.
     Tune,
@@ -721,6 +722,7 @@ pub struct Plugin {
     /// Parameter ranges in list order (id, min, max, stepped), read after init and on a rescan (values cross the
     /// hosting layer normalized).
     ranges: Vec<params::Range>,
+    param_order: os_host::ParamOrder,
     /// Host parameter changes (id, plain value) for the next process call or flush.
     param_queue: Vec<(u32, f64)>,
     /// Automation values (frame offset, id, plain value) for the next process call (`params.rs`).
@@ -973,6 +975,7 @@ impl Plugin {
                 voice_info,
                 ledger: VoiceLedger::new(),
                 bend,
+                param_order: os_host::ParamOrder::new(&ranges.iter().map(|r| r.0).collect::<Vec<_>>()),
                 ranges,
                 param_queue: Vec::new(),
                 auto: Vec::with_capacity(params::MAX_AUTO),
@@ -1084,6 +1087,8 @@ impl Plugin {
         unsafe {
             if self.processing {
                 if let Some(s) = (*self.plugin).stop_processing {
+                    // CLAP's audio thread is a serialized role; the UI thread may temporarily perform it.
+                    let _audio = os_engine::parallel::AudioScope::enter();
                     s(self.plugin);
                 }
                 self.processing = false;
@@ -1116,6 +1121,9 @@ impl Plugin {
         let before = self.param_out.len();
         unsafe {
             if let Some(f) = (*self.params).flush {
+                // Inactive flush is main-thread only; active flush is an audio-thread callback. The instance mutex
+                // excludes process(), so a scoped logical audio role here satisfies both requirements.
+                let _audio = (self.rate != 0).then(os_engine::parallel::AudioScope::enter);
                 f(self.plugin, &ins, &outs);
             }
         }
@@ -1408,7 +1416,13 @@ impl Plugin {
         }
         let mut r = Reader(data, 0);
         let stream = clap_istream { ctx: &mut r as *mut Reader as *mut c_void, read: Some(read) };
-        unsafe { (*self.state).load.is_some_and(|f| f(self.plugin, &stream)) }
+        let loaded = unsafe { (*self.state).load.is_some_and(|f| f(self.plugin, &stream)) };
+        if loaded {
+            self.ranges = unsafe { params::read_ranges(self.params, self.plugin) };
+            self.param_order.update(&self.ranges.iter().map(|r| r.0).collect::<Vec<_>>());
+            self.host_data.attention.raise();
+        }
+        loaded
     }
 
     /// Processes `n` frames (≤ max) with the queued events whose time falls inside them.
@@ -1473,7 +1487,7 @@ impl Plugin {
             if e.time < n && e.kind == Kind::On {
                 self.key_ch[usize::from(e.key & 127)] = e.levels.channel & 15;
             }
-            let ch = i16::from(self.key_ch[usize::from(e.key & 127)]);
+            let ch = i16::from(if e.kind == Kind::OffChannel { e.levels.channel & 15 } else { self.key_ch[usize::from(e.key & 127)] });
             if e.time < n && e.kind == Kind::Tune {
                 // Portamento glides (spec: audio/channel-voices.md): CLAP tuning expression, semitones.
                 self.exprs.push(clap_event_note_expression {
@@ -1533,7 +1547,7 @@ impl Plugin {
                 }
                 match e.kind {
                     Kind::On => self.ledger.start(e.key, id),
-                    Kind::Off => self.ledger.release(e.key),
+                    Kind::Off | Kind::OffChannel => self.ledger.release(e.key),
                     Kind::Choke if id >= 0 => self.ledger.choke_voice(id),
                     Kind::Choke | Kind::Tune | Kind::Gain => self.ledger.choke(e.key),
                 }
@@ -1544,7 +1558,7 @@ impl Plugin {
                         space_id: CLAP_CORE_EVENT_SPACE_ID,
                         type_: match e.kind {
                             Kind::On => CLAP_EVENT_NOTE_ON,
-                            Kind::Off => CLAP_EVENT_NOTE_OFF,
+                            Kind::Off | Kind::OffChannel => CLAP_EVENT_NOTE_OFF,
                             Kind::Choke | Kind::Tune | Kind::Gain => CLAP_EVENT_NOTE_CHOKE,
                         },
                         flags: 0,
@@ -1826,13 +1840,31 @@ impl os_host::Plugin for Plugin {
     }
 
     fn param_count(&self) -> usize {
-        if self.params.is_null() { 0 } else { unsafe { (*self.params).count.map_or(0, |c| c(self.plugin)) as usize } }
+        self.param_order.ids().len()
+    }
+
+    fn parameter_ids(&self) -> Vec<u32> {
+        self.param_order.ids().to_vec()
+    }
+
+    fn restore_parameter_ids(&mut self, ids: &[u32]) -> bool {
+        let current: Vec<_> = self.ranges.iter().map(|r| r.0).collect();
+        let restored = self.param_order.restore(ids, &current);
+        if restored {
+            self.host_data.attention.raise();
+        }
+        restored
+    }
+
+    fn param_revision(&self) -> u64 {
+        self.param_order.revision()
     }
 
     fn param_info(&self, index: usize) -> Option<os_host::ParamInfo> {
         if self.params.is_null() {
             return None;
         }
+        let index = self.param_order.index(index)?;
         unsafe {
             let mut info: clap_param_info = std::mem::zeroed();
             if !(*self.params).get_info.is_some_and(|g| g(self.plugin, index as u32, &mut info)) {
@@ -1940,6 +1972,7 @@ impl os_engine::Instrument for Plugin {
             return;
         }
         // CLAP: stop processing, then `reset` clears the plugin's voices and tails; processing restarts on the next block.
+        let _audio = os_engine::parallel::AudioScope::enter();
         unsafe {
             if self.processing {
                 if let Some(s) = (*self.plugin).stop_processing {
@@ -1959,6 +1992,9 @@ impl os_engine::Instrument for Plugin {
 
     fn note_off(&mut self, offset: u32, key: u8) {
         self.queue.push(Ev::new(offset, Kind::Off, key, 0.0));
+    }
+    fn note_end(&mut self, offset: u32, key: u8, channel: u8) {
+        self.queue.push(Ev { levels: os_engine::NoteLevels { channel, ..Default::default() }, ..Ev::new(offset, Kind::OffChannel, key, 0.0) });
     }
 
     fn midi(&mut self, offset: u32, bytes: [u8; 3]) {

@@ -10,7 +10,7 @@
 // spec: ui/midi-settings.md §2, §8; ui/midi-input.md §3
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -63,14 +63,14 @@ pub fn parse(bytes: &[u8]) -> Option<Msg> {
 }
 
 impl Msg {
-    /// The message as sent on to an instrument, on MIDI channel 1 (spec §4): not notes, not the clock's.
+    /// Channel messages retain the input channel. The destination's channel-through setting is applied by routing.
     pub fn bytes(&self) -> Option<[u8; 3]> {
         Some(match *self {
-            Msg::Cc { n, v, .. } => [0xb0, n, v],
-            Msg::Bend { v, .. } => [0xe0, (v & 0x7f) as u8, (v >> 7 & 0x7f) as u8],
-            Msg::Pressure { v, .. } => [0xd0, v, 0],
-            Msg::Poly { key, v, .. } => [0xa0, key, v],
-            Msg::Program { p, .. } => [0xc0, p, 0],
+            Msg::Cc { ch, n, v } => [0xb0 | (ch & 15), n, v],
+            Msg::Bend { ch, v } => [0xe0 | (ch & 15), (v & 0x7f) as u8, (v >> 7 & 0x7f) as u8],
+            Msg::Pressure { ch, v } => [0xd0 | (ch & 15), v, 0],
+            Msg::Poly { ch, key, v } => [0xa0 | (ch & 15), key, v],
+            Msg::Program { ch, p } => [0xc0 | (ch & 15), p, 0],
             _ => return None,
         })
     }
@@ -80,7 +80,40 @@ impl Msg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ev {
     pub dev: Arc<str>,
+    /// Distinguishes open connections even when device names match or a device reconnects.
+    pub port: u64,
+    /// Driver microseconds are retained for diagnostics; `at` maps that clock into the host's monotonic clock.
+    pub stamp: u64,
+    pub at: Instant,
     pub msg: Msg,
+}
+
+/// midir timestamps have a backend-specific origin. Calibrate on the input thread and retain relative driver
+/// timing across delayed callbacks/UI polls. A clock reset or an estimate in the future reanchors to arrival time.
+/// A backend that supplies no timestamp (zero) uses ingress time, never the later UI poll time.
+#[derive(Default)]
+struct InputClock {
+    anchor: Option<(u64, Instant)>,
+    previous: u64,
+}
+
+impl InputClock {
+    fn at(&mut self, stamp: u64, arrived: Instant) -> Instant {
+        if stamp == 0 {
+            self.anchor = None;
+            self.previous = 0;
+            return arrived;
+        }
+        let mapped = self.anchor.and_then(|(base, at)| {
+            (stamp >= self.previous).then_some(())?;
+            at.checked_add(Duration::from_micros(stamp.checked_sub(base)?)).filter(|&t| t <= arrived)
+        });
+        self.previous = stamp;
+        mapped.unwrap_or_else(|| {
+            self.anchor = Some((stamp, arrived));
+            arrived
+        })
+    }
 }
 
 /// An input device as Settings > MIDI lists it.
@@ -137,7 +170,7 @@ struct ExtClock(Mutex<ClockState>);
 
 impl ExtClock {
     /// Driver thread: a real-time message from `dev`. Returns whether it is the chosen device's.
-    fn feed(&self, dev: &str, status: u8, bytes: &[u8], wake: fn()) -> bool {
+    fn feed(&self, dev: &str, status: u8, bytes: &[u8], wake: fn(), at: Instant) -> bool {
         let Ok(mut c) = self.0.lock() else { return false };
         if c.device.as_deref() != Some(dev) {
             return false;
@@ -147,7 +180,7 @@ impl ExtClock {
                 if c.times.len() > CLOCKS_PER_BEAT {
                     c.times.pop_front();
                 }
-                c.times.push_back(Instant::now());
+                c.times.push_back(at);
                 if c.running {
                     c.count += 1;
                     // A beat: the status line and the tempo move on.
@@ -308,21 +341,25 @@ impl MidiIn {
 
     /// Opens the `i`-th input (named `name` in `unique`'s list).
     fn connect(&self, i: usize, name: &str) -> Option<midir::MidiInputConnection<()>> {
+        static NEXT_PORT: AtomicU64 = AtomicU64::new(1);
         let mut input = midir::MidiInput::new(CLIENT).ok()?;
         // SysEx and active sensing never reach the UI; the clock does (External clock sync).
         input.ignore(midir::Ignore::SysexAndActiveSense);
         let port = input.ports().into_iter().nth(i)?;
         let (tx, wake, clock): (Sender<Ev>, fn(), Arc<ExtClock>) = (self.tx.clone(), self.wake, self.clock.clone());
         let dev: Arc<str> = Arc::from(name);
+        let port_id = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+        let mut timing = InputClock::default();
         // Runs on the driver's thread: only queues the message and wakes the UI.
-        let take = move |_stamp: u64, bytes: &[u8], _: &mut ()| {
+        let take = move |stamp: u64, bytes: &[u8], _: &mut ()| {
+            let at = timing.at(stamp, Instant::now());
             let Some(&status) = bytes.first() else { return };
-            if status >= 0xf0 && !clock.feed(&dev, status, bytes, wake) {
+            if status >= 0xf0 && !clock.feed(&dev, status, bytes, wake, at) {
                 // Real-time and system messages of other devices are not used.
                 return;
             }
             if let Some(msg) = parse(bytes) {
-                if tx.send(Ev { dev: dev.clone(), msg }).is_ok() {
+                if tx.send(Ev { dev: dev.clone(), port: port_id, stamp, at, msg }).is_ok() {
                     wake();
                 }
             }
@@ -365,7 +402,7 @@ mod tests {
         assert!(own("Lemon Studio:Lemon Studio 131:0") && !own("Lemon Studio test:out 130:0") && !own("Launchkey MK4 61:Launchkey MK4 61 MIDI In 24:0"));
         assert_eq!(parse(&[0xfa]), Some(Msg::Start));
         assert_eq!(parse(&[0xf8]), None, "the clock is not a message here");
-        assert_eq!(Msg::Bend { ch: 4, v: 8192 }.bytes(), Some([0xe0, 0, 64]), "sent on channel 1");
+        assert_eq!(Msg::Bend { ch: 4, v: 8192 }.bytes(), Some([0xe4, 0, 64]), "the input channel survives parsing");
         assert_eq!(Msg::On { ch: 0, key: 1, vel: 2 }.bytes(), None);
     }
 
@@ -380,20 +417,49 @@ mod tests {
         fn nothing() {}
         let c = ExtClock::default();
         assert_eq!(c.status().text(), "Status: off");
-        assert!(!c.feed("Keys", 0xf8, &[0xf8], nothing), "no device chosen");
+        assert!(!c.feed("Keys", 0xf8, &[0xf8], nothing, Instant::now()), "no device chosen");
         c.choose(Some("Keys".into()));
         assert_eq!(c.status().text(), "Status: ready");
-        c.feed("Keys", 0xfa, &[0xfa], nothing);
+        c.feed("Keys", 0xfa, &[0xfa], nothing, Instant::now());
         for _ in 0..30 {
-            c.feed("Keys", 0xf8, &[0xf8], nothing);
+            c.feed("Keys", 0xf8, &[0xf8], nothing, Instant::now());
             std::thread::sleep(Duration::from_millis(2));
         }
         let s = c.status();
         assert_eq!(s.beat, Some(2), "30 clocks after Start: beat 2");
         assert!(s.tempo.is_some_and(|t| t > 100.0 && t < 1300.0), "{s:?}");
-        c.feed("Keys", 0xfc, &[0xfc], nothing);
+        c.feed("Keys", 0xfc, &[0xfc], nothing, Instant::now());
         assert_eq!(c.status().text(), "Status: ready");
-        assert!(!c.feed("Other", 0xfa, &[0xfa], nothing), "another device's clock is not followed");
+        assert!(!c.feed("Other", 0xfa, &[0xfa], nothing, Instant::now()), "another device's clock is not followed");
+    }
+
+    #[test]
+    fn driver_timestamps_survive_queue_delay_and_clock_resets_are_bounded() {
+        let base = Instant::now();
+        let mut clock = InputClock::default();
+        assert_eq!(clock.at(1_000_000, base), base);
+        // Driver events are 10 ms apart, although this callback is delayed by 90 ms.
+        assert_eq!(clock.at(1_010_000, base + Duration::from_millis(100)), base + Duration::from_millis(10));
+        assert_eq!(clock.at(1_010_000, base + Duration::from_millis(101)), base + Duration::from_millis(10));
+        let restart = base + Duration::from_millis(102);
+        assert_eq!(clock.at(1, restart), restart);
+        assert_eq!(clock.at(0, restart + Duration::from_millis(3)), restart + Duration::from_millis(3));
+        assert_eq!(clock.at(u64::MAX, restart + Duration::from_millis(4)), restart + Duration::from_millis(4));
+    }
+
+    #[test]
+    fn every_channel_message_preserves_its_input_channel() {
+        for ch in 0..16 {
+            for (message, status) in [
+                (Msg::Cc { ch, n: 7, v: 90 }, 0xb0),
+                (Msg::Bend { ch, v: 8192 }, 0xe0),
+                (Msg::Pressure { ch, v: 90 }, 0xd0),
+                (Msg::Poly { ch, key: 60, v: 90 }, 0xa0),
+                (Msg::Program { ch, p: 5 }, 0xc0),
+            ] {
+                assert_eq!(message.bytes().unwrap()[0], status | ch);
+            }
+        }
     }
 
     /// Messages sent to a loopback MIDI port (an output that is also an input: a loopMIDI port on Windows, ALSA's

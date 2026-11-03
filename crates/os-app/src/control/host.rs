@@ -65,6 +65,7 @@ impl App {
         }
         if !fx_map.is_empty() {
             self.plugins.remap_fx(&|t, k| fx_map.get(&(t, k)).copied().unwrap_or(Some((t, k))));
+            self.prepare_plugin_routing();
             self.transport.set_effects(self.plugins.effects());
             self.state.piano.dirty = true;
         }
@@ -119,6 +120,7 @@ impl App {
                 h.owner = id;
             }
             if made && fx {
+                self.prepare_plugin_routing();
                 self.transport.set_effects(self.plugins.effects());
             }
             self.state.piano.dirty = true;
@@ -212,9 +214,11 @@ impl App {
             self.invalidate();
         }
         if relink.0 {
+            self.prepare_plugin_routing();
             self.transport.set_instruments(self.plugins.instruments());
         }
         if relink.1 {
+            self.prepare_plugin_routing();
             self.transport.set_effects(self.plugins.effects());
         }
         if relink.0 || relink.1 {

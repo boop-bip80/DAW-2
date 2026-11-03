@@ -340,7 +340,7 @@ impl App {
                 f.selection &= f.has_selection();
             }
             FHit::Seg(1, i) => f.selection = i == 1 && f.has_selection(),
-            FHit::Seg(_, i) => f.o.tail = [Tail::Cut, Tail::Ring, Tail::Wrap][usize::from(i).min(2)],
+            FHit::Seg(_, i) => f.o.tail = [Tail::Cut, Tail::Ring, Tail::Wrap, Tail::Fixed][usize::from(i).min(3)],
             // A format toggles; the last one ticked stays.
             FHit::Tile(t) => {
                 let t = usize::from(t).min(3);

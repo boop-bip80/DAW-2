@@ -12,7 +12,8 @@ use os_flp::{FlpFile, check_alignment};
 #[test]
 fn corpus_roundtrip_and_alignment() {
     let Some(list) = std::env::var_os("OPENSTUDIO_FLP_CORPUS") else {
-        eprintln!("OPENSTUDIO_FLP_CORPUS not set; skipping corpus test");
+        assert!(std::env::var_os("LEMON_REQUIRE_EXTERNAL_FIXTURES").is_none(), "OPENSTUDIO_FLP_CORPUS is required for external qualification");
+        eprintln!("SKIPPED external fixture: OPENSTUDIO_FLP_CORPUS is unset");
         return;
     };
     let list = std::fs::read_to_string(&list)

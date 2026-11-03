@@ -48,6 +48,9 @@ pub enum Src {
     Typing(KeyCode),
     /// A MIDI keyboard's key.
     Midi(u8),
+    /// A physical MIDI input connection, its incoming channel and key. Separate ports/channels may hold the same
+    /// pitch simultaneously even when MIDI channel-through is disabled for the destination instrument.
+    MidiInput { port: u64, channel: u8, key: u8 },
     /// A MIDI key on the Omni preview MIDI channel (spec: ui/midi-settings.md §3).
     Omni(u8),
     /// A Touch controller pad or key (spec: ui/touch-controller.md §2).
@@ -109,8 +112,12 @@ impl App {
 
     /// `step_edit_down` for a note with more than a key and velocity (a MIDI note's Mod X / Y, another channel).
     pub(crate) fn step_edit_down_with(&mut self, src: Src, key: u16, velocity: u8, extra: crate::record::Extra) {
+        self.step_edit_down_at(src, key, velocity, extra, std::time::Instant::now());
+    }
+
+    pub(crate) fn step_edit_down_at(&mut self, src: Src, key: u16, velocity: u8, extra: crate::record::Extra, at: std::time::Instant) {
         // While playing, Record takes the note instead (spec: ui/recording.md §2 Taking notes).
-        self.record_down_with(src, key, velocity, extra);
+        self.record_down_at(src, key, velocity, extra, at);
         if self.step_edit_live() && extra.channel.is_none() {
             self.step_chord.down(src, key, velocity);
         }
@@ -123,7 +130,11 @@ impl App {
 
     /// `step_edit_up` with the note's release velocity, when it has one.
     pub(crate) fn step_edit_up_with(&mut self, src: Src, release: Option<u8>) {
-        self.record_up_with(src, release);
+        self.step_edit_up_at(src, release, std::time::Instant::now());
+    }
+
+    pub(crate) fn step_edit_up_at(&mut self, src: Src, release: Option<u8>, at: std::time::Instant) {
+        self.record_up_at(src, release, at);
         let Some(keys) = self.step_chord.up(src) else { return };
         if self.step_edit_live() && !keys.is_empty() {
             self.step_edit_write(&keys);

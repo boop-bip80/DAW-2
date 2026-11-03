@@ -50,6 +50,10 @@ struct Held {
     /// The device's key.
     key: u8,
     src: Src,
+    port: u64,
+    channel: u8,
+    midi: u8,
+    id: u64,
     /// The rack row sounding and the key it sounds at (key 60 for an omni preview).
     row: usize,
     play: u16,
@@ -61,16 +65,17 @@ struct Held {
 #[derive(Debug, Default)]
 pub struct Play {
     held: Vec<Held>,
-    /// The foot pedal is down.
-    pedal: bool,
+    /// Input connections/channels whose foot pedal is down.
+    pedal: Vec<(u64, u8)>,
     /// The row bent by pitch bend, while off centre.
-    bend_row: Option<usize>,
+    bend_row: Option<(usize, u8)>,
+    next_id: u64,
     /// When the external clock's tempo was last applied.
     tempo_at: Option<Instant>,
     /// External sync messages waiting out a positive offset.
     pending: VecDeque<(Instant, Msg)>,
     /// Generator muting keys held with Toggle on release on: (key, row).
-    muted: Vec<(u8, usize)>,
+    muted: Vec<(u64, u8, u8, usize)>,
 }
 
 impl Play {
@@ -152,9 +157,9 @@ impl App {
         self.ext_sync_tick();
         self.remote_tick();
         // The bent row returns to the centre when another is selected (spec §4).
-        if let Some(row) = self.midi_play.bend_row.filter(|&r| r != self.state.selected_channel) {
+        if let Some((row, channel)) = self.midi_play.bend_row.filter(|&(r, _)| r != self.state.selected_channel) {
             self.midi_play.bend_row = None;
-            self.transport.midi(row, [0xe0, 0, 64], 200.0);
+            self.transport.midi(row, [0xe0 | channel, 0, 64], 200.0);
         }
         self.midi_out_tick();
     }
@@ -202,37 +207,37 @@ impl App {
             match ev.msg {
                 Msg::Start | Msg::Continue | Msg::Stop | Msg::Spp(_) => {
                     if ext.as_deref() == Some(&*ev.dev) {
-                        self.ext_message(ev.msg);
+                        self.ext_message(ev.msg, ev.at);
                     }
                 }
                 Msg::On { ch, key, vel } => {
                     notes = true;
-                    self.midi_note_on(ch, key, vel);
+                    self.midi_note_on(ev.port, ch, key, vel, ev.at);
                 }
                 Msg::Off { ch, key, vel } => {
                     notes = true;
-                    self.midi_note_off(ch, key, vel);
+                    self.midi_note_off(ev.port, ch, key, vel, ev.at);
                 }
-                Msg::Cc { n: 64, v, .. } if prefs::check(&prefs::FOOT_PEDAL) => {
+                Msg::Cc { ch, n: 64, v } if prefs::check(&prefs::FOOT_PEDAL) => {
                     notes = true;
-                    self.midi_pedal(v >= 64);
+                    self.midi_pedal(ev.port, ch, v >= 64, ev.at);
                 }
                 Msg::Cc { ch, n, v } => {
                     if !self.remote_cc(&ev.dev, ch, n, v) {
-                        self.midi_forward(ev.msg);
+                        self.midi_forward(ev.msg, ev.at);
                     }
                 }
                 Msg::Bend { .. } => {
                     let row = self.state.selected_channel;
                     if row < self.state.project.channels.len() {
                         self.sync_live();
-                        if let Some(b) = ev.msg.bytes() {
-                            self.transport.midi(row, b, 200.0);
+                        if let Some(b) = self.midi_bytes(row, ev.msg) {
+                            self.transport.midi_at(row, b, 200.0, ev.at);
+                            self.midi_play.bend_row = Some((row, b[0] & 15));
                         }
-                        self.midi_play.bend_row = Some(row);
                     }
                 }
-                Msg::Pressure { .. } | Msg::Poly { .. } | Msg::Program { .. } => self.midi_forward(ev.msg),
+                Msg::Pressure { .. } | Msg::Poly { .. } | Msg::Program { .. } => self.midi_forward(ev.msg, ev.at),
             }
         }
         if notes {
@@ -244,26 +249,35 @@ impl App {
     #[cfg(test)]
     pub(crate) fn midi_notes(&mut self, msgs: Vec<Msg>) {
         let dev: std::sync::Arc<str> = std::sync::Arc::from("Test");
-        self.midi_events(msgs.into_iter().map(|msg| Ev { dev: dev.clone(), msg }).collect());
+        self.midi_events(msgs.into_iter().map(|msg| Ev { dev: dev.clone(), port: 0, stamp: 0, at: Instant::now(), msg }).collect());
     }
 
-    /// A message for the selected channel's hosted instrument, on MIDI channel 1 (spec §4).
-    fn midi_forward(&mut self, m: Msg) {
+    fn midi_bytes(&self, row: usize, m: Msg) -> Option<[u8; 3]> {
+        let mut bytes = m.bytes()?;
+        if !crate::rack::through(&self.state, row) {
+            bytes[0] &= 0xf0;
+        }
+        Some(bytes)
+    }
+
+    /// A message for the selected channel, respecting channel-through and retaining its ingress time.
+    fn midi_forward(&mut self, m: Msg, at: Instant) {
         let row = self.state.selected_channel;
-        let Some(b) = m.bytes().filter(|_| row < self.state.project.channels.len()) else { return };
+        let Some(b) = self.midi_bytes(row, m).filter(|_| row < self.state.project.channels.len()) else { return };
         self.sync_live();
-        self.transport.midi(row, b, 200.0);
+        self.transport.midi_at(row, b, 200.0, at);
     }
 
-    fn midi_note_on(&mut self, ch: u8, key: u8, vel: u8) {
+    fn midi_note_on(&mut self, port: u64, ch: u8, key: u8, vel: u8, at: Instant) {
         self.key_tap();
         let n = self.state.project.channels.len();
         let (vel, mut extra) = linked(vel);
+        let src = Src::MidiInput { port, channel: ch, key };
         // The channels set on Settings > MIDI (spec §3): their notes are not played on the selected channel.
         if Some(ch) == channel_of(&prefs::OMNI_CHANNEL) {
             let Some(row) = white_index(key).filter(|&r| r < n) else { return };
             extra.channel = Some(self.state.project.channels[row].index);
-            return self.midi_start(Src::Omni(key), key, row, 60, vel, extra, 0);
+            return self.midi_start(src, port, ch, key, row, 60, vel, extra, 0, at);
         }
         if Some(ch) == channel_of(&prefs::MARKER_CHANNEL) {
             if let Some(i) = white_index(key) {
@@ -278,7 +292,7 @@ impl App {
             if let Some(row) = white_index(key).filter(|&r| r < n) {
                 crate::rack::toggle_mute(&mut self.state, row);
                 if prefs::check(&prefs::TOGGLE_ON_RELEASE) {
-                    self.midi_play.muted.push((key, row));
+                    self.midi_play.muted.push((port, ch, key, row));
                 }
                 self.invalidate();
             }
@@ -294,25 +308,27 @@ impl App {
         if midi > 0 {
             extra.group = Some(midi);
         }
-        self.midi_start(Src::Midi(key), key, row, u16::from(key), vel, extra, midi);
+        self.midi_start(src, port, ch, key, row, u16::from(key), vel, extra, midi, at);
     }
 
     /// Starts a note, on MIDI channel `midi` for a hosted plugin; a key the pedal still holds ends its earlier note
     /// first (spec §3).
-    fn midi_start(&mut self, src: Src, key: u8, row: usize, play: u16, vel: u8, extra: Extra, midi: u8) {
+    fn midi_start(&mut self, src: Src, port: u64, channel: u8, key: u8, row: usize, play: u16, vel: u8, extra: Extra, midi: u8, at: Instant) {
         while let Some(i) = self.midi_play.held.iter().position(|h| h.src == src) {
             let h = self.midi_play.held.remove(i);
-            self.midi_end(h, h.up.unwrap_or(64));
+            self.midi_end(h, h.up.unwrap_or(64), at);
         }
         self.sync_live();
-        self.transport.note_on_midi(row, play, vel, midi);
-        self.midi_play.held.push(Held { key, src, row, play, up: None });
-        self.step_edit_down_with(src, play, vel, extra);
+        self.midi_play.next_id = self.midi_play.next_id.wrapping_add(1).max(1);
+        let id = self.midi_play.next_id;
+        self.transport.note_on_input(row, play, vel, midi, id, at);
+        self.midi_play.held.push(Held { key, src, port, channel, midi, id, row, play, up: None });
+        self.step_edit_down_at(src, play, vel, extra, at);
     }
 
-    fn midi_end(&mut self, h: Held, release: u8) {
-        self.transport.note_off(h.row, h.play);
-        self.step_edit_up_with(h.src, Some(release));
+    fn midi_end(&mut self, h: Held, release: u8, at: Instant) {
+        self.transport.note_off_input(h.row, h.play, h.midi, h.id, at);
+        self.step_edit_up_at(h.src, Some(release), at);
     }
 
     /// A key of the Performance mode MIDI channel (spec: ui/performance-mode.md §3).
@@ -324,48 +340,49 @@ impl App {
         self.invalidate();
     }
 
-    fn midi_note_off(&mut self, ch: u8, key: u8, vel: u8) {
+    fn midi_note_off(&mut self, port: u64, ch: u8, key: u8, vel: u8, at: Instant) {
         if Some(ch) == channel_of(&prefs::PERFORMANCE_CHANNEL) {
             return self.perform_note(key, vel, false);
         }
         if Some(ch) == channel_of(&prefs::MUTING_CHANNEL) {
-            while let Some(i) = self.midi_play.muted.iter().position(|m| m.0 == key) {
-                let (_, row) = self.midi_play.muted.remove(i);
+            while let Some(i) = self.midi_play.muted.iter().position(|m| (m.0, m.1, m.2) == (port, ch, key)) {
+                let (_, _, _, row) = self.midi_play.muted.remove(i);
                 crate::rack::toggle_mute(&mut self.state, row);
                 self.invalidate();
             }
             return;
         }
-        let src = if Some(ch) == channel_of(&prefs::OMNI_CHANNEL) { Src::Omni(key) } else { Src::Midi(key) };
+        let src = Src::MidiInput { port, channel: ch, key };
         let release = release_of(vel);
-        let pedal = self.midi_play.pedal && prefs::check(&prefs::FOOT_PEDAL);
+        let pedal = self.midi_play.pedal.contains(&(port, ch)) && prefs::check(&prefs::FOOT_PEDAL);
         let Some(i) = self.midi_play.held.iter().position(|h| h.src == src && h.key == key && h.up.is_none()) else { return };
         if pedal {
             self.midi_play.held[i].up = Some(release);
         } else {
             let h = self.midi_play.held.remove(i);
-            self.midi_end(h, release);
+            self.midi_end(h, release, at);
         }
     }
 
     /// The foot pedal (controller 64 with Foot pedal controls note off): up ends the notes it held (spec §3).
-    fn midi_pedal(&mut self, down: bool) {
-        self.midi_play.pedal = down;
+    fn midi_pedal(&mut self, port: u64, channel: u8, down: bool, at: Instant) {
+        self.midi_play.pedal.retain(|&p| p != (port, channel));
         if down {
+            self.midi_play.pedal.push((port, channel));
             return;
         }
-        let (ended, kept): (Vec<Held>, Vec<Held>) = std::mem::take(&mut self.midi_play.held).into_iter().partition(|h| h.up.is_some());
+        let (ended, kept): (Vec<Held>, Vec<Held>) = std::mem::take(&mut self.midi_play.held).into_iter().partition(|h| h.port == port && h.channel == channel && h.up.is_some());
         self.midi_play.held = kept;
         for h in ended {
-            self.midi_end(h, h.up.unwrap_or(64));
+            self.midi_end(h, h.up.unwrap_or(64), at);
         }
     }
 
     /// Every device note ends (the device list changed, remote control switched off).
     pub(crate) fn midi_release_all(&mut self) {
-        self.midi_play.pedal = false;
+        self.midi_play.pedal.clear();
         for h in std::mem::take(&mut self.midi_play.held) {
-            self.midi_end(h, 64);
+            self.midi_end(h, 64, Instant::now());
         }
         self.typing_lit_changed();
     }
@@ -389,10 +406,10 @@ impl App {
     }
 
     /// The external sync device's transport message (spec §8): with a positive offset it waits that long.
-    fn ext_message(&mut self, m: Msg) {
+    fn ext_message(&mut self, m: Msg, at: Instant) {
         let off = cfg::offset(Offset::External);
         if off > 0 {
-            self.midi_play.pending.push_back((Instant::now() + Duration::from_millis(off as u64), m));
+            self.midi_play.pending.push_back((at + Duration::from_millis(off as u64), m));
         } else {
             self.ext_apply(m, (-off) as u32);
         }
@@ -755,6 +772,54 @@ mod tests {
         prefs::set_check(&prefs::FOOT_PEDAL, false);
         app.midi_notes(vec![cc(64, 127), on(62), off(62)]);
         assert!(app.midi_play.held.is_empty());
+    }
+
+    fn input(port: u64, msg: Msg, at: Instant) -> Ev {
+        Ev { dev: std::sync::Arc::from(format!("Port {port}")), port, stamp: 0, at, msg }
+    }
+
+    #[test]
+    fn equal_keys_on_different_ports_and_channels_release_independently() {
+        let mut app = app();
+        let at = Instant::now();
+        app.midi_events(vec![input(1, on(60), at), input(2, on(60), at), input(1, Msg::On { ch: 1, key: 60, vel: 90 }, at)]);
+        assert_eq!(app.midi_play.held.len(), 3);
+        let mut ids: Vec<_> = app.midi_play.held.iter().map(|h| h.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "the engine sees three independent live-note identities");
+        app.midi_events(vec![input(1, off(60), at)]);
+        assert_eq!(app.midi_play.held.len(), 2);
+        assert!(app.midi_play.held.iter().all(|h| (h.port, h.channel) != (1, 0)));
+        app.midi_events(vec![input(2, off(60), at)]);
+        assert_eq!((app.midi_play.held[0].port, app.midi_play.held[0].channel), (1, 1));
+        app.midi_events(vec![input(1, Msg::Off { ch: 1, key: 60, vel: 64 }, at)]);
+        assert!(app.midi_play.held.is_empty());
+    }
+
+    #[test]
+    fn sustain_pedals_are_scoped_to_input_port_and_channel() {
+        let mut app = app();
+        let at = Instant::now();
+        app.midi_events(vec![input(1, cc(64, 127), at), input(1, on(60), at), input(2, on(60), at), input(1, off(60), at), input(2, off(60), at)]);
+        assert_eq!(app.midi_play.held.len(), 1);
+        assert_eq!(app.midi_play.held[0].port, 1);
+        app.midi_events(vec![input(2, cc(64, 0), at)]);
+        assert_eq!(app.midi_play.held.len(), 1, "another keyboard's pedal cannot release this note");
+        app.midi_events(vec![input(1, cc(64, 0), at)]);
+        assert!(app.midi_play.held.is_empty());
+    }
+
+    #[test]
+    fn a_delayed_ui_poll_keeps_ingress_note_times_in_the_score_log() {
+        let mut app = app();
+        let now = Instant::now();
+        let down = now - Duration::from_millis(250);
+        let up = down + Duration::from_millis(125);
+        app.midi_events(vec![input(1, on(60), down), input(1, off(60), up)]);
+        let notes = app.state.rec.log.notes(1, now, 1000.0);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].length, 125, "the 125 ms note must not collapse into the duration of this UI loop");
     }
 
     /// spec §3: the omni preview and generator muting channels.

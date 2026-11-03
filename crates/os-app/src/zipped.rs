@@ -13,6 +13,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -25,6 +26,11 @@ use crate::dialog::{spans, Kind, Then};
 const UNZIP_DIR: &str = "Unzipped projects";
 /// Files already compressed are stored as they are.
 const STORED: &[&str] = &["mp3", "ogg", "flac", "m4a", "aac", "opus", "zip"];
+/// Extraction is an unattended background operation, so reject archives large enough to exhaust a typical disk.
+/// These are deliberately conservative defaults; projects beyond them need an explicit, separate extraction path.
+const MAX_ZIP_ENTRIES: usize = 65_536;
+const MAX_ZIP_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_ZIP_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// A zip being unzipped or written: the panel's title and file, and the bytes done of the total.
 pub struct Zipping {
@@ -39,7 +45,7 @@ enum Done {
     /// The project file unzipped.
     Unzipped(PathBuf),
     /// The zip written, how many samples it holds, and the samples not found (not in it).
-    Zipped { zip: PathBuf, samples: usize, missing: Vec<String> },
+    Zipped { zip: PathBuf, samples: usize, missing: Vec<String>, opaque: Vec<String> },
 }
 
 /// The file name of a stored sample path (either slash).
@@ -87,28 +93,35 @@ type Entry = (usize, PathBuf, u64);
 /// the one nearest the top of the zip (then by name). Names that would leave the folder are skipped.
 pub fn unzip(zip: &Path, fallback: Option<&Path>, done: &AtomicU64, total: &AtomicU64) -> Result<PathBuf, String> {
     let mut a = zip::ZipArchive::new(io::BufReader::new(File::open(zip).map_err(|e| e.to_string())?)).map_err(|e| e.to_string())?;
+    if a.len() > MAX_ZIP_ENTRIES { return Err(format!("ZIP contains too many entries (limit: {MAX_ZIP_ENTRIES})")) }
     let mut entries: Vec<Entry> = Vec::new();
+    let mut names = BTreeSet::new();
     for i in 0..a.len() {
         let f = a.by_index_raw(i).map_err(|e| e.to_string())?;
         if f.is_dir() {
             continue;
         }
         if let Some(rel) = f.enclosed_name() {
+            let folded = rel.to_string_lossy().replace('\\', "/").to_lowercase();
+            if !names.insert(folded) {
+                return Err(format!("duplicate or case-conflicting ZIP member: {}", rel.display()));
+            }
             entries.push((i, rel, f.size()));
         }
     }
+    let bytes = check_zip_bounds(&entries)?;
     let project = entries
         .iter()
         .filter(|e| is_project(&e.1))
         .min_by_key(|e| (e.1.components().count(), e.1.to_string_lossy().to_lowercase()))
         .map(|e| e.1.clone())
         .ok_or_else(|| "it holds no FLP project".to_string())?;
-    total.store(entries.iter().map(|e| e.2).sum(), Ordering::Relaxed);
+    total.store(bytes, Ordering::Relaxed);
     let stem = zip.file_stem().map_or_else(|| "Project".to_string(), |s| s.to_string_lossy().into_owned());
     let beside = zip.parent().map(|d| if d.as_os_str().is_empty() { Path::new(".") } else { d });
     let mut first_error = None;
     for base in beside.into_iter().chain(fallback) {
-        let Some(dest) = folder_for(base, &stem, &entries, &project) else { continue };
+        let Some(dest) = folder_for(&mut a, base, &stem, &entries, &project)? else { continue };
         done.store(0, Ordering::Relaxed);
         match unzip_into(&mut a, &entries, &dest, done) {
             Ok(()) => return Ok(dest.join(&project)),
@@ -120,44 +133,106 @@ pub fn unzip(zip: &Path, fallback: Option<&Path>, done: &AtomicU64, total: &Atom
     Err(first_error.unwrap_or_else(|| "no folder to unzip it into".into()))
 }
 
-/// The folder under `base` the zip goes into: `<stem>`, else `<stem> (2)` and on. One that exists is used again when
-/// it is this zip unzipped before (it has the project file, and no file of the zip's with another size).
-fn folder_for(base: &Path, stem: &str, entries: &[Entry], project: &Path) -> Option<PathBuf> {
-    (1..100).map(|n| if n == 1 { base.join(stem) } else { base.join(format!("{stem} ({n})")) }).find(|d| {
-        if !d.exists() {
-            return true;
-        }
-        let same = |rel: &Path, size: u64| std::fs::metadata(d.join(rel)).is_ok_and(|m| m.is_file() && m.len() == size);
-        let unzipped = entries.iter().any(|e| e.1 == project && same(&e.1, e.2));
-        unzipped && entries.iter().all(|(_, rel, size)| !d.join(rel).exists() || same(rel, *size))
-    })
+fn check_zip_bounds(entries: &[Entry]) -> Result<u64, String> {
+    if entries.len() > MAX_ZIP_ENTRIES { return Err(format!("ZIP contains too many files (limit: {MAX_ZIP_ENTRIES})")) }
+    let mut total = 0u64;
+    for (_, relative, size) in entries {
+        if *size > MAX_ZIP_FILE_BYTES { return Err(format!("ZIP file {} exceeds the {} GiB per-file extraction limit", relative.display(), MAX_ZIP_FILE_BYTES / 1024 / 1024 / 1024)) }
+        total = total.checked_add(*size).ok_or("ZIP uncompressed size overflow")?;
+        if total > MAX_ZIP_TOTAL_BYTES { return Err(format!("ZIP uncompressed size exceeds the {} GiB extraction limit", MAX_ZIP_TOTAL_BYTES / 1024 / 1024 / 1024)) }
+    }
+    Ok(total)
 }
 
-/// Writes the zip's files into `dest`; a file already there with the same size is kept. Each file is written beside
-/// its place, then moved in, so a stopped unzip leaves no part file under a real name.
+/// Compare the decompressed member with the existing file, reading through ZIP's CRC verification. Equal length
+/// is never enough to reuse an extraction: a same-length edit of either the project or a sample gets a new folder.
+fn same_entry<R: Read + io::Seek>(archive: &mut zip::ZipArchive<R>, entry: &Entry, path: &Path) -> Result<bool, String> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return Ok(false) };
+    if !meta.is_file() || meta.len() != entry.2 { return Ok(false) }
+    let mut stored = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut member = archive.by_index(entry.0).map_err(|e| e.to_string())?;
+    let (mut left, mut right) = ([0u8; 64 * 1024], [0u8; 64 * 1024]);
+    let mut remaining = entry.2;
+    while remaining > 0 {
+        let n = remaining.min(left.len() as u64) as usize;
+        member.read_exact(&mut left[..n]).map_err(|e| e.to_string())?;
+        stored.read_exact(&mut right[..n]).map_err(|e| e.to_string())?;
+        if left[..n] != right[..n] { return Ok(false) }
+        remaining -= n as u64;
+    }
+    Ok(member.read(&mut left[..1]).map_err(|e| e.to_string())? == 0 && stored.read(&mut right[..1]).map_err(|e| e.to_string())? == 0)
+}
+
+fn safe_destination(root: &Path, relative: &Path) -> bool {
+    let mut at = root.to_path_buf();
+    if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) { return false }
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) { return false }
+        at.push(component);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) { return false }
+    }
+    true
+}
+
+/// Reuse only a content-verified extraction, otherwise choose a new sibling folder. User-modified files are kept.
+fn folder_for<R: Read + io::Seek>(archive: &mut zip::ZipArchive<R>, base: &Path, stem: &str, entries: &[Entry], project: &Path) -> Result<Option<PathBuf>, String> {
+    for n in 1..100 {
+        let dir = if n == 1 { base.join(stem) } else { base.join(format!("{stem} ({n})")) };
+        if !dir.exists() { return Ok(Some(dir)) }
+        if !dir.is_dir() || !dir.join(project).is_file() { continue }
+        let mut same = true;
+        for entry in entries {
+            if !safe_destination(&dir, &entry.1) || !same_entry(archive, entry, &dir.join(&entry.1))? {
+                same = false;
+                break;
+            }
+        }
+        if same { return Ok(Some(dir)) }
+    }
+    Ok(None)
+}
+
+/// Publish each complete member exclusively. An interrupted extraction never overwrites a previous generation,
+/// and a changed file encountered after folder selection aborts rather than replacing the user's edit.
 fn unzip_into<R: Read + io::Seek>(a: &mut zip::ZipArchive<R>, entries: &[Entry], dest: &Path, done: &AtomicU64) -> Result<(), String> {
     let err = |p: &Path, e: &dyn std::fmt::Display| format!("{}: {e}", p.display());
     std::fs::create_dir_all(dest).map_err(|e| err(dest, &e))?;
-    for (i, rel, size) in entries {
+    for entry in entries {
+        let (i, rel, size) = entry;
         let out = dest.join(rel);
-        if std::fs::metadata(&out).is_ok_and(|m| m.is_file() && m.len() == *size) {
+        if !safe_destination(dest, rel) { return Err(format!("unsafe extraction path: {}", out.display())) }
+        if out.exists() {
+            if !same_entry(a, entry, &out)? { return Err(format!("{} changed during extraction; it was preserved", out.display())) }
             done.fetch_add(*size, Ordering::Relaxed);
             continue;
         }
-        if let Some(d) = out.parent() {
-            std::fs::create_dir_all(d).map_err(|e| err(d, &e))?;
-        }
-        let mut part = out.clone().into_os_string();
-        part.push(".part");
-        let part = PathBuf::from(part);
-        let mut f = a.by_index(*i).map_err(|e| err(rel, &e))?;
-        let written = File::create(&part).and_then(|w| copy(&mut f, io::BufWriter::new(w), done)).and_then(|()| std::fs::rename(&part, &out));
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&part);
-            return Err(err(&out, &e));
-        }
+        if let Some(parent) = out.parent() { std::fs::create_dir_all(parent).map_err(|e| err(parent, &e))?; }
+        let mut member = a.by_index(*i).map_err(|e| err(rel, &e))?;
+        crate::durable_file::create_with(&out, |file| copy_exact(&mut member, file, *size, done)).map_err(|e| err(&out, &e))?;
     }
     Ok(())
+}
+
+/// Bound the *actual* decompression as well as the ZIP header's advertised size. A corrupt member that emits more
+/// or fewer bytes than declared is rejected before its temporary file can be published.
+fn copy_exact(r: &mut impl Read, mut w: impl Write, size: u64, done: &AtomicU64) -> io::Result<()> {
+    let mut buf = [0u8; 256 * 1024];
+    let mut left = size;
+    while left != 0 {
+        let nbytes = left.min(buf.len() as u64) as usize;
+        let n = match r.read(&mut buf[..nbytes]) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ZIP member ended before advertised size")),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        w.write_all(&buf[..n])?;
+        left -= n as u64;
+        done.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    let mut excess = [0u8; 1];
+    if r.read(&mut excess)? != 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "ZIP member exceeded advertised size")) }
+    w.flush()
 }
 
 /// Copies `r` into `w`, counting the bytes into `done`.
@@ -198,32 +273,47 @@ struct Pack {
     files: Vec<(PathBuf, String)>,
     /// Samples the project names that were not found (file names).
     missing: Vec<String>,
+    opaque: Vec<String>,
 }
 
 impl Pack {
     /// Takes the samples of the project being written; a sample renamed in the zip (two files of one name) gets that
     /// name in the project file too, so it is found by name once unzipped.
-    fn gather(&mut self, p: &mut os_model::Project) {
-        for ch in &mut p.channels {
-            let Some(stored) = ch.sample_path.clone().filter(|s| !s.trim().is_empty()) else { continue };
+    fn gather(&mut self, p: &mut os_model::Project) -> Result<(), String> {
+        let inventory = crate::assets::inspect(p)?;
+        self.opaque = inventory.opaque.into_iter().collect();
+        let mut paths = crate::assets::Paths::new();
+        for (_, stored) in inventory.references {
             let real = PathBuf::from(crate::plugins::resolve_sample(&stored));
             if !real.is_file() {
                 self.missing.push(file_name(&stored).to_string());
                 continue;
             }
-            let name = match self.files.iter().find(|(f, _)| *f == real) {
-                Some((_, n)) => n.clone(),
+            let same = self.files.iter().find(|(file, _)| *file == real ||
+                (file.file_name().zip(real.file_name()).is_some_and(|(a, b)| a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()))
+                    && crate::assets::same_content(file, &real).unwrap_or(false)));
+            let name = match same {
+                Some((_, name)) => name.clone(),
                 None => {
-                    let n = self.free_name(&real.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
-                    self.files.push((real, n.clone()));
-                    n
+                    let name = self.free_name(&real.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
+                    self.files.push((real, name.clone()));
+                    name
                 }
             };
-            let old = file_name(&stored);
-            if old != name {
-                ch.sample_path = Some(format!("{}{name}", &stored[..stored.len() - old.len()]));
-            }
+            crate::assets::map_path(&mut paths, &stored, name);
         }
+        if !self.missing.is_empty() {
+            self.missing.sort_unstable();
+            self.missing.dedup();
+            return Err(format!("portable ZIP export stopped: missing sample files: {}", self.missing.join(", ")));
+        }
+        if !self.opaque.is_empty() {
+            return Err(format!("portable ZIP export stopped: external file dependencies of {} cannot be enumerated; collect them with their plugins first", self.opaque.join(", ")));
+        }
+        let mut candidate = crate::assets::rewritten(p, &paths)?;
+        candidate.data_folder = Some(os_model::DataFolder { choice: os_model::DataFolder::RELATIVE, folder: String::new() });
+        *p = candidate;
+        Ok(())
     }
 
     /// `name`, else `<stem>_2.<ext>` and on, so no two files in the zip share a name (case does not count).
@@ -252,9 +342,11 @@ fn prepare(app: &mut App, zip: &Path) -> Result<(Vec<u8>, Pack), String> {
     let mut pack = Pack { project, ..Default::default() };
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let temp = std::env::temp_dir().join(format!("lemon-zip-{}-{nanos}.{ext}", std::process::id()));
-    let saved = app.save_copy_with(temp.clone(), &mut |p| pack.gather(p));
+    let mut gathered = Ok(());
+    let saved = app.save_copy_with(temp.clone(), &mut |p| gathered = pack.gather(p));
     let bytes = std::fs::read(&temp);
     let _ = std::fs::remove_file(&temp);
+    gathered?;
     match saved {
         None => Err("wait until the project has loaded".into()),
         Some(Err(e)) => Err(e),
@@ -274,27 +366,19 @@ fn write_zip(zip: &Path, flp: &[u8], pack: &Pack, done: &AtomicU64, total: &Atom
             .compression_method(if stored { CompressionMethod::Stored } else { CompressionMethod::Deflated })
             .large_file(size >= u64::from(u32::MAX))
     };
-    let mut part = zip.as_os_str().to_owned();
-    part.push(".part");
-    let part = PathBuf::from(part);
-    let write = || -> Result<(), String> {
-        let mut w = zip::ZipWriter::new(io::BufWriter::new(File::create(&part).map_err(|e| e.to_string())?));
-        w.start_file(pack.project.as_str(), options(&pack.project, flp.len() as u64)).map_err(|e| e.to_string())?;
-        w.write_all(flp).map_err(|e| e.to_string())?;
+    crate::durable_file::replace_with(zip, |file| {
+        let zip_error = |e| io::Error::other(e);
+        let mut writer = zip::ZipWriter::new(file);
+        writer.start_file(pack.project.as_str(), options(&pack.project, flp.len() as u64)).map_err(zip_error)?;
+        writer.write_all(flp)?;
         done.fetch_add(flp.len() as u64, Ordering::Relaxed);
         for ((file, name), size) in pack.files.iter().zip(&sizes) {
-            let mut r = File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
-            w.start_file(name.as_str(), options(name, *size)).map_err(|e| e.to_string())?;
-            copy(&mut r, &mut w, done).map_err(|e| format!("{}: {e}", file.display()))?;
+            let mut input = File::open(file)?;
+            writer.start_file(name.as_str(), options(name, *size)).map_err(zip_error)?;
+            copy(&mut input, &mut writer, done)?;
         }
-        w.finish().map_err(|e| e.to_string())?.flush().map_err(|e| e.to_string())?;
-        std::fs::rename(&part, zip).map_err(|e| e.to_string())
-    };
-    let r = write();
-    if r.is_err() {
-        let _ = std::fs::remove_file(&part);
-    }
-    r
+        writer.finish().map_err(zip_error)?.flush()
+    }).map_err(|e| format!("{}: {e}", zip.display()))
 }
 
 /// Export zipped project... chose `zip`: writes it on a thread of its own.
@@ -319,7 +403,7 @@ pub fn export(app: &mut App, zip: PathBuf) {
     let z = zip.clone();
     run(app, "Zipping project", &zip, move |done, total| {
         write_zip(&z, &flp, &pack, done, total)?;
-        Ok(Done::Zipped { zip: z, samples: pack.files.len(), missing: pack.missing })
+        Ok(Done::Zipped { zip: z, samples: pack.files.len(), missing: pack.missing, opaque: pack.opaque })
     });
 }
 
@@ -339,8 +423,12 @@ pub fn tick(app: &mut App) {
     let z = app.zipping.take().expect("checked");
     match result {
         Ok(Done::Unzipped(project)) => app.open(project),
-        Ok(Done::Zipped { zip, samples, missing }) => {
+        Ok(Done::Zipped { zip, samples, missing, opaque }) => {
             app.state.message = Some(format!("Exported {} with {samples} samples", zip.display()));
+            if !opaque.is_empty() {
+                let text = format!(" contains the host's known audio files. External dependencies of {} must also be collected with those plugins' own commands.", opaque.join(", "));
+                app.tell(Kind::Warning, "Plugin-managed files", spans(&[&z.name, &text]));
+            }
             if !missing.is_empty() {
                 let mut names = missing;
                 names.sort_by_key(|n| n.to_lowercase());
@@ -410,6 +498,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn refuses_case_conflicts_and_bounded_extraction() {
+        let d = temp("bounds");
+        let zip = d.join("colliding.zip");
+        make_zip(&zip, &[("Song.lemon", b"song"), ("Kick.wav", b"one"), ("kick.WAV", b"two")]);
+        let (done, total) = (AtomicU64::new(0), AtomicU64::new(0));
+        assert!(unzip(&zip, None, &done, &total).unwrap_err().contains("case-conflicting"));
+        assert!(!d.join("colliding").exists());
+        assert!(check_zip_bounds(&[(0, PathBuf::from("too-big.wav"), MAX_ZIP_FILE_BYTES + 1)]).is_err());
+        assert!(check_zip_bounds(&[
+            (0, PathBuf::from("one.wav"), MAX_ZIP_FILE_BYTES),
+            (1, PathBuf::from("two.wav"), MAX_ZIP_FILE_BYTES),
+            (2, PathBuf::from("three.wav"), 1),
+        ]).is_err());
+        assert!(check_zip_bounds(&[(0, PathBuf::from("one.wav"), 1)]).is_ok());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn decompression_rejects_member_size_mismatch() {
+        let done = AtomicU64::new(0);
+        assert!(copy_exact(&mut io::Cursor::new(b"abc"), Vec::new(), 2, &done).is_err(), "unadvertised decompression bytes");
+        assert!(copy_exact(&mut io::Cursor::new(b"a"), Vec::new(), 2, &done).is_err(), "truncated member");
+        let mut out = Vec::new();
+        copy_exact(&mut io::Cursor::new(b"abc"), &mut out, 3, &done).unwrap();
+        assert_eq!(out, b"abc");
+    }
+
     /// Two samples of one name: the second is renamed, in the zip and in its project file.
     #[test]
     fn names_in_the_zip_are_unique() {
@@ -444,10 +560,15 @@ mod tests {
         let before = app.state.project.clone();
         let zip = d.join("out").join("Song.zip");
         std::fs::create_dir_all(d.join("out")).unwrap();
+        assert!(matches!(prepare(&mut app, &zip), Err(e) if e.contains("missing sample files")), "incomplete archives must not be published as portable");
+        assert_eq!(app.state.project, before, "a rejected ZIP must not change the project");
+        app.state.project.channels[rows[3]].sample_path = None;
+        let before = app.state.project.clone();
         let (flp, pack) = prepare(&mut app, &zip).unwrap();
+        assert!(pack.missing.is_empty());
         assert_eq!(app.state.project, before, "the project is not changed");
         assert_eq!(app.state.path.as_deref(), Some(d.join("Song.flp").as_path()));
-        assert_eq!(pack.missing, vec!["Gone.wav".to_string()]);
+        assert!(pack.missing.is_empty(), "missing assets were fixed before publishing the ZIP");
         let (done, total) = (AtomicU64::new(0), AtomicU64::new(0));
         write_zip(&zip, &flp, &pack, &done, &total).unwrap();
         assert_eq!(names(&zip), vec!["Song.lemon", "Kick.wav", "Kick_2.wav"], "the project goes in as a .lemon file");

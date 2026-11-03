@@ -23,7 +23,7 @@ use vst3_sys::base::{
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::vst::{
     BusDirection, BusInfo, IAttributeList, IAudioProcessor, IComponent, IComponentHandler, IConnectionPoint, IContextMenu, IContextMenuTarget, IEditController,
-    IHostApplication, IMessage, IParamValueQueue, IParameterChanges, IoMode, MediaType, ParameterInfo, ProcessData, ProcessSetup, RoutingInfo,
+    IHostApplication, IMessage, IMidiMapping, IParamValueQueue, IParameterChanges, IoMode, MediaType, ParameterInfo, ProcessData, ProcessSetup, RoutingInfo,
     SpeakerArrangement, TChar,
 };
 use vst3_sys::{c_void, ComInterface, VstPtr, IID, VST3};
@@ -50,6 +50,12 @@ pub struct Probe {
     pub latency: AtomicU32,
     /// The controller has the extra parameter.
     pub extra: AtomicBool,
+    pub reorder: AtomicBool,
+    pub reject_controller_save: AtomicBool,
+    pub reject_controller_load: AtomicBool,
+    pub active: AtomicBool,
+    pub setup_modes: Mutex<Vec<i32>>,
+    pub process_modes: Mutex<Vec<i32>>,
     /// Gain points the processor received (offset, value), in order.
     pub gain_points: Mutex<Vec<(i32, f64)>>,
     /// The controller object, for simulating edits in its editor.
@@ -298,6 +304,7 @@ impl IComponent for Component {
     }
 
     unsafe fn set_active(&self, state: TBool) -> tresult {
+        self.probe.active.store(state != 0, Ordering::Release);
         self.probe.log(format!("comp.set_active {state}"));
         if state != 0 {
             unsafe { self.send(c"activated", i64::from(self.probe.latency.load(Ordering::Acquire))) };
@@ -345,7 +352,11 @@ impl IAudioProcessor for Component {
     }
 
     unsafe fn setup_processing(&self, setup: *const ProcessSetup) -> tresult {
+        if self.probe.active.load(Ordering::Acquire) {
+            return kResultFalse;
+        }
         let s = unsafe { &*setup };
+        self.probe.setup_modes.lock().unwrap().push(s.process_mode);
         self.probe.log(format!("comp.setup_processing {} {} {}", s.sample_rate, s.max_samples_per_block, s.symbolic_sample_size));
         kResultOk
     }
@@ -357,6 +368,10 @@ impl IAudioProcessor for Component {
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let d = unsafe { &mut *data };
+        self.probe.process_modes.lock().unwrap().push(d.process_mode);
+        if self.probe.setup_modes.lock().unwrap().last() != Some(&d.process_mode) {
+            return kResultFalse;
+        }
         if !d.context.is_null() {
             let c = unsafe { &*d.context };
             let e = (c.state, c.tempo, c.project_time_music, c.project_time_samples, c.bar_position_music, c.cycle_end_music);
@@ -442,7 +457,7 @@ impl IConnectionPoint for Component {
 
 // ---- edit controller ----
 
-#[VST3(implements(IEditController, IConnectionPoint))]
+#[VST3(implements(IEditController, IConnectionPoint, IMidiMapping))]
 pub struct Controller {
     probe: Arc<Probe>,
     handler: RefCell<Option<VstPtr<dyn IComponentHandler>>>,
@@ -549,6 +564,9 @@ impl IEditController for Controller {
     }
 
     unsafe fn set_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
+        if self.probe.reject_controller_load.load(Ordering::Acquire) {
+            return kResultFalse;
+        }
         // "MODE" + the mode value.
         let Some(s) = state.upgrade() else { return kInvalidArgument };
         let mut b = [0u8; 12];
@@ -564,6 +582,9 @@ impl IEditController for Controller {
     }
 
     unsafe fn get_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {
+        if self.probe.reject_controller_save.load(Ordering::Acquire) {
+            return kResultFalse;
+        }
         let mut b = b"MODE".to_vec();
         b.extend_from_slice(&self.values.borrow()[1].to_le_bytes());
         unsafe { write_bytes(&state, &b) }
@@ -578,6 +599,7 @@ impl IEditController for Controller {
             return kInvalidArgument;
         }
         let info = unsafe { &mut *info };
+        let index = if self.probe.reorder.load(Ordering::Acquire) && index < 2 { 1 - index } else { index };
         let (id, title, units, steps, default, flags) = match index {
             0 => (GAIN, "Gain", "dB", 0, 0.5, 1),
             1 => (MODE, "Mode", "", 2, 0.0, 1 | 8),
@@ -647,6 +669,21 @@ impl IEditController for Controller {
 
     unsafe fn create_view(&self, _name: FIDString) -> *mut c_void {
         std::ptr::null_mut()
+    }
+}
+
+impl IMidiMapping for Controller {
+    unsafe fn get_midi_controller_assignment(&self, bus: i32, channel: i16, cc: i16, id: *mut u32) -> tresult {
+        if bus != 0 || cc != 7 {
+            return kResultFalse;
+        }
+        let mapped = match channel {
+            0 => GAIN,
+            3 => MODE,
+            _ => return kResultFalse,
+        };
+        unsafe { *id = mapped };
+        kResultOk
     }
 }
 

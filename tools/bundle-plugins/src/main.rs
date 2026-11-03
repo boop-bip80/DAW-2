@@ -45,7 +45,7 @@ fn main() {
     let build = target.join("plugins");
     for (pkg, stem, name) in PLUGINS {
         let ok = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-            .args(["build", "--release", "--lib", "-p", pkg])
+            .args(["build", "--release", "--locked", "--lib", "-p", pkg])
             .current_dir(&root)
             .env("CARGO_TARGET_DIR", &build)
             .status()
@@ -60,6 +60,15 @@ fn main() {
             mac_bundle(&lib, &vst3, pkg, name);
             mac_bundle(&lib, &clap, pkg, name);
         } else {
+            // Staging must not inherit old architectures or stale modules from a prior bundle run.
+            // Both paths are generated outputs under target/bundled, never installed user copies.
+            for path in [&vst3, &clap] {
+                if path.is_dir() {
+                    std::fs::remove_dir_all(path).expect("remove old generated bundle");
+                } else if path.exists() {
+                    std::fs::remove_file(path).expect("remove old generated module");
+                }
+            }
             let arch = vst3.join("Contents").join(BUNDLE_ARCH);
             std::fs::create_dir_all(&arch).expect("vst3 bundle");
             std::fs::copy(&lib, arch.join(bundle_module(name))).expect("copy vst3");

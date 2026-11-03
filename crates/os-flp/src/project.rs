@@ -206,6 +206,8 @@ const PATTERN_COLOR_DEFAULT: u32 = 0x002D_2C29;
 /// Errors from [`load`] / [`apply`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProjectError {
+    #[error(transparent)]
+    Native(#[from] crate::lemon::Error),
     #[error("file has no FLdt event chunk")]
     NoEvents,
     #[error("file has no FLhd header")]
@@ -774,6 +776,7 @@ fn clip_len(events: &[Event], version: Option<usize>) -> usize {
 
 /// Reads the typed project from a parsed file.
 pub fn load(file: &FlpFile) -> Result<Project, ProjectError> {
+    crate::lemon::validate_version(file)?;
     let events = events_of(file)?;
     // A file of an older generation is read as its conversion to the current layout (spec: flp/layouts.md); [`apply`]
     // needs the converted file itself ([`upgrade`]).
@@ -1873,6 +1876,13 @@ const MX_STEREO: u8 = 0xC2;
 const MX_EQ_GAIN: u8 = 0xD0;
 const MX_EQ_FREQ: u8 = 0xD8;
 const MX_EQ_WIDTH: u8 = 0xE0;
+
+/// All three EQ bands in the parameter block's order: gains, frequencies, then widths.
+fn eq_records(m: &MixerTrack) -> impl Iterator<Item = (u8, i32)> + '_ {
+    [MX_EQ_GAIN, MX_EQ_FREQ, MX_EQ_WIDTH].into_iter().enumerate().flat_map(move |(field, first)| {
+        m.eq.iter().enumerate().map(move |(band, values)| (first + band as u8, values[field]))
+    })
+}
 
 /// Per mixer track, the plugin-state event (213) of each slot 0-9 that holds a plugin (spec: flp/events/mixer.md
 /// "Slot sub-block": a slot's plugin events come before its 98 marker). Track ranges as in `load_mixer`.
@@ -3544,6 +3554,15 @@ pub fn apply(project: &Project, file: &mut FlpFile) -> Result<(), ProjectError> 
                 *data = recs.concat();
             }
         }
+        if m.eq != old.eq {
+            let data = params.as_mut().ok_or_else(|| ProjectError::Structure("mixer has no parameter records for the edited EQ".into()))?;
+            let loc = mixer_location(record_track(m.index, project.mixer.len()), 0);
+            for ((pid, new), (_, prev)) in eq_records(m).zip(eq_records(old)) {
+                if new != prev {
+                    set_param_record(data, loc, pid, new);
+                }
+            }
+        }
         if let Some(data) = params.as_mut() {
             for (pid, new, prev, scale) in [
                 (MX_VOLUME, m.volume, old.volume, 16000.0),
@@ -4175,21 +4194,11 @@ fn arrangement_events(arr: &Arrangement, enc: TextEnc, clen: usize) -> Vec<Event
     ev
 }
 
-/// Track parameter records of a default track, in file order (spec: flp/events/mixer.md "Event 225"; the EQ-like IDs
-/// keep the values every untouched track has).
-const TRACK_PARAM_DEFAULTS: [(u8, i32); 12] = [
+/// Main track parameter defaults, before the EQ records (spec: flp/events/mixer.md "Event 225").
+const TRACK_PARAM_DEFAULTS: [(u8, i32); 3] = [
     (MX_VOLUME, 12800),
     (MX_PAN, 0),
     (MX_STEREO, 0),
-    (0xD0, 0),
-    (0xD1, 0),
-    (0xD2, 0),
-    (0xD8, 5777),
-    (0xD9, 33145),
-    (0xDA, 55825),
-    (0xE0, 17500),
-    (0xE1, 17500),
-    (0xE2, 17500),
 ];
 /// The record at location 0x4000 and the parameter block of "track 501" that every file has (spec: mixer.md).
 const MX_SPECIAL_LOC: u16 = 0x4000;
@@ -4225,6 +4234,9 @@ fn track_records(t: u16, m: Option<&MixerTrack>) -> Vec<u8> {
             MX_STEREO => m.stereo_separation.map_or(v, |x| (x * 64.0).round() as i32),
             _ => v,
         };
+        out.extend(param_rec(pid, MX_KIND_PARAM, mixer_location(t, 0), v));
+    }
+    for (pid, v) in eq_records(m) {
         out.extend(param_rec(pid, MX_KIND_PARAM, mixer_location(t, 0), v));
     }
     let mut levels = m.send_levels.clone();
@@ -4335,7 +4347,6 @@ fn mixer_is_default(mixer: &[MixerTrack]) -> bool {
     mixer.iter().enumerate().all(|(n, t)| {
         // The last stored track is routed nowhere in FL's files.
         let hidden = n + 1 == mixer.len() && n > 0 && t.routes.is_empty();
-        hidden ||
         t.name.is_none()
             && t.color.is_none()
             && t.enabled
@@ -4349,7 +4360,8 @@ fn mixer_is_default(mixer: &[MixerTrack]) -> bool {
             && t.volume.is_none_or(|v| (v - 0.8).abs() < 1e-9)
             && t.pan.is_none_or(|v| v == 0.0)
             && t.stereo_separation.is_none_or(|v| v == 0.0)
-            && t.routes == if t.index == 0 { Vec::<u16>::new() } else { vec![0] }
+            && t.eq == os_model::EQ_DEFAULT
+            && (hidden || t.routes == if t.index == 0 { Vec::<u16>::new() } else { vec![0] })
             && t.latency_out == 0.0
             && t.latency_in == 0.0
     })
@@ -5776,6 +5788,7 @@ mod tests {
         m.color = Some(Rgb::new(1, 2, 3));
         m.volume = Some(0.5);
         m.pan = Some(-0.25);
+        m.eq = [[900, 6000, 18000], [-600, 32000, 22000], [300, 54000, 14000]];
         m.routes = vec![0, 5];
         m.send_levels = vec![(5, 0.5)];
         m.slots[0] = Some(SlotPlugin { id: os_model::Id::NONE, name: "Fruity Parametric EQ 2".into(), state: vec![1, 2, 3] });
@@ -5783,7 +5796,10 @@ mod tests {
         m.slot_on[3] = false;
         m.slot_mix[3] = 0.5;
         p.mixer[0].enabled = false;
-        let mut file = FlpFile::parse(&create(&p).unwrap().to_bytes().unwrap()).unwrap();
+        p.mixer[17].eq = [[-200, 7000, 12000], [500, 35000, 23000], [-900, 51000, 30000]];
+        let mut native = create(&p).unwrap();
+        crate::lemon::to_lemon(&mut native, &[crate::lemon::saved_by("EQ persistence regression")]).unwrap();
+        let mut file = FlpFile::parse(&native.to_bytes().unwrap()).unwrap();
         let back = load(&file).unwrap();
         assert_eq!(back.mixer, p.mixer);
         assert!(unsaved_parts(&p, &file).is_empty());
@@ -5797,7 +5813,11 @@ mod tests {
         edited.mixer[2].slots.swap(0, 9);
         edited.mixer[4].slots[1] = Some(SlotPlugin { id: os_model::Id::NONE, name: "Fruity Limiter".into(), state: vec![] });
         edited.mixer[2].slot_mix[9] = 0.75;
+        edited.mixer[2].eq = [[-1000, 9000, 15000], [400, 37000, 25000], [700, 59000, 21000]];
+        edited.mixer[17].eq = [[600, 4000, 19000], [-300, 29000, 9000], [1100, 53000, 27000]];
         apply(&edited, &mut file).unwrap();
+        let file = FlpFile::parse(&file.to_bytes().unwrap()).unwrap();
+        assert!(crate::lemon::is_lemon(&file));
         assert_eq!(load(&file).unwrap().mixer, edited.mixer);
     }
 
@@ -5899,6 +5919,10 @@ mod tests {
         p.mixer = (0..18).map(MixerTrack::new).collect();
         p.mixer[17].routes.clear();
         let fx = |name: &str, state: u8| Some(SlotPlugin { id: os_model::Id::NONE, name: name.into(), state: vec![state; 4] });
+        for (i, m) in p.mixer.iter_mut().enumerate() {
+            let i = i as i32;
+            m.eq = [[i * 10, 5000 + i * 100, 10000 + i * 100], [-i * 20, 30000 + i * 100, 20000 + i * 100], [i * 30, 50000 + i * 100, 30000 + i * 100]];
+        }
         p.mixer[3].slots[0] = fx("Fruity Limiter", 3);
         p.mixer[4].slots[0] = fx("Fruity Limiter", 4);
         p.mixer[5].slots[2] = fx("Fruity Delay 3", 5);
@@ -6056,6 +6080,15 @@ mod tests {
         assert!(unsaved_parts(&p, &file).is_empty(), "default mixer: nothing is lost");
         p.mixer[1].volume = Some(0.5);
         assert_eq!(unsaved_parts(&p, &file), vec!["mixer settings"]);
+        p.mixer[1].volume = Some(0.8);
+        for t in 0..p.mixer.len() {
+            if t + 1 == p.mixer.len() {
+                p.mixer[t].routes.clear();
+            }
+            p.mixer[t].eq[1][0] = 600;
+            assert_eq!(unsaved_parts(&p, &file), vec!["mixer settings"], "an EQ edit on track {t} must not be silently lost");
+            p.mixer[t].eq = os_model::EQ_DEFAULT;
+        }
     }
 
     /// The mixer is stored after the playlist: a project with an arrangement keeps its mixer through `create` (a

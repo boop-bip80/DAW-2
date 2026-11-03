@@ -75,6 +75,9 @@ impl<P: Plugin> Instrument for Guarded<P> {
     fn note_off(&mut self, offset: u32, key: u8) {
         self.run((), |p| p.note_off(offset, key))
     }
+    fn note_end(&mut self, offset: u32, key: u8, channel: u8) {
+        self.run((), |p| p.note_end(offset, key, channel))
+    }
     fn note_on_from(&mut self, offset: u32, key: u8, velocity: f32, start: f32) {
         self.run((), |p| p.note_on_from(offset, key, velocity, start))
     }
@@ -254,6 +257,15 @@ impl<P: Plugin> Plugin for Guarded<P> {
     }
     fn param_count(&self) -> usize {
         self.look(0, |p| p.param_count())
+    }
+    fn parameter_ids(&self) -> Vec<u32> {
+        self.look(Vec::new(), |p| p.parameter_ids())
+    }
+    fn restore_parameter_ids(&mut self, ids: &[u32]) -> bool {
+        self.run(false, |p| p.restore_parameter_ids(ids))
+    }
+    fn param_revision(&self) -> u64 {
+        self.look(0, |p| p.param_revision())
     }
     fn param_info(&self, index: usize) -> Option<ParamInfo> {
         self.look(None, |p| p.param_info(index))

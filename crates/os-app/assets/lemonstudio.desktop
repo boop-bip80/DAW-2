@@ -7,5 +7,6 @@ Exec=lemonstudio %f
 Icon=lemonstudio
 Terminal=false
 Categories=AudioVideo;Audio;Midi;Music;
+MimeType=application/x-lemonstudio-project;application/x-flstudio-project;
 StartupWMClass=lemonstudio
 Keywords=DAW;music;audio;sequencer;

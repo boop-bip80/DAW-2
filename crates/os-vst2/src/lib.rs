@@ -391,7 +391,7 @@ impl Note {
         match self.kind {
             NoteKind::On => [0x90 | self.ch & 15, self.key, self.value],
             NoteKind::Off => [0x80 | self.ch & 15, self.key, self.value],
-            NoteKind::Control => [0xB0, self.key, self.value],
+            NoteKind::Control => [0xB0 | self.ch & 15, self.key, self.value],
             NoteKind::Raw(status) => [status, self.key, self.value],
         }
     }
@@ -1097,6 +1097,9 @@ impl os_engine::Instrument for Plugin {
         let key = key.min(127);
         self.queue(Note { time: offset, kind: NoteKind::Off, key, value: 64, ch: self.key_ch[usize::from(key)] });
     }
+    fn note_end(&mut self, offset: u32, key: u8, channel: u8) {
+        self.queue(Note { time: offset, kind: NoteKind::Off, key: key.min(127), value: 64, ch: channel & 15 });
+    }
 
     /// A glide step as pitch bend (`TuningBend`).
     fn tune(&mut self, offset: u32, key: u8, semitones: f32) {
@@ -1116,7 +1119,7 @@ impl os_engine::Instrument for Plugin {
     fn midi(&mut self, offset: u32, bytes: [u8; 3]) {
         let (key, value) = (bytes[1] & 0x7F, bytes[2] & 0x7F);
         let kind = if bytes[0] & 0xF0 == 0xB0 { NoteKind::Control } else { NoteKind::Raw(bytes[0]) };
-        self.queue(Note { time: offset, kind, key, value, ch: 0 });
+        self.queue(Note { time: offset, kind, key, value, ch: bytes[0] & 15 });
     }
 
     fn transport(&mut self, info: &os_engine::TransportInfo) {

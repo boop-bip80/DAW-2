@@ -299,7 +299,7 @@ impl Engine {
     /// are worked out with the delays as they are now (spec: "Lemon Studio").
     pub(super) fn first_plan(&mut self) {
         for t in 0..self.tracks.len() {
-            self.params.deliver_slots(t, &self.tracks[t].effects);
+            self.params.deliver_slots(t, &self.tracks[t].effects, self.exporting);
         }
         self.pdc.delivered = true;
         self.read_delays();

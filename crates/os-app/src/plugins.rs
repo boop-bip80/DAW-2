@@ -31,11 +31,22 @@ pub struct Available {
     pub desc: Descriptor,
 }
 
+/// Host-owned identity and automation positions. Native project metadata stores this separately from the plugin's
+/// opaque state so third-party state formats remain interoperable with other hosts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginIdentity {
+    pub uid: String,
+    pub parameters: Vec<u32>,
+}
+
 pub struct Hosted {
     pub plugin: SharedPlugin,
     /// The channel or slot plugin it plays (`os_model::Id`): the control plane keeps it with them when rows or slots
     /// move under it (`App::follow_ids`). `Id::NONE` until the next tick takes the id of what is under its key.
     pub owner: os_model::Id,
+    pub identity: PluginIdentity,
+    identity_revision: u64,
+    pub identity_restored: bool,
     /// Processing time and voices, read without locking the instance (spec: ui/plugin-performance.md §3,
     /// audio/voices.md §5).
     pub meter: Option<Arc<os_host::Meter>>,
@@ -149,10 +160,15 @@ pub fn lock_between_blocks<'a, T: ?Sized>(m: &'a std::sync::Mutex<T>, meter: Opt
 impl Hosted {
     /// A newly hosted instance, without a window.
     pub fn new(plugin: SharedPlugin) -> Hosted {
-        let (meter, attention, name) = plugin.lock().map(|p| (p.meter(), p.attention(), p.desc().name.clone())).unwrap_or_default();
+        let (meter, attention, name, identity, identity_revision) = plugin.lock().map(|p| {
+            (p.meter(), p.attention(), p.desc().name.clone(), PluginIdentity { uid: p.desc().uid(), parameters: p.parameter_ids() }, p.param_revision())
+        }).unwrap_or_default();
         Hosted {
             plugin,
             owner: os_model::Id::NONE,
+            identity,
+            identity_revision,
+            identity_restored: false,
             meter,
             name,
             #[cfg(plugin_windows)]
@@ -308,6 +324,9 @@ pub struct Plugins {
     pub effects: Vec<Available>,
     /// By rack row, or by `fx_key` for mixer slots.
     pub hosted: BTreeMap<usize, Hosted>,
+    /// The native file's identities by runtime owner. Missing plugins retain this metadata through saves and moves.
+    pub saved_identities: BTreeMap<u32, PluginIdentity>,
+    pub identity_error: Option<String>,
     /// Main window handle (owner of plugin windows).
     pub owner: isize,
     pub scale: f32,
@@ -570,6 +589,24 @@ impl Plugins {
         Ok(name)
     }
 
+    /// Applies the native file's parameter order once this instance has an owner, before it is exposed to playback.
+    pub fn restore_identity(&mut self, key: usize, owner: u32) -> Result<(), String> {
+        let Some(h) = self.hosted.get_mut(&key) else { return Ok(()) };
+        if h.identity_restored {
+            return Ok(());
+        }
+        if let Some(saved) = self.saved_identities.get(&owner).filter(|saved| saved.uid == h.identity.uid) {
+            let mut p = h.plugin.lock().map_err(|_| format!("{} could not restore its automation mapping", h.name))?;
+            if !p.restore_parameter_ids(&saved.parameters) {
+                return Err(format!("{} rejected its saved automation mapping", h.name));
+            }
+            h.identity.parameters = p.parameter_ids();
+            h.identity_revision = p.param_revision();
+        }
+        h.identity_restored = true;
+        Ok(())
+    }
+
     /// An instance of instrument `index` (of `available`) started from `state`, activated at the device rate, not
     /// hosted under any key (`create_with` hosts it; a channel's container's member, `crate::container`).
     pub fn instantiate(&mut self, index: usize, state: Option<&[u8]>) -> Result<(SharedPlugin, String), String> {
@@ -578,8 +615,13 @@ impl Plugins {
         let plugin = a.lib.clone().create(&a.desc.id)?;
         let mut p = plugin.lock().map_err(|_| "plugin busy")?;
         if let Some(st) = state {
+            let resolved;
+            let st = if crate::project_plugins::is_builtin(&a.desc) {
+                resolved = crate::assets::for_host(&a.desc.name, st)?;
+                resolved.as_slice()
+            } else { st };
             if !p.load_state(st) {
-                eprintln!("[plugins] {} did not take its starting state", a.desc.name);
+                return Err(format!("{} rejected its saved state; the original state has been kept", a.desc.name));
             }
         }
         if self.rate == 0 {
@@ -616,8 +658,8 @@ impl Plugins {
 
     /// Creates effect `index` (of `effects`) in mixer track `track`'s slot `slot`, replacing what was there.
     pub fn create_effect(&mut self, track: u16, slot: u8, index: usize, state: Option<&[u8]>) -> Result<String, String> {
-        self.drop_key(fx_key(track, slot));
         let (plugin, name) = self.instantiate_effect(index, state)?;
+        self.drop_key(fx_key(track, slot));
         self.hosted.insert(fx_key(track, slot), Hosted::new(plugin));
         Ok(name)
     }
@@ -630,7 +672,14 @@ impl Plugins {
         let plugin = a.lib.clone().create(&a.desc.id)?;
         let mut p = plugin.lock().map_err(|_| "plugin busy")?;
         if let Some(st) = state {
-            p.load_state(st);
+            let resolved;
+            let st = if crate::project_plugins::is_builtin(&a.desc) {
+                resolved = crate::assets::for_host(&a.desc.name, st)?;
+                resolved.as_slice()
+            } else { st };
+            if !p.load_state(st) {
+                return Err(format!("{} rejected its saved state; the original state has been kept", a.desc.name));
+            }
         }
         if self.rate == 0 {
             self.rate = crate::transport::Transport::device_rate().unwrap_or(48000);
@@ -908,6 +957,44 @@ impl Plugins {
         fl_from_recreation_state(lemon, &p.save_state()?)
     }
 
+    /// A required recreation snapshot for a save. `Ok(None)` means another plugin is hosted, or an untouched
+    /// Love Philter/Maximus recreation deliberately keeps the file's original bytes; capture/conversion failures
+    /// are errors and must not be mistaken for that case. Instrument recreations use the same checked boundary.
+    pub fn capture_recreation_state(&self, key: usize, file: &str) -> Result<Option<Vec<u8>>, String> {
+        let expected = match file {
+            EQ_FILE_NAME => Some(LEMON_EQ),
+            EDISON_FILE_NAME => Some(TESLA),
+            LOVE_PHILTER_FILE_NAME => Some(PULP_FILTER),
+            MAXIMUS_FILE_NAME => Some(PRESS),
+            crate::osc3::FILE_NAME => Some(crate::osc3::LEMON_TRIO),
+            crate::citrus::FILE_NAME => Some(crate::citrus::CITRUS),
+            f if crate::slicer::is_file_name(f) => Some(crate::slicer::LEMON_SLICER),
+            f if crate::drums::is_file_name(f) => Some(crate::drums::LEMON_DRUMS),
+            f => recreation_of(f),
+        };
+        let (Some(expected), Some(h)) = (expected, self.hosted.get(&key)) else { return Ok(None) };
+        let p = h.lock_for_state().ok_or_else(|| format!("{expected} could not be locked to save its state"))?;
+        if p.desc().name != expected || !crate::project_plugins::is_builtin(p.desc()) {
+            return Ok(None);
+        }
+        let state = p.save_state().ok_or_else(|| format!("{expected} could not save its state"))?;
+        let converted = match expected {
+            LEMON_EQ => lemon_parametric_eq_2::params::fl_from_plugin_state(&state),
+            TESLA => tesla::edison_from_plugin_state(&state),
+            PULP_FILTER => pulp_filter::fl_from_plugin_state(&state),
+            PRESS => press::fl_from_plugin_state(&state),
+            crate::osc3::LEMON_TRIO => lemon_3x_osc::params::fl_from_plugin_state(&state),
+            crate::citrus::CITRUS => citrus::fl_from_plugin_state(&state),
+            crate::slicer::LEMON_SLICER => lemon_slicer::params::fl_from_plugin_state(&state),
+            crate::drums::LEMON_DRUMS => lemon_drum_sampler::params::fl_from_plugin_state(&state),
+            name => fl_from_recreation_state(name, &state),
+        }.ok_or_else(|| format!("{expected} returned an invalid state; the original state has been kept"))?;
+        if matches!(expected, PULP_FILTER | PRESS) && converted.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(converted))
+    }
+
     /// Row `row`'s Lemon Sampler takes the stretch settings `sound` holds (§9b), keeping its other settings.
     pub fn set_sampler_stretch(&mut self, row: usize, sound: &os_model::ChannelSound) -> bool {
         self.set_sampler(row, None, &stretch_params(sound))
@@ -985,6 +1072,8 @@ impl Plugins {
             self.close_window(row);
         }
         self.hosted.clear();
+        self.saved_identities.clear();
+        self.identity_error = None;
         self.containers.clear();
         self.presets.clear();
         self.stash.clear();
@@ -1327,6 +1416,10 @@ impl Plugins {
                     close.push(row);
                 }
                 p.idle();
+                if p.stopped().is_none() && h.identity_revision != p.param_revision() {
+                    h.identity.parameters = p.parameter_ids();
+                    h.identity_revision = p.param_revision();
+                }
                 // A menu the plugin asked to pop up over its editor: at its point on the screen, or closed at once
                 // without a window to show it over (spec: plugins/vst3-hosting.md §9).
                 if let Some(m) = p.take_menu() {
@@ -1756,7 +1849,7 @@ pub fn sampler_state(ch: &os_model::Channel) -> Vec<u8> {
 /// happen (`params_tick`).
 pub fn store_sampler(ch: &mut os_model::Channel, state: &[u8]) {
     use lemon_sampler::params as sp;
-    let json = state.get(8..).filter(|_| state.len() > 8 && state[0] != b'{').unwrap_or(state);
+    let (json, _) = crate::assets::persisted_json(state);
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(json) else { return };
     let Some(params) = v.get("params").and_then(|p| p.as_object()) else { return };
     let f = |id: &str| params.get(id)?.get("f32")?.as_f64().map(|x| x as f32);
@@ -2110,8 +2203,7 @@ pub fn stretch_param(name: &str, norm: f64, stretch: &mut [u32; 4]) -> bool {
 
 /// `blob` (a Lemon Sampler state) with parameters set to the given JSON values.
 pub(crate) fn with_params(blob: &[u8], set: &[(&str, serde_json::Value)]) -> Option<Vec<u8>> {
-    let prefixed = blob.len() > 8 && blob[0] != b'{';
-    let json = if prefixed { &blob[8..] } else { blob };
+    let (json, prefixed) = crate::assets::persisted_json(blob);
     let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let params = v.get_mut("params")?.as_object_mut()?;
     for (k, val) in set {
@@ -2124,8 +2216,7 @@ pub(crate) fn with_params(blob: &[u8], set: &[(&str, serde_json::Value)]) -> Opt
 }
 
 pub(crate) fn with_sample_path(blob: &[u8], path: &str) -> Option<Vec<u8>> {
-    let prefixed = blob.len() > 8 && blob[0] != b'{';
-    let json = if prefixed { &blob[8..] } else { blob };
+    let (json, prefixed) = crate::assets::persisted_json(blob);
     let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let inner = serde_json::to_string(path).ok()?;
     v.get_mut("fields")?.as_object_mut()?.insert("sample-path".into(), serde_json::Value::String(inner));
@@ -2189,7 +2280,7 @@ fn post_drop(x: i32, y: i32, path: &str, frame: isize) -> bool {
 
 /// The `sample-path` field of a Lemon Sampler (or Lemon Trio) state blob.
 pub(crate) fn sample_path_of(blob: &[u8]) -> Option<String> {
-    let json = blob.get(8..).filter(|_| blob.len() > 8 && blob[0] != b'{').unwrap_or(blob);
+    let (json, _) = crate::assets::persisted_json(blob);
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let field = v.get("fields")?.get("sample-path")?.as_str()?;
     serde_json::from_str::<String>(field).ok()
@@ -3991,6 +4082,56 @@ mod tests {
         pl.idle(|_| None);
         assert_eq!(*gone.lock().unwrap(), Some(std::thread::current().id()));
         assert_eq!(retired_count(), 0);
+    }
+
+    /// A protocol mock that genuinely refuses state, unlike a temporary busy instance.
+    struct RefusingLibrary(Vec<Descriptor>);
+    impl Library for RefusingLibrary {
+        fn path(&self) -> &Path { &self.0[0].path }
+        fn plugins(&self) -> &[Descriptor] { &self.0 }
+        fn create(self: Arc<Self>, _: &str) -> Result<SharedPlugin, String> {
+            Ok(Arc::new(Mutex::new(Tracked(self.0[0].clone(), Arc::new(Mutex::new(None))))))
+        }
+    }
+
+    #[test]
+    fn rejected_restore_preserves_the_existing_instance_and_model_bytes() {
+        let mut descriptor = builtin_effects()[0].desc.clone();
+        descriptor.path = PathBuf::from("/test/refusing.clap");
+        let lib = Arc::new(RefusingLibrary(vec![descriptor.clone()]));
+        let available = Available { lib, desc: descriptor };
+        let mut plugins = Plugins { available: vec![available.clone()], effects: vec![available], ..Default::default() };
+        let old = builtin_effects()[0].lib.clone().create(&builtin_effects()[0].desc.id).unwrap();
+        let key = fx_key(0, 0);
+        plugins.hosted.insert(key, Hosted::new(old.clone()));
+        let original = vec![1, 7, 9, 255];
+        assert!(plugins.create_with(0, 0, Some(&original)).is_err());
+        assert!(!plugins.hosted.contains_key(&0));
+        assert!(plugins.create_effect(0, 0, 0, Some(&original)).is_err());
+        assert!(Arc::ptr_eq(&plugins.hosted[&key].plugin, &old));
+        assert_eq!(original, [1, 7, 9, 255]);
+    }
+
+    #[test]
+    fn failed_plugin_snapshot_does_not_partially_replace_project_state() {
+        let mut project = crate::app::test_project();
+        for (row, channel) in project.channels.iter_mut().take(2).enumerate() {
+            channel.kind = os_model::ChannelKind::Plugin;
+            channel.plugin = Some(os_flp::wrapper::WRAPPER.into());
+            channel.plugin_state = Some(vec![row as u8, 19, 37]);
+        }
+        let before: Vec<_> = project.channels.iter().map(|c| c.plugin_state.clone()).collect();
+        let mut plugins = Plugins::default();
+        let good = builtin()[0].lib.clone().create(&builtin()[0].desc.id).unwrap();
+        plugins.hosted.insert(0, Hosted::new(good));
+        let mut desc = builtin()[0].desc.clone();
+        desc.path = PathBuf::from("/test/refusing.clap");
+        plugins.hosted.insert(1, Hosted::new(Arc::new(Mutex::new(Tracked(desc, Arc::new(Mutex::new(None)))))));
+        crate::project_plugins::WRAP_BUILTINS.with(|wrap| wrap.set(true));
+        let result = crate::project_plugins::store_hosted(&mut project, &plugins);
+        crate::project_plugins::WRAP_BUILTINS.with(|wrap| wrap.set(false));
+        assert!(result.is_err());
+        assert_eq!(project.channels.iter().map(|c| c.plugin_state.clone()).collect::<Vec<_>>(), before);
     }
     /// An effect whose processing faults once `FAULT` is set, as one with a bad pointer does.
     struct Faulty(os_host::Descriptor, Arc<std::sync::atomic::AtomicBool>);

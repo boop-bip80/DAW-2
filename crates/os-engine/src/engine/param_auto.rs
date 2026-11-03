@@ -130,7 +130,7 @@ impl ParamAuto {
     }
 
     /// Hands mixer track `t`'s slot events of this block to their hosted effects (before the track is processed).
-    pub fn deliver_slots(&mut self, t: usize, effects: &[FxSlot]) {
+    pub fn deliver_slots(&mut self, t: usize, effects: &[FxSlot], offline: bool) {
         if self.events.is_empty() && self.ticks.is_empty() {
             return;
         }
@@ -140,8 +140,9 @@ impl ParamAuto {
             if !self.events.iter().chain(&self.ticks).any(|e| e.dest == dest) {
                 continue;
             }
-            // A busy instance misses these values: they are sent again at the next step.
-            let Ok(mut h) = h.try_lock() else {
+            // Offline rendering must deliver one-shot points exactly once before processing. Live rendering
+            // retains the nonblocking policy; the hardware callback never waits on an editor lock here.
+            let Some(mut h) = (if offline { h.lock().ok() } else { h.try_lock().ok() }) else {
                 let mine = |tg: &Target| matches!(*tg, Target::SlotParam(a, b, _) if usize::from(a) == t && usize::from(b) == fx.slot);
                 self.last.retain(|(tg, _)| !mine(tg));
                 self.last_tick.retain(|(tg, _)| !mine(tg));

@@ -312,6 +312,10 @@ impl Instrument for Chain {
         self.instruments(|i| i.note_off(offset, key));
     }
 
+    fn note_end(&mut self, offset: u32, key: u8, channel: u8) {
+        self.instruments(|i| i.note_end(offset, key, channel));
+    }
+
     fn note_on_from(&mut self, offset: u32, key: u8, velocity: f32, start: f32) {
         self.instruments(|i| i.note_on_from(offset, key, velocity, start));
     }

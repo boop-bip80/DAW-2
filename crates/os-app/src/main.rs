@@ -14,6 +14,7 @@
 
 mod app;
 mod arrange;
+mod assets;
 mod audio_clipboard;
 mod help_links;
 mod diagnostics;
@@ -42,6 +43,7 @@ mod cpu;
 mod data_folder;
 mod device;
 mod dialog;
+mod durable_file;
 mod floating;
 mod filedlg;
 mod enable_groups;
@@ -1843,10 +1845,25 @@ fn attach_console() {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     #[cfg(windows)]
     attach_console();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Recovery needs no window, audio device or plugin loading, including after a native-plugin crash.
+    if args.first().map(String::as_str) == Some("--recover-recording") {
+        if args.len() != 2 {
+            eprintln!("Usage: lemonstudio --recover-recording <take.wav.part>");
+            return std::process::ExitCode::from(2);
+        }
+        match capture::recover_take(std::path::Path::new(&args[1])) {
+            Ok((path, frames)) => println!("Recovered {frames} frames to {}", path.display()),
+            Err(e) => {
+                eprintln!("Recording recovery failed: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
     // A plugin scanner process (spec: ui/plugin-manager.md §4): loads one file, prints its plugins, ends.
     if args.first().map(String::as_str) == Some(plugin_scan::ARG) {
         plugin_scan::child_main(&args[1..]);
@@ -1863,24 +1880,36 @@ fn main() {
     // Plugin editors in real plugin windows, checked from the main thread (`plugins::window_check`).
     #[cfg(target_os = "macos")]
     if args.first().map(String::as_str) == Some("--plugin-window-check") {
-        std::process::exit(plugins::window_check::run(&args[1..]));
+        let status = plugins::window_check::run(&args[1..]);
+        plugins::sweep_retired();
+        return std::process::ExitCode::from(status as u8);
     }
     app::move_old_settings();
     // The mixing threads every engine renders on, from here on (spec: audio/multicore.md).
     mix_threads::start();
     // A render without a window (FILE > Export audio from the command line, `render`).
     if args.first().map(String::as_str) == Some("--render") {
-        std::process::exit(render::cli(&args[1..]));
+        let status = render::cli(&args[1..]);
+        // Hosted::drop retires plugin instances into thread-local storage.
+        // Like GUI shutdown, destroy eligible instances on this main thread
+        // before the runtime begins thread-local/Windows loader teardown.
+        plugins::sweep_retired();
+        return std::process::ExitCode::from(status as u8);
     }
     if args.iter().any(|a| a == "--screenshot") {
         screenshot(&args);
-        return;
+        // The screenshot's App can retire hosted plugins while unwinding.
+        plugins::sweep_retired();
+        return std::process::ExitCode::SUCCESS;
     }
     // The control plane's socket (spec: roadmap/control-plane.md): beside the window, or without one.
-    let control = control::server::Flags::take(&mut args).unwrap_or_else(|e| {
-        eprintln!("Lemon Studio: {e}");
-        std::process::exit(2);
-    });
+    let control = match control::server::Flags::take(&mut args) {
+        Ok(flags) => flags,
+        Err(e) => {
+            eprintln!("Lemon Studio: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
     let level = control.level.unwrap_or(control::Level::Edit);
     if let Some(at) = &control.serve {
         control::server::serve_headless(at, level, control.token.clone(), args.first().map(std::path::PathBuf::from));
@@ -1996,6 +2025,7 @@ fn main() {
     // The app's plugin instances are destroyed here, on this (UI) thread, as far as the engine has let go of them.
     drop(shell);
     plugins::sweep_retired();
+    std::process::ExitCode::SUCCESS
 }
 
 #[cfg(test)]

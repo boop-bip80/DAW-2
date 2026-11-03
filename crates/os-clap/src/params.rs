@@ -69,7 +69,8 @@ impl Plugin {
     /// Automation (audio thread): parameter `index` of the list to normalized `value`, `offset` frames into the next
     /// process call. A stepped parameter gets its nearest step. Unknown indexes are ignored.
     pub(crate) fn automate(&mut self, offset: u32, index: u32, value: f64) {
-        let Some(&(id, lo, hi, stepped)) = self.ranges.get(index as usize) else { return };
+        let Some(index) = self.param_order.index(index as usize) else { return };
+        let Some(&(id, lo, hi, stepped)) = self.ranges.get(index) else { return };
         if id == u32::MAX || self.auto.len() >= MAX_AUTO {
             return;
         }
@@ -113,7 +114,16 @@ impl Plugin {
     pub(crate) fn idle_params(&mut self) {
         let rescan = self.host_data.rescan.swap(0, std::sync::atomic::Ordering::AcqRel);
         if rescan & (CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_ALL) != 0 {
+            let rate = self.rate;
+            if rescan & CLAP_PARAM_RESCAN_ALL != 0 && rate != 0 {
+                self.deactivate();
+            }
             self.ranges = unsafe { read_ranges(self.params, self.plugin) };
+            self.param_order.update(&self.ranges.iter().map(|r| r.0).collect::<Vec<_>>());
+            if self.rate == 0 && rate != 0 {
+                self.activate(rate);
+            }
+            self.host_data.attention.raise();
         }
         if !self.processed && !self.auto.is_empty() {
             for (_, id, v) in self.auto.drain(..) {

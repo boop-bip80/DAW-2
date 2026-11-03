@@ -21,6 +21,12 @@ pub trait Instrument: Send {
     fn note_on(&mut self, offset: u32, key: u8, velocity: f32);
     /// Ends a note `offset` frames into the next `process` call.
     fn note_off(&mut self, offset: u32, key: u8);
+    /// Ends a live note on its original MIDI channel. Instruments without channel-aware voices retain their
+    /// ordinary key release; plugin hosts override this to preserve the incoming channel on the wire.
+    fn note_end(&mut self, offset: u32, key: u8, channel: u8) {
+        let _ = channel;
+        self.note_off(offset, key);
+    }
     /// Starts a note `start` (0..1) of the way into the instrument's sample (a trimmed audio clip; spec:
     /// plugins/lemon-sampler.md §7). Instruments without a sample start position play it from the top.
     fn note_on_from(&mut self, offset: u32, key: u8, velocity: f32, start: f32) {

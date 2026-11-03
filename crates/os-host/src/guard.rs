@@ -2,32 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
-//! Plugin crash containment.
+//! In-process plugin fault handling.
 //!
-//! Every call Lemon Studio makes into a plugin's code goes through [`call`], under a crash guard: an access violation
-//! or another fault inside the plugin comes back as `Err(code)` instead of ending the process. On Windows MSVC builds
-//! the guard is structured exception handling (`guard.c`), which also catches exceptions the plugin raises and does not
-//! handle itself. On macOS and Linux it is a signal guard (`guard_unix.c`): SIGSEGV, SIGBUS, SIGILL or SIGFPE raised
-//! by the code inside the call jumps back to the call's start, and the crash is reported under the Windows code of the
-//! same fault ([`describe`]). The plugin's [`Module`] is then marked crashed: every instance of it stops
-//! ([`crate::Guarded`]) and, on Windows, its windows no longer reach its code ([`watch_windows`]). A build without a C
-//! compiler makes the calls directly and contains nothing ([`contained`]).
+//! Windows MSVC builds use structured exception handling (`guard.c`) for supported faults. A contained fault marks
+//! the plugin's [`Module`] stopped, so it is not called or unloaded again. This is a limited mitigation, not process
+//! isolation: heap corruption, aborts and failures on threads a plugin starts can still end the host.
 //!
-//! What cannot be contained: errors the system ends a process for at once (heap corruption, stack buffer overruns, a
-//! stack overflow on Windows, `abort`), a C++ exception that escapes a plugin on macOS or Linux, and crashes on threads
-//! a plugin started itself. A plugin that installs its own handler for those signals turns the unix guard off for the
-//! faults that handler does not hand on.
-//!
-//! Soundness on macOS and Linux. The signal guard does not unwind: it jumps over every frame between [`catch`] and the
-//! fault, and Rust only allows that over frames with no destructor left to run. The guard is around whole methods of
-//! the format crates (a format's `process`, say), not around each foreign call inside them, so the jump can also cross
-//! those crates' own frames. Then what they own leaks (buffers, COM references; the stopped instance itself is never
-//! destroyed anyway), a lock one of them holds stays locked, a `RefCell` borrow stays borrowed, and a value meant to
-//! restore some state when dropped does not ([`after_crash`] covers the thread-local ones). The format crates hold
-//! their locks only around their own code, never across a call into the plugin, and the instance's own lock is taken
-//! outside the guard (a [`crate::Guarded`] is locked, then guards its calls). The risky cases left: a fault in the
-//! host's own code while a plugin called back into it, and a fault inside the C library (in `malloc`, say), whose
-//! internal lock then stays taken. Putting the guard around each foreign call instead would remove the first.
+//! Unix calls run directly. Recovering from SIGSEGV/SIGBUS with siglongjmp across format methods and host callbacks
+//! skips live Rust destructors and is unsound; the host must not continue in that damaged process. A native fault
+//! therefore ends the process, and recovery means restarting from a saved/recovery project. Likewise, a timeout
+//! cannot safely cancel a plugin already executing in this process. Process isolation would be required for that.
 //
 // spec: plugins/plugin-formats.md ("Crash containment")
 
@@ -66,8 +50,6 @@ impl Module {
 static MODULES: Mutex<Vec<Arc<Module>>> = Mutex::new(Vec::new());
 /// A plugin crashed in this process and the crash was contained.
 static TRIPPED: AtomicBool = AtomicBool::new(false);
-/// What [`after_crash`] registered.
-static AFTER_CRASH: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
 
 /// The exception code of an error raised by the Object Pascal runtime native plugins are built in, which the plugin
 /// did not handle (spec: plugins/fruity-abi.md, "Crash containment").
@@ -78,7 +60,7 @@ thread_local! {
     static LAST_MESSAGE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-/// What a contained exception was (the layout `guard.c` and `guard_unix.c` fill).
+/// What a contained exception was (the layout `guard.c` fills).
 #[cfg(plugin_guard)]
 #[repr(C)]
 struct Fault {
@@ -135,24 +117,16 @@ pub fn call<R, F: FnOnce() -> R>(module: &Module, f: F) -> Result<R, u32> {
 pub fn catch<R, F: FnOnce() -> R>(f: F) -> Result<R, u32> {
     #[cfg(plugin_guard)]
     {
-        let mut slot = Slot::<R, F> { f: Some(f), r: None, #[cfg(unix)] panic: None };
+        let mut slot = Slot::<R, F> { f: Some(f), r: None };
         let mut fault = Fault { code: 0, message: [0; 256] };
         // SAFETY: the trampoline gets the slot it was instantiated for, alive for the whole call.
         let done = unsafe { os_host_guarded_call(trampoline::<R, F>, (&raw mut slot).cast(), &mut fault) } != 0;
-        #[cfg(unix)]
-        if let Some(p) = slot.panic.take() {
-            std::panic::resume_unwind(p);
-        }
         match slot.r.take() {
             Some(r) if done => Ok(r),
             _ => {
                 TRIPPED.store(true, Ordering::Release);
                 let len = fault.message.iter().position(|&c| c == 0).unwrap_or(fault.message.len());
                 LAST_MESSAGE.with(|m| *m.borrow_mut() = String::from_utf16_lossy(&fault.message[..len]));
-                #[cfg(unix)]
-                for reset in AFTER_CRASH.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-                    reset();
-                }
                 Err(fault.code.max(1))
             }
         }
@@ -161,33 +135,20 @@ pub fn catch<R, F: FnOnce() -> R>(f: F) -> Result<R, u32> {
     Ok(f())
 }
 
-/// Has `reset` run on the thread of every crash contained from now on, right after it: for thread-local state that
-/// code under the guard sets and restores when a value drops, which the unix guard jumps over (module docs). Register
-/// each function once. Not needed on Windows, where the guard unwinds and the values drop.
-pub fn after_crash(reset: fn()) {
-    AFTER_CRASH.lock().unwrap_or_else(|e| e.into_inner()).push(reset);
-}
+/// Compatibility hook for format crates. Guards no longer skip Rust destructors; no repair callback is required.
+pub fn after_crash(_reset: fn()) {}
 
-/// What `catch` hands the trampoline: the closure, then its result (or, on unix, the panic it raised).
+/// What `catch` hands the trampoline: the closure, then its result.
 #[cfg(plugin_guard)]
 struct Slot<R, F> {
     f: Option<F>,
     r: Option<R>,
-    #[cfg(unix)]
-    panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 #[cfg(all(plugin_guard, windows))]
 unsafe extern "C-unwind" {
     /// `guard.c`: calls `f(ctx)`; 0 and what was raised in `fault` when it raised an exception the guard contains.
     fn os_host_guarded_call(f: extern "C-unwind" fn(*mut c_void), ctx: *mut c_void, fault: *mut Fault) -> i32;
-}
-
-#[cfg(all(plugin_guard, unix))]
-unsafe extern "C" {
-    /// `guard_unix.c`: calls `f(ctx)`; 0 and the crash in `fault` when a fault signal inside ended it. Nothing may
-    /// unwind into it.
-    fn os_host_guarded_call(f: extern "C" fn(*mut c_void), ctx: *mut c_void, fault: *mut Fault) -> i32;
 }
 
 /// Runs the closure in `catch`'s slot. Rust code between the guard and the plugin unwinds like a panic would.
@@ -197,21 +158,6 @@ extern "C-unwind" fn trampoline<R, F: FnOnce() -> R>(ctx: *mut c_void) {
     let slot = unsafe { &mut *ctx.cast::<Slot<R, F>>() };
     if let Some(f) = slot.f.take() {
         slot.r = Some(f());
-    }
-}
-
-/// Runs the closure in `catch`'s slot. A panic stops here and `catch` resumes it once the C frame is gone: unwinding
-/// through that frame would leave its jump target registered. A fault jumps over this frame and the closure's, which
-/// then leak whatever they own (module docs).
-#[cfg(all(plugin_guard, unix))]
-extern "C" fn trampoline<R, F: FnOnce() -> R>(ctx: *mut c_void) {
-    // SAFETY: `ctx` is the slot of the `catch` call running this.
-    let slot = unsafe { &mut *ctx.cast::<Slot<R, F>>() };
-    if let Some(f) = slot.f.take() {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-            Ok(r) => slot.r = Some(r),
-            Err(p) => slot.panic = Some(p),
-        }
     }
 }
 
@@ -527,7 +473,6 @@ mod tests {
     }
 
     /// A panic in Lemon Studio's own code under the guard is still a panic.
-    #[cfg(plugin_guard)]
     #[test]
     fn panics_pass_through_the_guard() {
         let m = Module::default();
@@ -560,35 +505,23 @@ mod tests {
         std::thread::spawn(run).join().unwrap();
     }
 
-    /// The functions registered with `after_crash` run on the crashing thread (unix, where nothing unwinds).
-    #[cfg(all(plugin_guard, unix))]
+    /// Unix hosting cannot safely resume after a native fault. Verify the boundary in a subprocess.
+    #[cfg(unix)]
     #[test]
-    fn after_crash_functions_run_on_the_crashing_thread() {
-        thread_local! {
-            static SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        }
-        after_crash(|| SET.set(false));
-        SET.set(true);
-        assert_eq!(catch(|| read_at(24)), Err(0xC000_0005));
-        assert!(!SET.get());
-    }
-
-    /// A fault outside any guarded call still ends the process the usual way: the guard hands it on. Runs itself again
-    /// as a child process, which must be ended by the signal.
-    #[cfg(all(plugin_guard, unix))]
-    #[test]
-    fn a_fault_outside_the_guard_still_ends_the_process() {
+    fn a_unix_plugin_fault_ends_the_process() {
         use std::os::unix::process::ExitStatusExt as _;
         if std::env::var_os("LEMON_GUARD_CHILD").is_some() {
-            assert_eq!(catch(|| 1), Ok(1), "installs the guard");
-            let _ = read_at(8);
-            unreachable!("the read faults");
+            assert!(!contained());
+            // A synchronous bad access exercises a native fault even when this test runner inherited a signal
+            // mask. Raising SIGSEGV can be queued rather than delivered under such a mask.
+            let _ = catch(|| unsafe { std::ptr::read_volatile(8usize as *const usize) });
+            unreachable!("a native fault must not resume Rust execution");
         }
         let exe = std::env::current_exe().unwrap();
-        let name = "guard::tests::a_fault_outside_the_guard_still_ends_the_process";
-        let mut child = std::process::Command::new(exe);
-        let out = child.args(["--exact", name, "--test-threads=1"]).env("LEMON_GUARD_CHILD", "1").output().unwrap();
-        assert!(matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)), "{out:?}");
+        let name = "guard::tests::a_unix_plugin_fault_ends_the_process";
+        let out = std::process::Command::new(exe).args(["--exact", name, "--test-threads=1"])
+            .env("LEMON_GUARD_CHILD", "1").output().unwrap();
+        assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{out:?}");
     }
 
     #[test]

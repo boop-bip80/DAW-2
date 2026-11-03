@@ -532,7 +532,8 @@ fn member_ops(s: &State, t: u16, slot: u8, m: &[Member], i: usize) -> Vec<PItem>
 
 /// Before an edit of the containers' lists: each member's state as its instance holds it now, so that the edit (and its
 /// undo) keeps what was set in the members' windows. A save stores them the same way (`project_plugins::store_hosted`).
-pub fn store_members(proj: &mut Project, plugins: &Plugins) {
+pub fn store_members(proj: &mut Project, plugins: &Plugins) -> Result<(), String> {
+    let mut updates = Vec::new();
     for (&key, live) in &plugins.containers {
         let Some((t, k)) = key_place(key) else { continue };
         let Some(p) = state_in_mut(proj, t, k) else { continue };
@@ -541,15 +542,23 @@ pub fn store_members(proj: &mut Project, plugins: &Plugins) {
         for m in &mut list {
             let Some(at) = live.shape.iter().position(|s| (s.0, s.1.as_str()) == (m.id, m.uid.as_str())) else { continue };
             let Some(h) = live.keys[at].and_then(|k| plugins.hosted.get(&k)) else { continue };
-            if let Some(state) = h.plugin.lock().ok().and_then(|p| p.save_state()).filter(|st| *st != m.state) {
+            let state = h.plugin.lock().ok().and_then(|p| p.save_state())
+                .ok_or_else(|| format!("{} could not save its state; the container was not changed", m.name))?;
+            if state != m.state {
                 m.state = state;
                 changed = true;
             }
         }
         if changed {
-            *p = encode(&list);
+            updates.push((t, k, encode(&list)));
         }
     }
+    for (t, k, state) in updates {
+        if let Some(p) = state_in_mut(proj, t, k) {
+            *p = state;
+        }
+    }
+    Ok(())
 }
 
 impl App {
@@ -582,7 +591,10 @@ impl App {
                 continue;
             };
             let (wet, dry) = levels(mix, on);
-            list.push(Member { id: 0, instrument: false, uid: p.desc().uid(), name: p.desc().name.clone(), wet, dry, state: p.save_state().unwrap_or_default() });
+            let Some(state) = p.save_state() else {
+                return Some(format!("{} could not save its state; the slots were not changed", p.desc().name));
+            };
+            list.push(Member { id: 0, instrument: false, uid: p.desc().uid(), name: p.desc().name.clone(), wet, dry, state });
             taken.push(k);
         }
         if !taken.contains(&slot) {
@@ -931,7 +943,18 @@ impl App {
                     Some((plugin, _)) => {
                         let k = MEMBER_KEY + self.plugins.next_member;
                         self.plugins.next_member += 1;
-                        self.plugins.hosted.insert(k, Hosted::new(plugin));
+                        let owner = crate::control::command::member_owner(id.0, m.id).unwrap_or(0);
+                        let mut hosted = Hosted::new(plugin);
+                        hosted.owner = Id(owner);
+                        self.plugins.hosted.insert(k, hosted);
+                        // Restore before the chain takes this instance: its first audible block must already use
+                        // the saved automation positions, including when rebuilt during playback.
+                        if let Err(error) = self.plugins.restore_identity(k, owner) {
+                            self.plugins.drop_key(k);
+                            missing.push(format!("{} ({error})", m.name));
+                            keys.push(None);
+                            continue;
+                        }
                         keys.push(Some(k));
                     }
                     None => {
@@ -1168,7 +1191,7 @@ mod tests {
         tick(&mut a);
         // A save stores the members' states.
         let mut proj = a.state.project.clone();
-        crate::project_plugins::store_hosted(&mut proj, &a.plugins);
+        crate::project_plugins::store_hosted(&mut proj, &a.plugins).unwrap();
         let saved = proj.mixer.iter().find(|m| m.index == 2).unwrap().slots[0].as_ref().map(|p| decode(&p.state).unwrap()).unwrap();
         assert!(saved.iter().all(|m| !m.state.is_empty()));
         // Every member window has a title.

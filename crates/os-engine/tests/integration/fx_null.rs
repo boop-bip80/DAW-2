@@ -157,7 +157,8 @@ fn run(case: &Case) -> Result<f64, String> {
 #[test]
 fn slot_effects_null_against_fl_exports() {
     let Some(dir) = std::env::var_os("OS_FX_NULL") else {
-        eprintln!("OS_FX_NULL not set: the null test against FL's exports is skipped");
+        assert!(std::env::var_os("LEMON_REQUIRE_EXTERNAL_FIXTURES").is_none(), "OS_FX_NULL is required for external qualification");
+        eprintln!("SKIPPED external fixture: OS_FX_NULL is unset");
         return;
     };
     let mut cases: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -177,6 +178,10 @@ fn slot_effects_null_against_fl_exports() {
                 continue;
             }
         };
+        if std::env::var_os("LEMON_REQUIRE_EXTERNAL_FIXTURES").is_some() && case.plugin == "Fruity Chorus" && case.phases.is_none() {
+            failed.push(format!("{name}: required qualification cannot include an unjudged random-phase case"));
+            continue;
+        }
         match run(&case) {
             // A chorus without the export's phases is only reported: its LFOs start elsewhere.
             Ok(db) if case.plugin == "Fruity Chorus" && case.phases.is_none() => println!("{name}: {db:.1} dB (phases unknown, not judged)"),

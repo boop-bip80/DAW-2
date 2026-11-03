@@ -29,7 +29,9 @@ pub const RATES: [u32; 5] = [44100, 48000, 88200, 96000, 192000];
 pub const CHANNELS: [&str; 4] = ["Stereo", "Mono (merged)", "Mono (left)", "Mono (right)"];
 /// The resampling choices: the window's width in points (2: linear); 27 is what playback uses.
 pub const POINTS: [u32; 8] = [2, 8, 16, 27, 64, 128, 256, 512];
-pub const TAILS: [&str; 3] = ["Cut", "Ring out", "Wrap"];
+pub const TAILS: [&str; 4] = ["Cut", "Ring (legacy)", "Wrap", "10 s tail"];
+/// Explicit, bounded default: quiet gaps do not truncate future delayed audio within this interval.
+pub const FIXED_TAIL_SECONDS: u64 = 10;
 
 /// What happens to the sound after the song's end (spec §3 "Tail").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,8 @@ pub enum Tail {
     Ring,
     /// What rang past the end is added to the file's start; the file is the song's length.
     Wrap,
+    /// Always render ten seconds past the selected material, including silent gaps before delayed effects.
+    Fixed,
 }
 
 /// The export's choices, as kept in settings.txt.
@@ -93,7 +97,7 @@ impl Default for Options {
             rate: 0,
             channels: 0,
             points: 27,
-            tail: Tail::Ring,
+            tail: Tail::Fixed,
             dither: false,
             hq: true,
             split: false,
@@ -162,8 +166,9 @@ impl Options {
         o.points = num("export_points").filter(|v| POINTS.contains(v)).unwrap_or(o.points);
         o.tail = match num("export_tail") {
             Some(0) => Tail::Cut,
+            Some(1) => Tail::Ring,
             Some(2) => Tail::Wrap,
-            _ => Tail::Ring,
+            _ => Tail::Fixed,
         };
         for (k, f) in FLAG_KEYS.iter().zip(o.flags()) {
             *f = sf::flag(k, *f);
@@ -289,6 +294,277 @@ impl Job {
 /// Below this (-96 dB) a split track is silent and not written.
 const SILENT: f32 = 1.584_893_1e-5;
 
+/// Buffered codecs/resampling remain explicitly bounded until their incremental encoders are qualified. The
+/// default native-rate float WAV path below does not keep the song or all stems in memory.
+pub const BUFFERED_SAMPLE_LIMIT: usize = 16 * 1024 * 1024;
+
+pub fn can_stream(job: &Job, rate: u32) -> bool {
+    let o = &job.options;
+    o.formats == [true,false,false,false] && o.wav_depth == 2 && (o.rate == 0 || o.rate == rate) && o.tail != Tail::Wrap
+}
+
+struct WaveSpool {
+    source: Option<usize>,
+    path: PathBuf,
+    raw: PathBuf,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    frames: u64,
+    loud: bool,
+    omit_silent: bool,
+    meta: Meta,
+}
+
+impl Drop for WaveSpool {
+    fn drop(&mut self) {
+        self.writer.take();
+        let _ = std::fs::remove_file(&self.raw);
+    }
+}
+
+impl WaveSpool {
+    fn new(source: Option<usize>, path: PathBuf, omit_silent: bool, meta: Meta) -> Result<Self,String> {
+        use std::sync::atomic::{AtomicU64,Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        let (raw,file) = loop {
+            let n = NEXT.fetch_add(1,Ordering::Relaxed);
+            let raw = parent.join(format!(".lemon-render-{}-{n}.raw",std::process::id()));
+            match std::fs::File::create_new(&raw) {
+                Ok(file) => break (raw,file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("{}: {e}",raw.display())),
+            }
+        };
+        Ok(Self { source,path,raw,writer:Some(std::io::BufWriter::with_capacity(64*1024,file)),frames:0,loud:false,omit_silent,meta })
+    }
+
+    fn push(&mut self, samples: &[f32], channels: usize, limit: Option<u64>) -> Result<(),String> {
+        use std::io::Write;
+        let allowed = limit.map_or(samples.len()/2, |n| (n.saturating_sub(self.frames) as usize).min(samples.len()/2));
+        let writer = self.writer.as_mut().ok_or("render spool already closed")?;
+        for f in samples.chunks_exact(2).take(allowed) {
+            self.loud |= f.iter().any(|s| s.abs() >= SILENT);
+            if channels == 0 {
+                writer.write_all(&f[0].to_le_bytes()).and_then(|_|writer.write_all(&f[1].to_le_bytes())).map_err(|e|e.to_string())?;
+            } else {
+                let mono = [(f[0]+f[1])*0.5,f[0],f[1]][channels-1];
+                writer.write_all(&mono.to_le_bytes()).map_err(|e|e.to_string())?;
+            }
+        }
+        self.frames += allowed as u64;
+        Ok(())
+    }
+
+    fn prepare(mut self, options: &Options, rate: u32) -> Result<Option<PreparedWave>,String> {
+        if self.omit_silent && !self.loud { return Ok(None); }
+        self.writer.take().ok_or("render spool already closed")?.into_inner().map_err(|e|e.to_string())?.sync_all().map_err(|e|e.to_string())?;
+        let channels = options.channel_count();
+        let bytes = self.frames.checked_mul(u64::from(channels)*4).ok_or("WAV length overflow")?;
+        if !options.markers && !options.note_markers { self.meta.markers.clear(); }
+        if !options.loops { self.meta.loop_frames = None; }
+        else if self.meta.loop_frames.is_none() { self.meta.loop_frames=Some((0,self.frames)); }
+        if !options.tempo { self.meta.tempo=(0.0,0.0); }
+        let mut extra=Vec::new();
+        append_wav_metadata(&mut extra,self.frames,rate,&self.meta);
+        let riff = 36u64.checked_add(bytes).and_then(|n|n.checked_add(extra.len() as u64)).filter(|&n|n<=u64::from(u32::MAX)).ok_or("too long for RIFF WAV; split the export into shorter ranges")?;
+        let mut header=wav_bytes(&[],channels,rate,32,false,&Meta::default())?;
+        header[4..8].copy_from_slice(&(riff as u32).to_le_bytes());
+        header[40..44].copy_from_slice(&(bytes as u32).to_le_bytes());
+        if std::fs::metadata(&self.raw).map_err(|e|e.to_string())?.len()!=bytes {
+            return Err(format!("{}: render spool length changed",self.raw.display()));
+        }
+        Ok(Some(PreparedWave { spool:self,header,extra,bytes }))
+    }
+}
+
+/// A finished, flushed spool, with a validated RIFF header. Nothing is published until *all* requested outputs
+/// have passed this preparation step and the previous files have been snapshotted for rollback.
+struct PreparedWave { spool:WaveSpool, header:Vec<u8>, extra:Vec<u8>, bytes:u64 }
+impl PreparedWave {
+    fn publish(&self) -> Result<(),String> {
+        self.publish_with_cancel(&||false)
+    }
+    fn publish_with_cancel(&self, cancelled:&impl Fn()->bool) -> Result<(),String> {
+        use std::io::{Read,Write};
+        crate::durable_file::replace_with(&self.spool.path,|out| {
+            out.write_all(&self.header)?;
+            let mut input=std::fs::File::open(&self.spool.raw)?;
+            let mut copied=0u64;
+            let mut block=[0u8;64*1024];
+            loop {
+                if cancelled() {return Err(std::io::Error::new(std::io::ErrorKind::Interrupted,"Export cancelled"));}
+                let n=input.read(&mut block)?;
+                if n==0 {break;}
+                out.write_all(&block[..n])?;
+                copied+=n as u64;
+            }
+            if copied!=self.bytes {return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,"render spool length changed"));}
+            out.write_all(&self.extra)
+        }).map_err(|e|format!("{}: {e}",self.spool.path.display()))
+    }
+}
+
+/// A pre-publish snapshot of an output's previous generation. It is created before the *first* stem is replaced
+/// so any normal I/O error partway through publication can restore every attempted destination. A process crash
+/// during the renames is not a transactional multi-file commit; that still needs a generation manifest.
+struct PreviousWave { target:PathBuf, copy:Option<PathBuf>, permissions:Option<std::fs::Permissions> }
+impl PreviousWave {
+    fn capture(target: &Path) -> Result<Self,String> {
+        use std::io::{ErrorKind,Write};
+        use std::sync::atomic::{AtomicU64,Ordering};
+        static NEXT:AtomicU64=AtomicU64::new(0);
+        let metadata=match std::fs::symlink_metadata(target) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind()==ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{}: {e}",target.display())),
+        };
+        if metadata.as_ref().is_some_and(|m|!m.file_type().is_file()) {
+            return Err(format!("{}: export target is not a regular file",target.display()));
+        }
+        let permissions=metadata.map(|m|m.permissions());
+        let mut copy=None;
+        if permissions.is_some() {
+            let parent=target.parent().unwrap_or_else(||Path::new("."));
+            let (path,mut out)=loop {
+                let n=NEXT.fetch_add(1,Ordering::Relaxed);
+                let path=parent.join(format!(".lemon-render-original-{}-{n}.backup",std::process::id()));
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(f) => break (path,f),
+                    Err(e) if e.kind()==ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(format!("{}: {e}",path.display())),
+                }
+            };
+            let snapshot=(||->std::io::Result<()> {
+                let mut old=std::fs::File::open(target)?;
+                std::io::copy(&mut old,&mut out)?;
+                out.flush()?;
+                out.sync_all()
+            })();
+            if let Err(e)=snapshot {
+                drop(out);
+                let _=std::fs::remove_file(&path);
+                return Err(format!("{}: cannot snapshot before export: {e}",target.display()));
+            }
+            drop(out);
+            copy=Some(path);
+        }
+        Ok(Self {target:target.to_path_buf(),copy,permissions})
+    }
+
+    fn restore(&self) -> Result<(),String> {
+        match &self.copy {
+            Some(old) => {
+                crate::durable_file::replace_with(&self.target,|out| {
+                    let mut saved=std::fs::File::open(old)?;
+                    std::io::copy(&mut saved,out).map(|_|())
+                }).map_err(|e|format!("{}: restore failed: {e}",self.target.display()))?;
+                if let Some(permissions)=&self.permissions {
+                    std::fs::set_permissions(&self.target,permissions.clone())
+                        .map_err(|e|format!("{}: restore permissions failed: {e}",self.target.display()))?;
+                }
+                Ok(())
+            }
+            None => match std::fs::remove_file(&self.target) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("{}: removal of newly published output failed: {e}",self.target.display())),
+            },
+        }
+    }
+}
+impl Drop for PreviousWave {
+    fn drop(&mut self) {if let Some(copy)=&self.copy {let _=std::fs::remove_file(copy);}}
+}
+
+fn publish_prepared(
+    outputs:Vec<PreparedWave>,mut publish:impl FnMut(usize,&PreparedWave)->Result<(),String>
+) -> Result<Vec<PathBuf>,String> {
+    use std::collections::HashSet;
+    // Resolve parent aliases before checking for duplicate output names. Conservative lowercasing rejects paths
+    // that collide on common case-insensitive volumes even when this test host happens to use a case-sensitive one.
+    let mut names=HashSet::new();
+    for output in &outputs {
+        let path=&output.spool.path;
+        let parent=std::fs::canonicalize(path.parent().unwrap_or_else(||Path::new(".")))
+            .map_err(|e|format!("{}: {e}",path.display()))?;
+        let name=path.file_name().ok_or_else(||format!("{}: output filename is missing",path.display()))?
+            .to_string_lossy().to_lowercase();
+        if !names.insert((parent,name)) {return Err(format!("{}: duplicate or case-colliding export destination",path.display()));}
+    }
+    // Preflight and reserve rollback copies *all at once*. None of the previous outputs can be modified before
+    // every requested destination has been checked and snapshotted.
+    let mut originals=outputs.iter().map(|w|PreviousWave::capture(&w.spool.path)).collect::<Result<Vec<_>,_>>()?;
+    let mut files=Vec::with_capacity(outputs.len());
+    for (i,output) in outputs.iter().enumerate() {
+        if let Err(e)=publish(i,output) {
+            // `replace_with` can fail after rename if syncing the parent directory fails; include the attempted
+            // target as well as earlier successes in rollback, even if it is normally still unmodified.
+            // Preserve the only previous-generation bytes if restoring that output fails.
+            let failures=originals[..=i].iter_mut().rev().filter_map(|old| {
+                let error=old.restore().err()?;
+                Some(match old.copy.take() {
+                    Some(backup)=>format!("{error}; previous output retained at {}",backup.display()),
+                    None=>error,
+                })
+            }).collect::<Vec<_>>();
+            if failures.is_empty() {return Err(format!("{e}; all attempted export files rolled back"));}
+            return Err(format!("{e}; rollback incomplete: {}",failures.join("; ")));
+        }
+        files.push(output.spool.path.clone());
+    }
+    Ok(files)
+}
+
+/// Incremental native-rate float WAV export. Every render tick is drained to disk; memory does not grow with song
+/// length. Only requested stems get spool files, and split tracks that remained silent are omitted at completion.
+pub struct WaveStream { job: Job, rate: u32, outputs: Vec<WaveSpool>, initialized: bool, song: u64 }
+impl WaveStream {
+    pub fn new(job: &Job, rate: u32, song: u64) -> Result<Self,String> {
+        let mut outputs=Vec::new();
+        if job.tracks.is_empty() {
+            outputs.push(WaveSpool::new(None,job.file(WAV),false,Meta { markers:job.markers.clone(),loop_frames:job.loop_frames,tempo:job.tempo })?);
+        }
+        Ok(Self { job:job.clone(),rate,outputs,initialized:false,song })
+    }
+    pub fn push(&mut self, mix: &[f32], tracks: &[Vec<f32>]) -> Result<(),String> {
+        if !self.initialized {
+            self.initialized=true;
+            if !self.job.tracks.is_empty() {
+                for &t in &self.job.tracks {
+                    let name=if self.job.tracks.len()==1 {self.job.name.clone()} else {format!("{} - {t:02} {}",self.job.name,self.job.track_name(usize::from(t)))};
+                    self.outputs.push(WaveSpool::new(Some(usize::from(t)),self.job.folder.join(format!("{name}.wav")),false,Meta::default())?);
+                }
+            } else if self.job.options.split {
+                for t in 0..tracks.len() {
+                    if t==0 && !self.job.options.split_master { continue; }
+                    let path=self.job.stems_folder().join(format!("{t:02} {}.wav",self.job.track_name(t)));
+                    self.outputs.push(WaveSpool::new(Some(t),path,true,Meta::default())?);
+                }
+            }
+        }
+        let limit=(self.job.options.tail==Tail::Cut).then_some(self.song);
+        for output in &mut self.outputs {
+            let samples=output.source.map_or(mix,|t|tracks.get(t).map_or(&[],Vec::as_slice));
+            output.push(samples,self.job.options.channels,limit)?;
+        }
+        Ok(())
+    }
+    pub fn finish(self) -> Result<Vec<PathBuf>,String> {self.finish_with_cancel(||false)}
+    pub fn finish_with_cancel(self, cancelled:impl Fn()->bool) -> Result<Vec<PathBuf>,String> {
+        let mut prepared=Vec::new();
+        for output in self.outputs {
+            if cancelled() {return Err("Export cancelled; existing outputs preserved".into());}
+            if let Some(wave)=output.prepare(&self.job.options,self.rate)? {prepared.push(wave);}
+        }
+        if cancelled() {return Err("Export cancelled; existing outputs preserved".into());}
+        publish_prepared(prepared,|_,wave| {
+            if cancelled() {return Err("Export cancelled".into());}
+            wave.publish_with_cancel(&cancelled)
+        })
+    }
+}
+
 /// Writes the files of `job` from the render at `rate`: `mix` and the mixer tracks' outputs (interleaved stereo, by
 /// track number; empty unless Split mixer tracks), `song` frames long before the tail. Returns the files written.
 pub fn write(job: &Job, rate: u32, mix: Vec<f32>, tracks: Vec<Vec<f32>>, song: u64) -> Result<Vec<PathBuf>, String> {
@@ -373,7 +649,7 @@ pub fn shape(o: &Options, audio: Vec<f32>, song: u64, rate: u32, out_rate: u32) 
 pub fn tail(mut audio: Vec<f32>, song: usize, t: Tail) -> Vec<f32> {
     let n = audio.len() / 2;
     match t {
-        Tail::Ring => audio,
+        Tail::Ring | Tail::Fixed => audio,
         _ if song == 0 => audio,
         _ if n <= song => {
             audio.resize(song * 2, 0.0);
@@ -520,7 +796,7 @@ fn encode(o: &Options, f: usize, path: &Path, audio: &[f32], rate: u32, meta: &M
         }
         _ => ogg_bytes(audio, ch, rate, o.ogg_kbps).map_err(err)?,
     };
-    std::fs::write(path, bytes).map_err(|e| err(e.to_string()))
+    crate::durable_file::replace(path, &bytes).map_err(|e| err(e.to_string()))
 }
 
 /// A WAV file: PCM at 16 or 24 bits (dithered when `dither`), IEEE float at 32; with `cue `, `LIST`/`adtl`, `smpl` and
@@ -559,6 +835,22 @@ fn wav_bytes(audio: &[f32], ch: u16, rate: u32, bits: u16, dither: bool, meta: &
     put(b"data", &data);
     drop(data);
     let frames = audio.len() as u64 / u64::from(ch);
+    append_wav_metadata(&mut chunks, frames, rate, meta);
+    let mut out = Vec::with_capacity(chunks.len() + 12);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(4 + chunks.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(&chunks);
+    Ok(out)
+}
+
+fn append_wav_metadata(chunks: &mut Vec<u8>, frames: u64, rate: u32, meta: &Meta) {
+    let mut put = |id: &[u8;4], body: &[u8]| {
+        chunks.extend_from_slice(id);
+        chunks.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        chunks.extend_from_slice(body);
+        if body.len() % 2 == 1 { chunks.push(0); }
+    };
     let markers: Vec<&Marker> = meta.markers.iter().filter(|m| m.frame <= frames).collect();
     if !markers.is_empty() {
         let mut cue = (markers.len() as u32).to_le_bytes().to_vec();
@@ -613,12 +905,6 @@ fn wav_bytes(audio: &[f32], ch: u16, rate: u32, bits: u16, dither: bool, meta: &
         acid.extend_from_slice(&(meta.tempo.0 as f32).to_le_bytes());
         put(b"acid", &acid);
     }
-    let mut out = Vec::with_capacity(chunks.len() + 12);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(4 + chunks.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(&chunks);
-    Ok(out)
 }
 
 /// A FLAC file at `bits`, compression `level` 0..=8 (block size, prediction order and stereo coding go up with it, as
@@ -719,6 +1005,126 @@ fn ogg_bytes(audio: &[f32], ch: u16, rate: u32, kbps: u32) -> Result<Vec<u8>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_multiple_stems_rolls_back_an_earlier_published_wav_if_a_later_publish_fails() {
+        use std::sync::atomic::{AtomicU64,Ordering};
+        static NEXT:AtomicU64=AtomicU64::new(0);
+        let folder=std::env::temp_dir().join(format!("lemon_wave_batch_{}_{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+        std::fs::create_dir(&folder).unwrap();
+        let mut job=Job::wav(&folder.join("take.wav"));
+        job.options.split=true;
+        job.options.split_master=true;
+        job.options.tail=Tail::Cut;
+        job.track_names=vec!["Master".into(),"Bus".into()];
+        let mix=vec![0.2f32,0.1,0.3,0.2];
+        let tracks=vec![vec![0.3f32,0.2,0.1,0.4],vec![0.4f32,0.4,0.2,0.1]];
+        let mut stream=WaveStream::new(&job,48000,2).unwrap();
+        stream.push(&mix,&tracks).unwrap();
+        let prepared=stream.outputs.into_iter().map(|w|w.prepare(&job.options,48000).unwrap().unwrap()).collect::<Vec<_>>();
+        assert_eq!(prepared.len(),3);
+        let old=prepared.iter().map(|w|{
+            let value=format!("old output: {}",w.spool.path.display()).into_bytes();
+            std::fs::write(&w.spool.path,&value).unwrap();
+            (w.spool.path.clone(),value)
+        }).collect::<Vec<_>>();
+        let e=publish_prepared(prepared,|index,wave| {
+            if index==1 {Err("injected second WAV publication failure".into())} else {wave.publish()}
+        }).unwrap_err();
+        assert!(e.contains("rolled back"),"{e}");
+        for (path,bytes) in &old {assert_eq!(&std::fs::read(path).unwrap(),bytes);}
+        for dir in [&folder,&job.stems_folder()] {
+            assert!(std::fs::read_dir(dir).unwrap().all(|entry|{
+                let name=entry.unwrap().file_name();
+                !name.to_string_lossy().contains("lemon-render")
+            }),"failed batch left temporary render/backup files in {}",dir.display());
+        }
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+
+    #[test]
+    fn incomplete_rollback_retains_original_snapshot() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let folder = std::env::temp_dir().join(format!(
+            "lemon_wave_failed_restore_{}_{}",
+            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&folder).unwrap();
+        let mut job = Job::wav(&folder.join("take.wav"));
+        job.options.split = true;
+        job.options.split_master = true;
+        job.options.tail = Tail::Cut;
+        job.track_names = vec!["Master".into(), "Bus".into()];
+        let mix = vec![0.2f32, 0.1, 0.3, 0.2];
+        let tracks = vec![mix.clone(), mix.clone()];
+        let mut stream = WaveStream::new(&job, 48000, 2).unwrap();
+        stream.push(&mix, &tracks).unwrap();
+        let prepared = stream.outputs.into_iter()
+            .map(|w| w.prepare(&job.options, 48000).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(prepared.len() >= 2);
+        let first = prepared[0].spool.path.clone();
+        let second = prepared[1].spool.path.clone();
+        let original = b"previous irreplaceable audio";
+        std::fs::write(&first, original).unwrap();
+        std::fs::write(&second, b"other original audio").unwrap();
+        let error = publish_prepared(prepared, |index, wave| {
+            if index == 1 {return Err("injected second publish failure".into());}
+            wave.publish()?;
+            // Force restore failure portably without relying on filesystem privileges.
+            std::fs::remove_file(&first).unwrap();
+            std::fs::create_dir(&first).unwrap();
+            Ok(())
+        }).unwrap_err();
+        assert!(error.contains("rollback incomplete"), "{error}");
+        assert!(error.contains("previous output retained at"), "{error}");
+        assert_eq!(std::fs::read(&second).unwrap().as_slice(), b"other original audio");
+        let backups = std::fs::read_dir(first.parent().unwrap()).unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().contains(".lemon-render-original-"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap().as_slice(), original);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn streamed_wav_and_stems_match_buffered_samples_and_metadata() {
+        let folder=std::env::temp_dir().join(format!("lemon_streamed_export_{}",std::process::id()));
+        let _=std::fs::remove_dir_all(&folder);std::fs::create_dir_all(&folder).unwrap();
+        let mix:Vec<f32>=(0..34).map(|i|i as f32/100.0-0.17).collect();
+        let tracks=vec![mix.clone(),vec![0.0;34],mix.iter().map(|v|v*0.3).collect()];
+        for channels in [0,1,2,3] {
+            let mut job=Job::wav(&folder.join(format!("channels_{channels}.wav")));
+            job.options.channels=channels;job.options.split=true;job.options.tail=Tail::Cut;
+            job.options.markers=true;job.options.loops=true;job.options.tempo=true;
+            job.markers=vec![Marker{frame:3,name:"marker".into()}];job.loop_frames=Some((2,9));job.tempo=(120.0,4.0);
+            let expected=write(&job,48000,mix.clone(),tracks.clone(),10).unwrap().into_iter()
+                .map(|p|{let b=std::fs::read(&p).unwrap();(p,b)}).collect::<Vec<_>>();
+            let mut stream=WaveStream::new(&job,48000,10).unwrap();
+            for (a,b) in [(0,6),(6,16),(16,34)] {
+                let block=tracks.iter().map(|t|t[a..b].to_vec()).collect::<Vec<_>>();
+                stream.push(&mix[a..b],&block).unwrap();
+            }
+            let files=stream.finish().unwrap();
+            assert_eq!(files.len(),expected.len());
+            for (path,bytes) in expected {assert_eq!(std::fs::read(path).unwrap(),bytes);}
+        }
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn streaming_scope_is_explicit_and_native_wav_is_default() {
+        let mut job=Job::wav(Path::new("test.wav"));
+        assert_eq!(job.options.tail,Tail::Fixed);assert!(can_stream(&job,48000));
+        job.options.rate=44100;assert!(!can_stream(&job,48000));
+        job.options.rate=0;job.options.formats[FLAC]=true;assert!(!can_stream(&job,48000));
+        job.options.formats[FLAC]=false;job.options.tail=Tail::Wrap;assert!(!can_stream(&job,48000));
+        assert_eq!(BUFFERED_SAMPLE_LIMIT*std::mem::size_of::<f32>(),64*1024*1024);
+    }
+
 
     fn tone(frames: usize, rate: u32, hz: f32) -> Vec<f32> {
         (0..frames).flat_map(|i| {

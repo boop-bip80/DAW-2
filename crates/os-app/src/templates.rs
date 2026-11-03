@@ -169,6 +169,9 @@ impl App {
         }
         let s = &mut self.state;
         s.path = None;
+        s.recovery_id = crate::backup::new_identity();
+        s.plugin_edit_revision = 0;
+        self.backup = Default::default();
         crate::project_info::created(s);
         s.message = Some(format!("New project from the template {name}"));
         self.mark_saved();

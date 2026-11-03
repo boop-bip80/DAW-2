@@ -147,4 +147,5 @@ fn older_files_read_as_their_resaves() {
         eprintln!("{}", differ.join("\n"));
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    assert!(differ.is_empty(), "{} semantic differences in {} FL Studio original/resaved pairs:\n{}", differ.len(), pairs.len(), differ.join("\n"));
 }

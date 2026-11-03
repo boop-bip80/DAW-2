@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-lemonstudio-project">
+    <comment>Lemon Studio project</comment>
+    <glob pattern="*.lemon" weight="80"/>
+  </mime-type>
+  <mime-type type="application/x-flstudio-project">
+    <comment>FL Studio project</comment>
+    <glob pattern="*.flp" weight="60"/>
+  </mime-type>
+</mime-info>

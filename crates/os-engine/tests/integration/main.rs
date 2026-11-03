@@ -8,3 +8,5 @@
 mod fx_null;
 mod live_note_count;
 mod pc_null;
+
+mod stabilization;

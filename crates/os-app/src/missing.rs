@@ -87,16 +87,10 @@ pub fn apply(app: &App) {
     os_engine::sample::set_search_folders(search_folders(&app.state, &app.missing.picked));
 }
 
-/// The channels whose sample is not found (sampler and audio clip channels, and a 3x Osc's custom shape): row and the
-/// path the project stores.
+/// Every known external audio reference that is missing, including drum layers and built-ins inside containers.
 pub fn missing_samples(s: &State) -> Vec<(usize, String)> {
-    s.project
-        .channels
-        .iter()
-        .enumerate()
-        .filter_map(|(row, ch)| Some((row, ch.sample_path.clone().filter(|p| !p.trim().is_empty())?)))
-        .filter(|(_, p)| !Path::new(&crate::plugins::resolve_sample(p)).is_file())
-        .collect()
+    crate::assets::inspect(&s.project).map(|inventory| inventory.references.into_iter()
+        .filter(|(_, p)| !Path::new(&crate::plugins::resolve_sample(p)).is_file()).collect()).unwrap_or_default()
 }
 
 /// The file name of a stored sample path (either slash).
@@ -122,7 +116,10 @@ pub fn loaded(app: &mut App) {
         return;
     }
     let samples: Vec<String> = missing_samples(&app.state).iter().map(|(_, p)| file_name(p).to_string()).collect();
-    let plugins = app.missing.plugins.clone();
+    let mut plugins = app.missing.plugins.clone();
+    if let Err(e) = crate::assets::inspect(&app.state.project) {
+        plugins.push(e);
+    }
     if samples.is_empty() && plugins.is_empty() {
         return;
     }
@@ -229,7 +226,14 @@ pub fn tick(app: &mut App) {
         }
     }
     apply(app);
-    let found = relink(app, &before);
+    let found = match relink(app, &before) {
+        Ok(n) => n,
+        Err(e) => {
+            app.state.message = Some(format!("Could not relink missing samples: {e}"));
+            app.invalidate();
+            return;
+        }
+    };
     let left = before.len() - found;
     app.state.message = Some(match (found, left) {
         (0, _) => format!("No missing samples found in {}", folder.display()),
@@ -239,23 +243,21 @@ pub fn tick(app: &mut App) {
     app.invalidate();
 }
 
-/// The channels of `before` (missing samples) whose sample is found now take the file found: its path goes into the
-/// project (a change to save), and a hosted Lemon Sampler loads it. Returns how many were found.
-fn relink(app: &mut App, before: &[(usize, String)]) -> usize {
+/// Relink every occurrence of a found file, in the model and live built-ins, through the shared asset rewriter.
+fn relink(app: &mut App, before: &[(usize, String)]) -> Result<usize, String> {
+    let mut paths = crate::assets::Paths::new();
     let mut found = 0;
-    for (row, old) in before {
+    for (_, old) in before {
         let now = crate::plugins::resolve_sample(old);
-        if !Path::new(&now).is_file() {
-            continue;
-        }
-        found += 1;
-        let Some(ch) = app.state.project.channels.get_mut(*row) else { continue };
-        ch.sample_path = Some(now.clone());
-        if ch.kind.is_sampler() {
-            app.state.sample_loads.push((*row, now));
+        if Path::new(&now).is_file() {
+            crate::assets::map_path(&mut paths, old, now);
+            found += 1;
         }
     }
-    found
+    let project = crate::assets::snapshot(app)?;
+    let candidate = crate::assets::rewritten(&project, &paths)?;
+    crate::assets::apply(app, candidate, &paths, None)?;
+    Ok(found)
 }
 
 /// The search's progress panel: the folder searched and the time so far.

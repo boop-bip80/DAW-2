@@ -102,6 +102,8 @@ pub(super) enum Note {
     On { key: u8, vel: f32, start: f32, fine: f32, levels: crate::NoteLevels, voice: Option<u32> },
     /// The note's end: a plugin's own release, a sampler voice's envelope release.
     Off(u8),
+    /// A channel-qualified live note end.
+    End(u8, u8),
     /// A sampler voice's closing fade: the voice named when it is an audio clip's, else the key's voices.
     Choke(u8, Option<u32>),
     /// Tuning of the voices of a key, semitones from the key's own pitch.
@@ -180,6 +182,7 @@ enum State {
 struct Voice {
     /// Key sent to the instrument (a mono voice keeps it while it glides to other keys).
     sent: u8,
+    channel: u8,
     /// Tick it started on.
     born: u64,
     /// Cut group it belongs to; 0 = none.
@@ -268,14 +271,14 @@ impl Voices {
         let v = self.pool[i];
         if r.plugin {
             if v.state == State::Held {
-                out.push((ch, off, Note::Off(v.sent)));
+                out.push((ch, off, ended(v.sent, v.channel)));
             }
             self.pool.remove(i);
             self.voice_gone(v);
         } else if r.one_shot {
             self.close(i, r, ch, off, out);
         } else if v.state == State::Held {
-            out.push((ch, off, Note::Off(v.sent)));
+            out.push((ch, off, ended(v.sent, v.channel)));
             let p = &mut self.pool[i];
             (p.state, p.left) = (State::Released, p.left.min(r.tail));
             self.voice_gone(v);
@@ -441,14 +444,18 @@ fn note_end(v: &mut Voices, r: &Rules, e: &Event, out: &mut Vec<(usize, u32, Not
         return;
     }
     // The oldest held voice of the key; a note whose voice a cut or the limit ended has nothing left to end.
-    if let Some(i) = v.pool.iter().position(|p| p.sent == e.key && p.state == State::Held) {
+    if let Some(i) = v.pool.iter().position(|p| p.sent == e.key && p.channel == e.levels.channel && p.state == State::Held) {
         end_voice(v, r, i, e, out);
     }
 }
 
+fn ended(key: u8, channel: u8) -> Note {
+    if channel == 0 { Note::Off(key) } else { Note::End(key, channel) }
+}
+
 /// Voice `i`'s note ends.
 fn end_voice(v: &mut Voices, r: &Rules, i: usize, e: &Event, out: &mut Vec<(usize, u32, Note)>) {
-    out.push((e.ch, e.off, Note::Off(v.pool[i].sent)));
+    out.push((e.ch, e.off, ended(v.pool[i].sent, v.pool[i].channel)));
     if r.plugin {
         v.pool.remove(i);
     } else {
@@ -523,7 +530,7 @@ fn note_start(v: &mut Voices, r: &Rules, e: &Event, out: &mut Vec<(usize, u32, N
     // A retriggered key: its old tuning ends with it.
     v.glides.retain(|g| g.key != key);
     out.push((e.ch, e.off, Note::On { key, vel: e.vel, start: e.start, fine: e.fine, levels: e.levels, voice: e.voice }));
-    v.pool.push(Voice { sent: key, born: v.tick, group, state: State::Held, left, layer: e.layer, voice: e.voice });
+    v.pool.push(Voice { sent: key, channel: e.levels.channel, born: v.tick, group, state: State::Held, left, layer: e.layer, voice: e.voice });
     if r.mono {
         v.sounding = Some((key, key));
     }

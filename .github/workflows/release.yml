@@ -157,6 +157,8 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$TAG" packages/* --repo "$GITHUB_REPOSITORY" --clobber
           else
+            # The template is prepended to GitHub's generated notes (gh allows --notes with --generate-notes): what
+            # the beta is, the risky areas and the tracker, where settings and projects live, how to report a bug.
             gh release create "$TAG" packages/* --repo "$GITHUB_REPOSITORY" \
-              --title "Lemon Studio $TAG" --generate-notes --prerelease
+              --title "Lemon Studio $TAG" --notes "$(cat docs/release-notes.md)" --generate-notes --prerelease
           fi

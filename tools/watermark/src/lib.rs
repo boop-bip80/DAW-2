@@ -182,6 +182,37 @@ mod tests {
         }
     }
 
+    /// The summary a tagged build publishes tells a beta tester what they need: the risky areas and the tracker, where
+    /// settings and projects live, that a `.lemon` project is not an FL Studio one, and how to report a bug. It is a
+    /// file the release workflow publishes, and the bug report asks for the diagnostics.
+    #[test]
+    fn the_release_notes_tell_a_beta_tester_what_they_need() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let notes = read("docs/release-notes.md");
+        for want in [
+            "Known-risky areas",
+            "Project files",
+            "Plugin hosting",
+            "https://github.com/ItsAlphaNeon/Lemon-Studio/issues",
+            "Settings and projects",
+            ".lemon",
+            "FL Studio",
+            "Diagnostics.txt",
+            "Crash.txt",
+        ] {
+            assert!(notes.contains(want), "docs/release-notes.md does not mention {want:?}");
+        }
+        assert!(
+            read(".github/workflows/release.yml").contains("docs/release-notes.md"),
+            "the release workflow does not publish docs/release-notes.md"
+        );
+        let template = read(".github/ISSUE_TEMPLATE/bug_report.yml");
+        for want in ["Diagnostics.txt", "Crash.txt"] {
+            assert!(template.contains(want), "the bug report does not ask for {want}");
+        }
+    }
+
     /// Every source file in the repository opens with the header, with the note for a file that holds others' work (see
     /// the crate documentation).
     #[test]

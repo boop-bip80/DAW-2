@@ -75,6 +75,18 @@ body:
       required: true
 
   - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        HELP > Diagnostics writes `Diagnostics.txt` into Lemon Studio's user folder; after a crash, `Crash.txt` is
+        there too, with the message and where it happened. Drag both in, or paste what they say: most reports can't be
+        acted on without them.
+      placeholder: Drag Diagnostics.txt and, if Lemon Studio crashed, Crash.txt here.
+    validations:
+      required: false
+
+  - type: textarea
     id: extra
     attributes:
       label: Additional context

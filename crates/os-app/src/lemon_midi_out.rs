@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crossbeam_queue::ArrayQueue;
-use os_engine::{Instrument, TransportInfo};
+use os_engine::{Instrument, TransportInfo, TuningBend};
 use os_model::{Channel, ChannelKind};
 
 /// What the ADD menu and a new channel call it.
@@ -313,6 +313,8 @@ pub fn reset_messages(l: &Live) -> Vec<([u8; 3], u8)> {
 pub struct MidiOutInstrument {
     pub live: Live,
     sink: Arc<ArrayQueue<Out>>,
+    /// The bend the notes' fine pitch and glides go out as, over the channel's pitch-bend range.
+    bend: TuningBend,
     /// The keys sounding (note on sent, no note off yet), with the channel and port they went to.
     held: Vec<(u8, u8, u8)>,
     /// The song is playing (the last `transport` said so) and where it was.
@@ -324,7 +326,9 @@ pub struct MidiOutInstrument {
 
 impl MidiOutInstrument {
     pub fn new(live: Live, sink: Arc<ArrayQueue<Out>>) -> MidiOutInstrument {
-        MidiOutInstrument { live, sink, held: Vec::new(), playing: false, last_frame: 0, told: false }
+        let mut bend = TuningBend::default();
+        bend.set_range(u32::from(live.bend_range));
+        MidiOutInstrument { live, sink, bend, held: Vec::new(), playing: false, last_frame: 0, told: false }
     }
 
     fn send(&self, bytes: [u8; 3], len: u8) {
@@ -337,16 +341,25 @@ impl MidiOutInstrument {
         }
     }
 
-    fn send_reset(&self) {
+    fn send_reset(&mut self) {
+        // A note's tuning left the bend away from the centre: playback starts from it again.
+        if let Some(mut b) = self.bend.reset() {
+            b[0] |= self.live.settings.channel & 0x0f;
+            self.send(b, 3);
+        }
         for (b, n) in reset_messages(&self.live) {
             self.send(b, n);
         }
     }
 
-    /// Note off for every key still sounding.
+    /// Note off for every key still sounding, and the bend back to the centre.
     fn cut(&mut self) {
         for (ch, key, port) in std::mem::take(&mut self.held) {
             self.push(port, [0x80 | ch, key, 64], 3);
+        }
+        if let Some(mut b) = self.bend.reset() {
+            b[0] |= self.live.settings.channel & 0x0f;
+            self.send(b, 3);
         }
     }
 }
@@ -360,6 +373,11 @@ impl Drop for MidiOutInstrument {
 impl Instrument for MidiOutInstrument {
     fn note_on(&mut self, _offset: u32, key: u8, velocity: f32) {
         let ch = self.live.settings.channel & 0x0f;
+        // A note starts untuned: the bend an earlier note's fine pitch left goes back to the centre before it.
+        if let Some(mut b) = self.bend.note_on(key & 0x7f) {
+            b[0] |= ch;
+            self.send(b, 3);
+        }
         let v = (velocity * 128.0).round().clamp(1.0, 127.0) as u8;
         if let Some(i) = self.held.iter().position(|h| h.1 == key) {
             let (c, k, p) = self.held.remove(i);
@@ -376,6 +394,14 @@ impl Instrument for MidiOutInstrument {
         if let Some(i) = self.held.iter().position(|h| h.1 == key & 0x7f) {
             let (c, k, p) = self.held.remove(i);
             self.push(p, [0x80 | c, k, 64], 3);
+        }
+    }
+
+    /// A note's fine pitch (or a glide) over the channel's pitch-bend range (spec: plugins/midi-out.md §3).
+    fn tune(&mut self, _offset: u32, key: u8, semitones: f32) {
+        if let Some(mut b) = self.bend.tune(key & 0x7f, semitones) {
+            b[0] |= self.live.settings.channel & 0x0f;
+            self.send(b, 3);
         }
     }
 
@@ -734,6 +760,34 @@ mod tests {
     }
 
     /// The groups of the measured conversion (spec §4): 1, 2 and 4 kept, none, 15 and 19 given 3, 5, 6, 7, 8.
+    /// A note's fine pitch and glide go out as pitch bend over the channel's range, and a later untuned note puts
+    /// the bend back to the centre before it (spec §3).
+    #[test]
+    fn note_tuning_goes_out_as_pitch_bend() {
+        let q = Arc::new(ArrayQueue::new(64));
+        let mut i = MidiOutInstrument::new(live(), q.clone());
+        i.note_on(0, 60, 1.0);
+        i.tune(0, 60, 1.0);
+        // A new note starts centred, then takes its own tuning.
+        i.note_on(0, 64, 1.0);
+        i.tune(0, 64, -1.0);
+        let got: Vec<Out> = std::iter::from_fn(|| q.pop()).collect();
+        assert_eq!(
+            got.iter().map(|o| o.data().to_vec()).collect::<Vec<_>>(),
+            vec![
+                vec![0x90, 60, 127],
+                vec![0xe0, 0x2b, 0x45],
+                vec![0xe0, 0x00, 0x40],
+                vec![0x90, 64, 127],
+                vec![0xe0, 0x55, 0x3a],
+            ]
+        );
+        // Stop centres it again.
+        i.reset();
+        let rest: Vec<Out> = std::iter::from_fn(|| q.pop()).collect();
+        assert!(rest.iter().any(|o| o.data() == [0xe0, 0x00, 0x40]), "{rest:?}");
+    }
+
     #[test]
     fn cut_groups_as_measured() {
         assert_eq!(cut_groups(&[0, 4, 15, 0, 1, 0, 19, 2]), vec![3, 4, 5, 6, 1, 7, 8, 2]);

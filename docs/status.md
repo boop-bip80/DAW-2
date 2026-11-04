@@ -612,8 +612,8 @@ and Touch controller. Kept with the program's settings, not the project. Which w
   whose Port (Settings ▸ MIDI) is the channel's port, on its MIDI channel, while Enable MIDI output is on; starting
   playback sends its pan, volume, pitch-bend range, bank and program, as its On reset settings say. Its window sets
   the channel, port, patch (with the General MIDI names), bank and its two checks; the file's MIDI Out state is kept
-  byte for byte. Not yet: its knob pages and controllers, Map note color to MIDI channel, fine pitch as pitch bend,
-  and recording what it sends into an exported MIDI file
+  byte for byte. Its notes' fine pitch and glides go out as pitch bend over the channel's pitch-bend range. Not yet:
+  its knob pages and controllers, Map note color to MIDI channel, and recording what it sends into an exported MIDI file
 - The piano roll's Tools menu: Import MIDI file... into its channel (replacing or blending), Export as MIDI file...
 - Not yet: FL's FLEX mapping of the mod wheel and sustain pedal
 

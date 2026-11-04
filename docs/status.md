@@ -326,7 +326,7 @@ arrangement's in SONG mode, the current pattern's in PAT mode, each marker start
 a key on a MIDI keyboard, play a note on the typing keyboard, or press a Touch controller pad or key) in time. The average of the taps, in whole BPM, becomes the project tempo while Apply
 tempo is on; the beat bar counts the taps in groups of four. Each tap clicks with the metronome's Tick sound,
 the first of each four accented. Apply tempo is remembered between sessions. − nudge / nudge +, held while playing, run playback 2 % slower / faster
-until let go (the tempo stays). Not yet: Sync, Mute and now (drawn greyed out), nudging with the arrow keys.
+until let go (the tempo stays); while the window is in front, the Left / Right arrows nudge the same way. Not yet: Sync, Mute and now (drawn greyed out).
 
 **Closing windows.** VIEW > Close all windows (F12), Close all unfocused windows (Ctrl+F12: all but the one
 in front) and Close all plugin windows (Alt+F12: channel settings and plugin editors); the browser stays.

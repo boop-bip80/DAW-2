@@ -4354,6 +4354,21 @@ impl App {
         matches!(self.drag, Some(Drag::Browser { .. }))
     }
 
+    /// A key let go of: the Tempo tapper's held arrow-key nudge ends with it (spec: ui/tempo-tapper.md §6).
+    pub fn key_up(&mut self, key: &winit::keyboard::Key) {
+        use winit::keyboard::{Key, NamedKey};
+        let n = match key {
+            Key::Named(NamedKey::ArrowLeft) => -1,
+            Key::Named(NamedKey::ArrowRight) => 1,
+            _ => return,
+        };
+        // Clear only the direction this key started: the other arrow may still be held.
+        if crate::tapper::nudging() == n {
+            crate::tapper::nudge_flag().store(0, std::sync::atomic::Ordering::Relaxed);
+            self.damage_win(Win::Tapper);
+        }
+    }
+
     /// A key pressed while surface `on` has the keyboard focus (`None`: the main window, else that detached window's
     /// native window): it acts on that surface, and a popup or type-in box it opens is drawn there.
     pub fn key_on(&mut self, on: Option<Win>, key: &winit::keyboard::Key, ctrl: bool, alt: bool) {
@@ -7730,6 +7745,19 @@ impl App {
             Key::Named(NamedKey::Space) => self.act(if self.transport.playing() { Action::Stop } else { Action::Play }),
             // L flips the PAT / SONG switch, as in FL (the typing keyboard, when on, takes L first).
             Key::Character(c) if !ctrl && !alt && !self.shift && c.eq_ignore_ascii_case("l") => self.act(Action::PatSong(!self.state.song_mode)),
+            // The tapper's arrow-key nudge while it is in front (spec: ui/tempo-tapper.md §6).
+            Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight)
+                if self.state.z.last() == Some(&Win::Tapper)
+                    && self.state.menu_open.is_none()
+                    && !self.state.settings.open
+                    && self.state.playlist.edit.is_none()
+                    && self.state.playlist.popup.is_none()
+                    && !ctrl
+                    && !alt =>
+            {
+                let n = if matches!(key, Key::Named(NamedKey::ArrowLeft)) { -1 } else { 1 };
+                self.tapper_act(crate::tapper::TapAct::Nudge(n));
+            }
             // spec: ui/tempo-tapper.md §1
             Key::Named(NamedKey::F5) if ctrl => self.act(Action::ToggleWin(Win::Tapper)),
             Key::Named(NamedKey::F7) if alt && !ctrl => self.act(Action::ToggleWin(Win::Touch)),
@@ -13677,6 +13705,15 @@ mod tests {
         app.act(Action::Tapper(TapAct::Nudge(-1)));
         assert_eq!(crate::tapper::nudging(), -1);
         app.release();
+        assert_eq!(crate::tapper::nudging(), 0);
+        // The Left / Right arrows nudge while the tapper is in front and end on their release (spec §6).
+        app.key(&Key::Named(NamedKey::ArrowLeft), false, false);
+        assert_eq!(crate::tapper::nudging(), -1);
+        app.key_up(&Key::Named(NamedKey::ArrowLeft));
+        assert_eq!(crate::tapper::nudging(), 0);
+        app.key(&Key::Named(NamedKey::ArrowRight), false, false);
+        assert_eq!(crate::tapper::nudging(), 1);
+        app.key_up(&Key::Named(NamedKey::ArrowRight));
         assert_eq!(crate::tapper::nudging(), 0);
         app.transport.stop();
         for name in [

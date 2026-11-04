@@ -1073,6 +1073,12 @@ impl ApplicationHandler for Shell {
                         return;
                     }
                 }
+                if !pressed {
+                    self.app.key_up(&event.logical_key);
+                    if self.app.has_damage() {
+                        window.request_redraw();
+                    }
+                }
                 // Repeats go on too: a dialog, an Info box or a browser folder cell takes them (typing, moving through a
                 // list), and `App::key` keeps those of the piano roll's moving and copying keys (spec: ui/piano-keys.md
                 // §4 rule 1).

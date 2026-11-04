@@ -24,9 +24,14 @@ plays once, and a looping voice is released at the song's end so a render finish
 ## Shipping
 
 - [x] **Prebuilt binaries for Windows, macOS and Linux.** Every tag runs
-  [release.yml](../.github/workflows/release.yml): it builds the program and every plugin, packages the program with
-  its icon and desktop entry (Linux) or app bundle (macOS), packages the plugin bundles for other DAWs, and attaches
-  all of it to the GitHub release as a prerelease.
+  [release.yml](../.github/workflows/release.yml): it builds the program and every plugin, then
+  `cargo run -p package -- --platform <platform> --profile release` stages the package — the program, its icon and
+  desktop entry (Linux) or app bundle (macOS), the plugin bundles for other DAWs, and the release notes — checks that
+  layout, and only then archives it, so a missing artifact fails before the tag rather than at download time. CI runs
+  the same tool and check on Linux for every push ([ci.yml](../.github/workflows/ci.yml)). Here it staged
+  `dist/lemon-studio-linux-x64` from the real debug build (50 plugin bundles: 25 VST3, 25 CLAP) and the check exited 0;
+  renaming `lemonstudio.desktop` made the check exit 1 naming it, and restoring it made it exit 0 again. Remaining: the
+  Windows and macOS packages are staged by the same tool in CI, which cannot be observed from this container.
 - [ ] **macOS signing and notarization actually applied.** The release workflow signs with a Developer ID and
   notarizes when `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`, `MACOS_NOTARY_APPLE_ID`,
   `MACOS_NOTARY_TEAM_ID` and `MACOS_NOTARY_PASSWORD` are set; without them the build stays ad hoc signed. Remaining: the

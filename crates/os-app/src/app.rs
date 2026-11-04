@@ -3767,6 +3767,9 @@ impl App {
         let s = &mut self.state;
         if s.shown(Win::Tapper) && s.in_front(Win::Tapper) {
             s.hide(Win::Tapper);
+            // The window's temporary mute goes with it; the settings stay.
+            s.tapper.now_mute_until = None;
+            crate::tapper::set_mute_gain(1.0);
         } else {
             if !s.tapper.placed {
                 let (w, h) = views::tapper::SIZE;
@@ -3793,6 +3796,14 @@ impl App {
                     }
                 }
             }
+            TapAct::Sync => {
+                crate::tapper::toggle_sync();
+            }
+            TapAct::Mute => {
+                crate::tapper::toggle_mute();
+                self.tapper_mute_apply(std::time::Instant::now());
+            }
+            TapAct::Now => self.tapper_now(),
             // Held while playing (§6): the engine runs 2 % slower / faster until the release; stopped, it does nothing.
             TapAct::Nudge(n) => {
                 if self.transport.playing() && !self.transport.paused() {
@@ -3803,26 +3814,108 @@ impl App {
         self.damage_win(Win::Tapper);
     }
 
+    /// Sets the temporary tapper mute from the Mute switch and "now". Mute holds the first two taps silent and fades
+    /// in over the next three, letting go when the count lapses (no tap for FIRST_GAP); Now is silent for four bars,
+    /// then comes back at once. Only a playing, visible tapper mutes; stopping or closing it restores full volume.
+    fn tapper_mute_apply(&mut self, now: std::time::Instant) {
+        let playing = self.transport.playing() && !self.transport.paused();
+        let shown = self.state.shown(Win::Tapper);
+        if !playing || !shown {
+            self.state.tapper.now_mute_until = None;
+        } else if self.state.tapper.now_mute_until.is_some_and(|until| now >= until) {
+            self.state.tapper.now_mute_until = None;
+        }
+        let now_on = self.state.tapper.now_mute_until.is_some();
+        let taps = self.state.tapper.count.taps();
+        let lapsed = self.state.tapper.count.last().is_some_and(|last| self.state.tapper.clock() - last >= crate::tapper::FIRST_GAP);
+        let target = if !playing || !shown {
+            1.0
+        } else if now_on {
+            0.0
+        } else if crate::tapper::get().mute && !lapsed {
+            match taps {
+                1 | 2 => 0.0,
+                3 => 1.0 / 3.0,
+                4 => 2.0 / 3.0,
+                _ => 1.0,
+            }
+        } else {
+            1.0
+        };
+        if (crate::tapper::mute_gain() - target).abs() > 1e-4 {
+            crate::tapper::set_mute_gain(target);
+            if shown {
+                self.damage_win(Win::Tapper);
+            }
+        }
+    }
+
+    /// Now: four bars at the current tempo, silent from this moment, then back to full volume on the tick after the
+    /// deadline. Stopped playback has nothing to mute.
+    fn tapper_now(&mut self) {
+        if !self.transport.playing() || self.transport.paused() {
+            return;
+        }
+        let p = &self.state.project;
+        let bars = 4.0 * f64::from(p.bar_ticks());
+        let secs = bars * 60.0 / p.tick_tempo(self.state.tempo).max(1.0);
+        self.state.tapper.now_mute_until = Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(secs.max(0.05)));
+        self.tapper_mute_apply(std::time::Instant::now());
+    }
+
+    /// Sync: the first tap of a count puts the playing bar back on its downbeat, so the tap lands on beat one. Audio
+    /// clips already follow the project tempo, so the same restart leaves them aligned with the new BPM.
+    fn tapper_resync(&mut self) {
+        let (playing, paused, song, tick) = (self.transport.playing(), self.transport.paused(), self.transport.song(), self.transport.tick());
+        if !playing || paused {
+            return;
+        }
+        let tick = tick.max(0.0) as u32;
+        let downbeat = if song {
+            let markers = self.state.project.arrangement().map_or(&[][..], |a| &a.markers);
+            let regions = self.state.project.marker_bars(markers);
+            let (start, bar, _) = regions.iter().rev().find(|r| r.0 <= tick).copied().unwrap_or(regions[0]);
+            start + tick.saturating_sub(start) / bar.max(1) * bar.max(1)
+        } else {
+            crate::piano::bar_start(&self.state, tick)
+        };
+        if song {
+            self.state.playlist.pos = downbeat;
+            self.play_song_from(downbeat);
+        } else {
+            self.state.piano.marker = downbeat;
+            self.state.piano.marker_placed = true;
+            self.transport.stop();
+            self.start_playback();
+        }
+    }
+
     /// A tap at `t` seconds on the tapper's clock: it counts (§2), lights the pad (§4), clicks (the metronome's Tick,
     /// accented on the taps the beat bar shows orange, §8) and, with Apply tempo on, a new tempo becomes the project
     /// tempo (§5).
     fn tap(&mut self, t: f64) {
         let tp = &mut self.state.tapper;
         let bpm = tp.count.tap(t);
+        let first = bpm.is_none();
         tp.flash_at = Some(std::time::Instant::now());
         tp.flash = 1.0;
         let accent = tp.count.bar().is_some_and(|(_, accent)| accent);
         #[cfg(test)]
         tp.test_clicks.push(accent);
-        #[cfg(not(test))]
-        self.transport.tap_click(accent);
         // A count's taps make one undo step; a new count, a new one.
-        if bpm.is_none() {
+        if first {
             self.state.history.end_run();
         }
         if let Some(bpm) = bpm.filter(|_| crate::tapper::get().apply) {
             crate::control::edit_run(self, crate::control::command::TEMPO, crate::control::command::Region::Settings, crate::history::Run::Tap, |app| app.set_tempo(bpm));
         }
+        self.tapper_mute_apply(std::time::Instant::now());
+        if first && crate::tapper::get().sync {
+            self.tapper_resync();
+            self.tapper_mute_apply(std::time::Instant::now());
+        }
+        #[cfg(not(test))]
+        self.transport.tap_click(accent);
         self.damage_win(Win::Tapper);
     }
 
@@ -4176,6 +4269,10 @@ impl App {
         // The tapper's pad fades back after a tap (spec: ui/tempo-tapper.md §4).
         if self.state.tapper.fade(now) && self.state.shown(Win::Tapper) {
             self.damage_rect(views::tapper::pad_rect(&self.state));
+        }
+        // A "now" mute ends on its own; a stopped or closed tapper never leaves playback muted.
+        if self.state.tapper.now_mute_until.is_some() || crate::tapper::mute_gain() < 1.0 {
+            self.tapper_mute_apply(now);
         }
         // Mixer meters (spec: ui/mixer.md §9): fall back after playback stops.
         let peaks = self.transport.take_track_peaks();
@@ -13693,11 +13790,14 @@ mod tests {
         assert_eq!(views::tapper::rect(&app.state), Rect::new(882.0, 393.0, 156.0, 294.0), "156 x 294, centred over the main window");
         let row = bar_model(&app.state)[VIEW].rows.iter().find(|r| r.label == "Tap tempo").cloned().unwrap();
         assert_eq!((row.enabled, row.mark, row.shortcut), (true, Mark::Check(true), "Ctrl+F5"));
-        // The hints; the controls that do nothing yet only say so.
+        // Every control is live and says what it does.
         let hint = |app: &App, a: &Action| app.hits.iter().rev().find(|h| &h.action == a).map(|h| h.hint.to_string()).unwrap();
         assert_eq!(hint(&app, &Action::Tapper(TapAct::Pad)), "Tap me, or press any key on your MIDI keyboard");
         assert_eq!(hint(&app, &Action::Tapper(TapAct::Nudge(-1))), "Nudge tempo to align time (Left / pitch bend)");
         assert_eq!(hint(&app, &Action::Tapper(TapAct::Nudge(1))), "Nudge tempo to align time (Right / pitch bend)");
+        assert_eq!(hint(&app, &Action::Tapper(TapAct::Sync)), "First tap of a count realigns playback to the bar's downbeat");
+        assert_eq!(hint(&app, &Action::Tapper(TapAct::Mute)), "Mute all audio during first taps (during playback)");
+        assert_eq!(hint(&app, &Action::Tapper(TapAct::Now)), "Mute now, for a few bars (during playback)");
         // A nudge is held while playing only, and any release lets it go (spec §6).
         app.act(Action::Tapper(TapAct::Nudge(1)));
         assert_eq!(crate::tapper::nudging(), 0, "stopped: nothing");
@@ -13716,13 +13816,6 @@ mod tests {
         app.key_up(&Key::Named(NamedKey::ArrowRight));
         assert_eq!(crate::tapper::nudging(), 0);
         app.transport.stop();
-        for name in [
-            "Resynchronize to taps",
-            "Mute all audio during first taps (during playback)",
-            "Mute now, for a few bars (during playback)",
-        ] {
-            assert_eq!(hint(&app, &Action::Placeholder(name)), format!("{name}: not available yet"));
-        }
 
         // Apply tempo on (the default): from the second tap, every tempo is the project's.
         let pad = hit_rect(&app, &Action::Tapper(TapAct::Pad));
@@ -13805,6 +13898,74 @@ mod tests {
         assert!(app.state.shown(Win::Tapper) && app.state.in_front(Win::Tapper));
         click(&mut app, &mut c, b);
         assert!(!app.state.shown(Win::Tapper));
+    }
+
+    /// The tapper's Sync, Mute and Now controls: each is a live hit in the window, Sync puts the playing bar back on
+    /// its downbeat on a count's first tap, Mute fades playback back in over the first taps, and Now mutes for four bars.
+    #[test]
+    fn tempo_tapper_sync_mute_and_now() {
+        use crate::tapper::TapAct;
+        use std::time::{Duration, Instant};
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let mut app = App::new(None);
+        app.act(Action::ToggleWin(Win::Tapper));
+        frame(&mut app, &mut c, None);
+        let sync = hit_rect(&app, &Action::Tapper(TapAct::Sync));
+        let mute = hit_rect(&app, &Action::Tapper(TapAct::Mute));
+        let now = hit_rect(&app, &Action::Tapper(TapAct::Now));
+        let pad = hit_rect(&app, &Action::Tapper(TapAct::Pad));
+
+        // Sync: a count's first tap restarts the bar under the playhead from its downbeat.
+        assert!(!crate::tapper::get().sync);
+        click(&mut app, &mut c, sync);
+        assert!(crate::tapper::get().sync);
+        app.state.song_mode = false;
+        app.transport.pretend_at(500.0, false);
+        let downbeat = crate::piano::bar_start(&app.state, 500);
+        app.state.tapper.test_time = Some(1.0);
+        click(&mut app, &mut c, pad);
+        assert_eq!(app.state.piano.marker, downbeat, "the playing bar realigns on its downbeat");
+        // A later tap of the same count does not restart it again.
+        app.state.piano.marker = 0;
+        app.transport.pretend_at(500.0, false);
+        app.state.tapper.test_time = Some(1.5);
+        click(&mut app, &mut c, pad);
+        assert_eq!(app.state.piano.marker, 0, "only the first tap of a count resynchronizes");
+        click(&mut app, &mut c, sync);
+        assert!(!crate::tapper::get().sync);
+
+        // Mute: the first two taps are silent, then playback fades in over the next three.
+        app.transport.pretend_at(10.0, false);
+        click(&mut app, &mut c, mute);
+        assert!(crate::tapper::get().mute);
+        for (i, (t, want)) in [(10.0, 0.0), (10.5, 0.0), (11.0, 1.0 / 3.0), (11.5, 2.0 / 3.0), (12.0, 1.0)].into_iter().enumerate() {
+            app.state.tapper.test_time = Some(t);
+            click(&mut app, &mut c, pad);
+            assert!((crate::tapper::mute_gain() - want).abs() < 1e-4, "tap {i}: gain {} want {want}", crate::tapper::mute_gain());
+        }
+
+        // If the taps stop, the mute lets go instead of holding playback silent forever.
+        app.state.tapper.test_time = Some(20.0);
+        click(&mut app, &mut c, pad);
+        assert_eq!(crate::tapper::mute_gain(), 0.0, "a one-tap count starts silent");
+        app.state.tapper.test_time = Some(20.0 + crate::tapper::FIRST_GAP);
+        app.tick();
+        assert_eq!(crate::tapper::mute_gain(), 1.0, "a lapsed count lets go");
+
+        // Now mutes at once and comes back after its four bars.
+        click(&mut app, &mut c, now);
+        assert_eq!(crate::tapper::mute_gain(), 0.0);
+        assert!(app.state.tapper.now_mute_until.is_some());
+        app.state.tapper.now_mute_until = Some(Instant::now() - Duration::from_millis(1));
+        app.tick();
+        assert_eq!(crate::tapper::mute_gain(), 1.0, "the four bars are over");
+        assert!(app.state.tapper.now_mute_until.is_none());
+
+        // Turning Mute off restores playback; closing the tapper never leaves it muted.
+        click(&mut app, &mut c, mute);
+        assert!(!crate::tapper::get().mute);
+        assert_eq!(crate::tapper::mute_gain(), 1.0);
+        crate::tapper::set_mute_gain(1.0);
     }
 
     /// While the tapper is open, typing-keyboard notes and Touch controller presses tap like MIDI keys, a chord once

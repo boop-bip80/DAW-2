@@ -2083,6 +2083,12 @@ impl Session {
         if song && at.tick > 0.0 && !at.paused {
             r.gain = 0.0;
         }
+        // The Tempo tapper's temporary mute follows playback, not live notes or previews. A stream that starts while
+        // it is engaged starts at that gain, so a resync does not let a blip through.
+        if song {
+            r.duck_src = Some(crate::tapper::mute_gain_flag());
+            r.duck = crate::tapper::mute_gain();
+        }
         let detach = Detach(r.detach.clone());
         device.add(Box::new(r))?;
         Ok(Session { _detach: detach, feed, kind, engine, done, ctl, generation, project: project.clone(), mode, rate, truncated: at.truncated })
@@ -2128,6 +2134,9 @@ struct Renderer {
     /// Output gain, ramped toward 1 (playing) or 0 (paused) by `step` per frame.
     gain: f32,
     step: f32,
+    /// The Tempo tapper's temporary mute (1 = not muted), read every block, and the gain it is ramping toward it.
+    duck_src: Option<Arc<AtomicU32>>,
+    duck: f32,
     /// Feed the monitor tap with what this stream outputs.
     tap: bool,
     /// Its session let go of it (`Detach`): the device no longer plays it.
@@ -2144,7 +2153,7 @@ impl Renderer {
         // A stream that starts paused (moved to new audio settings while paused) starts silent.
         let gain = if ctl.paused.load(Ordering::Relaxed) { 0.0 } else { 1.0 };
         let other = Vec::with_capacity(queue.w * 2 * 8192);
-        Renderer { queue, wake: None, inline: None, ctl, done, shared, gain, step, tap: false, detach: Arc::new(AtomicBool::new(false)), asked: None, other }
+        Renderer { queue, wake: None, inline: None, ctl, done, shared, gain, step, duck_src: None, duck: 1.0, tap: false, detach: Arc::new(AtomicBool::new(false)), asked: None, other }
     }
 
     /// Renders one block (see `render_block`) and copies it to the monitor tap, unless the stream is held.
@@ -2163,6 +2172,7 @@ impl Renderer {
     fn render_block(&mut self, stereo: &mut [f32]) {
         let w = self.queue.w;
         let target = if self.ctl.paused.load(Ordering::Relaxed) { 0.0 } else { 1.0 };
+        let duck_target = self.duck_src.as_ref().map_or(1.0, |g| f32::from_bits(g.load(Ordering::Relaxed)).clamp(0.0, 1.0));
         if self.gain == 0.0 && target == 0.0 {
             stereo.fill(0.0);
             return;
@@ -2212,11 +2222,12 @@ impl Renderer {
                 }
             }
         }
-        if self.gain != 1.0 || target != 1.0 {
+        if self.gain != 1.0 || target != 1.0 || self.duck != 1.0 || duck_target != 1.0 {
             for f in stereo.chunks_exact_mut(w) {
                 self.gain = if self.gain < target { (self.gain + self.step).min(target) } else { (self.gain - self.step).max(target) };
+                self.duck = if self.duck < duck_target { (self.duck + self.step).min(duck_target) } else { (self.duck - self.step).max(duck_target) };
                 for s in f {
-                    *s *= self.gain;
+                    *s *= self.gain * self.duck;
                 }
             }
         }
@@ -2460,6 +2471,34 @@ mod tests {
         assert!((frames as f64 / 48000.0 - secs).abs() < 0.01, "file holds {frames} frames");
         let samples = bytes[44..].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs());
         assert!(samples.fold(0.0f32, f32::max) > 0.01, "the notes are heard");
+    }
+
+    /// The Tempo tapper's mute silences the playback without pausing it: the position keeps moving and full level
+    /// returns when the mute ends.
+    #[test]
+    fn tapper_mute_silences_without_stopping_playback() {
+        let (e, _) = looping_engine();
+        let (mut r, _, shared) = renderer(e);
+        let flag = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        r.duck_src = Some(flag.clone());
+        let mut block = vec![0.0f32; 512 * 2];
+        for _ in 0..20 {
+            r.render(&mut block);
+        }
+        assert!(block.iter().any(|s| s.abs() > 0.0), "playing audibly");
+        let before = shared.position.load(Ordering::Relaxed);
+        flag.store(0.0f32.to_bits(), Ordering::Relaxed);
+        for _ in 0..4 {
+            r.render(&mut block);
+        }
+        assert!(block.iter().all(|s| s.abs() < 1e-9), "muted");
+        let during = shared.position.load(Ordering::Relaxed);
+        assert!(during > before, "playback keeps moving ({before} -> {during})");
+        flag.store(1.0f32.to_bits(), Ordering::Relaxed);
+        for _ in 0..4 {
+            r.render(&mut block);
+        }
+        assert!(block.iter().any(|s| s.abs() > 0.0), "back at full level");
     }
 
     /// Playback started in the middle of the song comes in from silence over the fade, then at full level.

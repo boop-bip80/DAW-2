@@ -154,29 +154,28 @@ pub fn paint(ui: &mut Ui, s: &State, _f: &FrameInfo) {
     label(ui, nf, left.cx() + 2.0, left.cy(), true, text(hov_l, held < 0), "- nudge");
     label(ui, nf, right.cx() - 2.0, right.cy(), true, text(hov_r, held > 0), "nudge +");
 
-    // Sync, Mute (switches) and now (a button): not available yet (§6, §8); with Apply tempo off FL greys them too.
+    // Sync and Mute (switches) and now (a button): Sync realigns the first tap of a count with the bar's downbeat;
+    // Mute ducks the first taps and fades back in; now mutes four bars at once (§6, §8).
     let lf = Font::new(14);
     let cy = y0 + 231.0;
-    ui.off(at(5.0, 222.0, 43.0, 18.0), "Resynchronize to taps");
-    led(ui, x0 + 14.0, cy, set.sync, false, true);
-    label(ui, lf, x0 + 26.0, cy, false, dim, "Sync");
-    ui.off(at(59.0, 222.0, 48.0, 18.0), "Mute all audio during first taps (during playback)");
-    led(ui, x0 + 68.0, cy, set.mute, false, true);
-    label(ui, lf, x0 + 79.0, cy, false, dim, "Mute");
+    let hov_sync = ui.hit(at(5.0, 222.0, 43.0, 18.0), Action::Tapper(TapAct::Sync), "First tap of a count realigns playback to the bar's downbeat");
+    led(ui, x0 + 14.0, cy, set.sync, hov_sync, false);
+    label(ui, lf, x0 + 26.0, cy, false, if set.sync { t.pill } else if hov_sync { t.tx(0xe2e6e8) } else { dim }, "Sync");
+    let hov_mute = ui.hit(at(59.0, 222.0, 48.0, 18.0), Action::Tapper(TapAct::Mute), "Mute all audio during first taps (during playback)");
+    led(ui, x0 + 68.0, cy, set.mute, hov_mute, false);
+    label(ui, lf, x0 + 79.0, cy, false, if set.mute { t.pill } else if hov_mute { t.tx(0xe2e6e8) } else { dim }, "Mute");
     let now = at(109.0, 219.0, 42.0, 25.0);
-    ui.off(now, "Mute now, for a few bars (during playback)");
+    let now_on = tap.now_mute_until.is_some();
+    let hov_now = ui.hit(now, Action::Tapper(TapAct::Now), "Mute now, for a few bars (during playback)");
     if lemon {
-        ui.c.stroke_rrect(now, lk::r_btn(t), 1.0, t.s(0x34383a));
+        let face = if now_on { t.s(0x3a2a1c) } else if hov_now { t.s(0x292d2f) } else { t.s(0x232628) };
+        ui.c.fill_rrect(now, lk::r_btn(t), face);
+        ui.c.stroke_rrect(now, lk::r_btn(t), 1.0, if now_on { t.pill } else { t.s(0x3c4042) });
     } else {
-        ui.c.fill_polygon(&[(now.x, now.y), (now.right(), now.y), (now.right(), now.bottom()), (now.x + 6.0, now.bottom())], t.s(0x1e2122));
+        let face = if now_on { t.s(0x3a2a1c) } else if hov_now { t.s(0x2a2e30) } else { t.s(0x1e2122) };
+        ui.c.fill_polygon(&[(now.x, now.y), (now.right(), now.y), (now.right(), now.bottom()), (now.x + 6.0, now.bottom())], face);
     }
-    label(ui, lf, now.cx() + 2.0, now.cy(), true, dim, "now");
-    if !lemon {
-        // Classic greys out by veiling the faces with the background.
-        for r in [Rect::new(left.x, left.y, right.right() - left.x, left.h), at(5.0, 222.0, 102.0, 18.0), now] {
-            ui.veil(r, bg);
-        }
-    }
+    label(ui, lf, now.cx() + 2.0, now.cy(), true, if now_on { t.pill } else if hov_now { t.tx(0xe2e6e8) } else { dim }, "now");
 
     // Apply tempo (§5).
     let ay = y0 + 261.0;

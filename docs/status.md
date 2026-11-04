@@ -325,8 +325,8 @@ arrangement's in SONG mode, the current pattern's in PAT mode, each marker start
 **Tempo tapper.** VIEW > Tempo tapper, Ctrl+F5 or the kick drum button on the toolbar: click the pad (or press
 a key on a MIDI keyboard, play a note on the typing keyboard, or press a Touch controller pad or key) in time. The average of the taps, in whole BPM, becomes the project tempo while Apply
 tempo is on; the beat bar counts the taps in groups of four. Each tap clicks with the metronome's Tick sound,
-the first of each four accented. Apply tempo is remembered between sessions. − nudge / nudge +, held while playing, run playback 2 % slower / faster
-until let go (the tempo stays); while the window is in front, the Left / Right arrows nudge the same way. Not yet: Sync, Mute and now (drawn greyed out).
+the first of each four accented. Apply tempo, Sync and Mute are remembered between sessions. − nudge / nudge +, held while playing, run playback 2 % slower / faster
+until let go (the tempo stays); while the window is in front, the Left / Right arrows nudge the same way. Sync, on, puts the playing bar back on its downbeat on the first tap of a count; audio clips already follow the tempo, so they stay aligned with the new BPM. Mute holds the first two taps of a count silent and fades playback in over the next three, letting go once two seconds pass without a tap; now mutes at once for four bars. Both temporary mutes end when playback stops or the tapper closes.
 
 **Closing windows.** VIEW > Close all windows (F12), Close all unfocused windows (Ctrl+F12: all but the one
 in front) and Close all plugin windows (Alt+F12: channel settings and plugin editors); the browser stays.

@@ -53,7 +53,6 @@ impl Tapper {
     }
 
     /// Taps in the current count (0 before the first).
-    #[cfg(test)]
     pub fn taps(&self) -> usize {
         self.taps
     }
@@ -86,13 +85,19 @@ impl Tapper {
     }
 }
 
-/// What the window's working controls do (Sync, Mute and now are not available yet).
+/// What the window's controls do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TapAct {
     /// The pad: a tap on press.
     Pad,
     /// The Apply tempo switch.
     Apply,
+    /// The Sync switch: the first tap of a count restarts the playing bar from its downbeat.
+    Sync,
+    /// The Mute switch: the first taps of a count duck playback and it fades back in as the count settles.
+    Mute,
+    /// Mute playback now for four bars.
+    Now,
     /// − nudge (-1) / nudge + (+1), held: playback runs slower / faster until the button is let go (§6).
     Nudge(i8),
 }
@@ -118,6 +123,32 @@ pub fn nudging() -> i8 {
     nudge_flag().load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The gain of the Tempo tapper's temporary mute (1 = not muted, 0 = silent), read by the playback renderer. Mute
+/// ducks the first taps of a count; now mutes four bars. One per test thread under tests, like the nudge.
+pub fn mute_gain_flag() -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+    use std::sync::{atomic::AtomicU32, Arc};
+    #[cfg(test)]
+    {
+        thread_local!(static TEST: Arc<AtomicU32> = Arc::new(AtomicU32::new(1.0f32.to_bits())));
+        TEST.with(Arc::clone)
+    }
+    #[cfg(not(test))]
+    {
+        static FLAG: std::sync::OnceLock<Arc<AtomicU32>> = std::sync::OnceLock::new();
+        FLAG.get_or_init(|| Arc::new(AtomicU32::new(1.0f32.to_bits()))).clone()
+    }
+}
+
+/// The tapper mute's gain now (`mute_gain_flag`).
+pub fn mute_gain() -> f32 {
+    f32::from_bits(mute_gain_flag().load(std::sync::atomic::Ordering::Relaxed)).clamp(0.0, 1.0)
+}
+
+/// Sets the tapper mute's gain, clamped to 0..=1.
+pub fn set_mute_gain(gain: f32) {
+    mute_gain_flag().store(gain.clamp(0.0, 1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The window's state: where it is (centred over the main window the first time, then where it was left, also in later
 /// runs: `layout`), the count and the pad's flash.
 pub struct TapperUi {
@@ -128,6 +159,8 @@ pub struct TapperUi {
     /// When the last tap lit the pad, while its flash fades, and how lit it is (1 at the tap, 0 when gone).
     pub flash_at: Option<Instant>,
     pub flash: f32,
+    /// The end of "now"'s four-bar mute (None: not muting now).
+    pub now_mute_until: Option<Instant>,
     /// The tapper's clock: taps are seconds since this.
     epoch: Instant,
     /// Tests tap at times of their own.
@@ -146,6 +179,7 @@ impl Default for TapperUi {
             count: Tapper::default(),
             flash_at: None,
             flash: 0.0,
+            now_mute_until: None,
             epoch: Instant::now(),
             #[cfg(test)]
             test_time: None,
@@ -186,8 +220,9 @@ impl TapperUi {
 pub struct Settings {
     /// New tempos set the project tempo.
     pub apply: bool,
-    /// Kept for when Sync and Mute work.
+    /// The first tap of a count restarts the playing bar from its downbeat.
     pub sync: bool,
+    /// The first taps of a count duck playback, which fades back in as the count settles.
     pub mute: bool,
 }
 
@@ -237,6 +272,22 @@ pub fn toggle_apply() -> bool {
     with(|s| {
         s.apply = !s.apply;
         s.apply
+    })
+}
+
+/// Toggles Sync and keeps it; returns the new state.
+pub fn toggle_sync() -> bool {
+    with(|s| {
+        s.sync = !s.sync;
+        s.sync
+    })
+}
+
+/// Toggles Mute and keeps it; returns the new state.
+pub fn toggle_mute() -> bool {
+    with(|s| {
+        s.mute = !s.mute;
+        s.mute
     })
 }
 
@@ -373,6 +424,19 @@ mod tests {
         assert!(ui.fade(t0 + std::time::Duration::from_millis(260)));
         assert_eq!((ui.flash, ui.flash_at), (0.0, None));
         assert!(!ui.fade(t0 + std::time::Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn sync_and_mute_toggles_are_kept() {
+        assert!(!get().sync && !get().mute);
+        assert!(toggle_sync());
+        assert!(get().sync);
+        assert!(!toggle_sync());
+        assert!(!get().sync);
+        assert!(toggle_mute());
+        assert!(get().mute);
+        assert!(!toggle_mute());
+        assert!(!get().mute);
     }
 
     #[test]

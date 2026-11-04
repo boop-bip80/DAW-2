@@ -30,12 +30,18 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
+            platform: windows
+            folder: lemon-studio-windows-x64
             package: lemon-studio-windows-x64.zip
           - name: Linux
             os: ubuntu-24.04
+            platform: linux
+            folder: lemon-studio-linux-x64
             package: lemon-studio-linux-x64.tar.gz
           - name: macOS
             os: macos-latest
+            platform: macos
+            folder: lemon-studio-macos
             package: lemon-studio-macos.zip
     steps:
       - uses: actions/checkout@v4
@@ -95,37 +101,31 @@ jobs:
             --password "$MACOS_NOTARY_PASSWORD" --wait
           xcrun stapler staple "$app"
 
-      - name: Package (Windows)
+      # The package, staged by the same tool a checkout runs: the program, the plugin bundles, the release notes and
+      # the platform's own entry (desktop entry and icon, app bundle, icon). The tool checks the layout as it stages it,
+      # so a missing artifact fails here instead of at download time.
+      - name: Package
+        run: cargo run -p package --locked -- --platform ${{ matrix.platform }} --profile release
+
+      - name: Archive the package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item target/release/lemonstudio.exe dist/
-          Copy-Item target/bundled dist/plugins -Recurse
-          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.package }}"
+        run: Compress-Archive -Path "dist/${{ matrix.folder }}/*" -DestinationPath "${{ matrix.package }}"
 
-      - name: Package (Linux)
+      - name: Archive the package (Linux)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/release/lemonstudio dist/
-          cp crates/os-app/assets/lemonstudio.desktop dist/
-          cp crates/os-app/assets/lemonstudio.png dist/
-          cp -r target/bundled dist/plugins
-          tar -czf "${{ matrix.package }}" -C dist .
+          tar -czf "${{ matrix.package }}" -C "dist/${{ matrix.folder }}" .
           # The same tree, zipped, for anyone who prefers it.
-          (cd dist && zip -qr "../lemon-studio-linux-x64.zip" .)
+          (cd "dist/${{ matrix.folder }}" && zip -qr "../../lemon-studio-linux-x64.zip" .)
 
-      - name: Package (macOS)
+      - name: Archive the package (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          mkdir -p dist
           # `ditto` keeps the bundle's signature and extended attributes; `zip` would break them.
-          ditto "target/bundled/Lemon Studio.app" "dist/Lemon Studio.app"
-          cp -R target/bundled dist/plugins
-          ditto -c -k --keepParent dist "${{ matrix.package }}"
+          ditto -c -k "dist/${{ matrix.folder }}" "${{ matrix.package }}"
 
       - uses: actions/upload-artifact@v4
         with:

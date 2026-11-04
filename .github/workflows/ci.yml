@@ -54,6 +54,16 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo run -p bundle-app --locked
 
+      # The package a release ships, staged from this build: a layout break fails here, not at download time. Linux is
+      # the platform whose package can be assembled anywhere (macOS needs the app bundle, Windows a Windows host).
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: cargo run -p package --locked -- --platform linux --profile debug
+
+      - name: Check the package layout (Linux)
+        if: runner.os == 'Linux'
+        run: cargo run -p package --locked -- check --platform linux --dir dist/lemon-studio-linux-x64
+
       # Every platform's crates: the notices test lists them with an offline `cargo tree --target all`.
       - name: Fetch
         run: cargo fetch --locked

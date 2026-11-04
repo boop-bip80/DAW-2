@@ -1,0 +1,13 @@
+[package]
+name = "package"
+description = "Stages and checks the package a release ships for a platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "package"
+path = "src/main.rs"
+test = false
+
+[dependencies]

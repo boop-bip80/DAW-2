@@ -537,6 +537,8 @@ impl App {
             self.state.message = self.params_automate(key, index);
             self.invalidate();
         }
+        // A Vocoder's input selectors are its sidechain bus: a change in its window reroutes the playing track now.
+        self.sync_vocoder_ports();
     }
 
     /// A plugin parameter set from outside its window (a remote control) to `level`, for automation recording.

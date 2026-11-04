@@ -2391,6 +2391,7 @@ impl App {
                 EDISON_FILE_NAME => self.plugins.edison_file_state(key),
                 LOVE_PHILTER_FILE_NAME => self.plugins.love_philter_file_state(key),
                 MAXIMUS_FILE_NAME => self.plugins.maximus_file_state(key),
+                crate::plugins::VOCODEX_FILE_NAME => self.plugins.vocoder_file_state(key),
                 file => self.plugins.recreation_file_state(key, file),
             };
             if let Some(st) = st {

@@ -133,6 +133,9 @@ pub struct Shared {
     engine_voices: Mutex<Vec<Weak<AtomicU32>>>,
     /// Disk recording into mixer tracks: where the playback's armed tracks hand their takes (`Transport::record_tracks`).
     record: Mutex<Option<Arc<dyn os_engine::RecordTap>>>,
+    /// Tests: the input ports sent for hosted effects since the last call.
+    #[cfg(test)]
+    last_ports: Mutex<Vec<(usize, usize, usize, usize)>>,
 }
 
 /// The frames queued when the device asked for a block, since they were last taken (`AheadStats::take`): what the
@@ -423,6 +426,8 @@ enum Cmd {
     Factory(Option<PathBuf>),
     /// Disk recording started or ended (`Transport::record_tracks`): the playback's engine takes it at once.
     Record,
+    /// A hosted effect's input ports changed: track, slot, main bus, first auxiliary bus.
+    EffectPorts(usize, usize, usize, usize),
     /// Tests: the open device fails as if it went away.
     #[cfg(test)]
     FailDevice,
@@ -528,6 +533,23 @@ impl Transport {
             slot.fx = list;
         }
         let _ = self.tx.send(Cmd::Instruments);
+    }
+
+    /// The input ports of the hosted plugin in `slot` of mixer track `track`: `main` for its main input bus, `aux` for
+    /// its first auxiliary one, each the number of a track's input counted from 1, or 0 for none. Playing engines hear
+    /// the new routing from their next block (spec: audio/sidechain.md "Hosted plugins' input buses").
+    pub fn set_effect_ports(&self, track: usize, slot: usize, main: usize, aux: usize) {
+        #[cfg(test)]
+        if let Ok(mut p) = self.shared.last_ports.lock() {
+            p.push((track, slot, main, aux));
+        }
+        let _ = self.tx.send(Cmd::EffectPorts(track, slot, main, aux));
+    }
+
+    /// Tests: the input ports sent for hosted effects since the last call, oldest first.
+    #[cfg(test)]
+    pub(crate) fn take_effect_ports(&self) -> Vec<(usize, usize, usize, usize)> {
+        self.shared.last_ports.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default()
     }
 
     /// Peak per mixer track (L, R) heard since the last call (the mixer meters' feed); resets them.
@@ -1427,6 +1449,13 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
                 }
                 for p in [held.as_mut().map(|h| &mut h.0), live_project.as_mut()].into_iter().flatten() {
                     edits.iter().for_each(|x| x.apply_to(p));
+                }
+            }
+            Ok(Cmd::EffectPorts(track, slot, main, aux)) => {
+                for s in [session.as_mut(), live.as_mut()].into_iter().flatten() {
+                    if let Ok(mut e) = s.engine.lock() {
+                        e.set_effect_ports(track, slot, main, aux);
+                    }
                 }
             }
             Ok(Cmd::Update) => {

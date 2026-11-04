@@ -479,8 +479,8 @@ and Touch controller. Kept with the program's settings, not the project. Which w
   unchanged. It plays the wet level, the pass-throughs, added noise, hold, attack and release (peak or RMS), band
   count, width and order; the original's built-in synth carrier, unison, pitch shift, contour and the band curves
   (other than where the bands start and end) are kept but not played. Its sound is Lemon Studio's own, not compared
-  with FL Studio's exports. Changing its input selectors reroutes the track only after the project is saved and
-  opened again
+  with FL Studio's exports. Changing its input selectors reroutes the track at once, in the same session, and switching
+  back to no input drops the sidechain; the saved project keeps the routing
 - Peak Controller: a project's Fruity Peak Controller slots open as Lemon Peak Controller (VST3 and CLAP, Pith editor)
   and save back unchanged; their controller links (kept byte for byte, formulas included) drive mixer volumes, pans,
   sends and plugin parameters one tick late, as in the original, within the fader's resolution of FL Studio 2026's

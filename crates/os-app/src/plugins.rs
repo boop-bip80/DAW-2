@@ -908,6 +908,24 @@ impl Plugins {
         fl_from_recreation_state(lemon, &p.save_state()?)
     }
 
+    /// The FL state of the Lemon Vocoder hosted under `key` with its input selectors as the instance has them now: the
+    /// plugin's own state may lag a parameter the host just set (it applies at its next block), while the selectors
+    /// must take effect and be saved at once (spec: plugins/lemon-vocoder.md §1).
+    pub fn vocoder_file_state(&self, key: usize) -> Option<Vec<u8>> {
+        use lemon_small_fx::vocoder as vc;
+        let mut state = self.recreation_file_state(key, VOCODEX_FILE_NAME)?;
+        let at = os_engine::effects::vocoder::settings_at(&state)?;
+        let infos = self.param_infos(key);
+        for (k, field) in [(vc::MOD_INPUT, os_engine::effects::vocoder::MOD_INPUT), (vc::CAR_INPUT, os_engine::effects::vocoder::CAR_INPUT)] {
+            let Some(info) = infos.iter().find(|i| i.name == vc::SETTINGS[k].name) else { continue };
+            let Some(n) = self.param_value(key, info.id) else { continue };
+            let (lo, hi) = vc::SETTINGS[k].range;
+            let v = (f64::from(lo) + n * f64::from(hi - lo)).round() as i32;
+            state[at + 4 * field..at + 4 * field + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        Some(state)
+    }
+
     /// Row `row`'s Lemon Sampler takes the stretch settings `sound` holds (§9b), keeping its other settings.
     pub fn set_sampler_stretch(&mut self, row: usize, sound: &os_model::ChannelSound) -> bool {
         self.set_sampler(row, None, &stretch_params(sound))

@@ -1836,6 +1836,12 @@ impl Engine {
         }
     }
 
+    /// The input ports of the hosted plugin in `slot` of track `track` (0 = none), for the live port command's tests.
+    pub fn effect_ports(&self, track: usize, slot: usize) -> Option<[usize; 2]> {
+        let fx = self.tracks.get(track)?.effects.iter().find(|e| e.slot == slot)?;
+        matches!(fx.fx, Fx::Hosted(_)).then_some(fx.ports)
+    }
+
     /// Ticks hosted plugins missed since the last call (each one still busy elsewhere after the tick's wait), heard as
     /// a gap on its channel or mixer track.
     pub fn take_missed(&mut self) -> u64 {
@@ -8334,6 +8340,19 @@ mod tests {
             assert!((keyed.0 - half(&own).0).abs() < 1e-4, "{key}: first half untouched: {keyed:?}");
             assert!(keyed.1 < half(&own).1 * 0.75, "{key}: ducked: {keyed:?} {:?}", half(&own));
         }
+    }
+
+    /// A hosted effect's input ports change while the engine runs: the next blocks use the new routing, no rebuild.
+    #[test]
+    fn hosted_effect_ports_update_at_once() {
+        let mut lib = SampleLibrary::new(None);
+        let mut e = Engine::new(&insert_project(), &mut lib, 44100, PlayMode::Pattern(1));
+        e.set_effect(1, 0, std::sync::Arc::new(std::sync::Mutex::new(KeyOut { own: false })));
+        assert_eq!(e.effect_ports(1, 0), Some([0, 0]));
+        e.set_effect_ports(1, 0, 0, 2);
+        assert_eq!(e.effect_ports(1, 0), Some([0, 2]), "the auxiliary bus takes input 2");
+        e.set_effect_ports(1, 0, 0, 0);
+        assert_eq!(e.effect_ports(1, 0), Some([0, 0]), "and back to no sidechain");
     }
 
     /// spec: audio/sidechain.md "Sidechain input": the input waits for the slots above the keyed one (a look-ahead),

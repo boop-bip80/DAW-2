@@ -204,17 +204,21 @@ pub fn wrapped_slot(s: &SlotPlugin) -> Option<PluginRef> {
     (s.name == WRAPPER).then(|| wrapper::decode(&s.state)).flatten()
 }
 
+/// The input a Vocodex slot's selectors name for its sidechain bus: its carrier selector's input, or else its
+/// modulator selector's (spec: plugins/lemon-vocoder.md §1).
+pub fn vocoder_key_input(state: &[u8]) -> usize {
+    os_engine::effects::vocoder::Settings::from_state(state).unwrap_or_default().routing().key_input()
+}
+
 /// The input ports a mixer slot's wrapped plugin is saved with: its main and first auxiliary input bus, each the number
 /// of a track's input counted from 1, 0 for none (spec: audio/sidechain.md "Hosted plugins' input buses"). A Vocodex
-/// slot (played by Lemon Vocoder) feeds its sidechain bus the input its carrier selector names, or else its modulator
-/// selector's (spec: plugins/lemon-vocoder.md §1).
+/// slot (played by Lemon Vocoder) feeds its sidechain bus the input its selectors name ([`vocoder_key_input`]).
 pub fn slot_ports(project: &Project, track: usize, slot: usize) -> (usize, usize) {
     let Some(s) = project.mixer.iter().find(|m| usize::from(m.index) == track).and_then(|m| m.slots.get(slot)?.as_ref()) else {
         return (0, 0);
     };
     if s.name.eq_ignore_ascii_case(crate::plugins::VOCODEX_FILE_NAME) {
-        let routing = os_engine::effects::vocoder::Settings::from_state(&s.state).unwrap_or_default().routing();
-        return (0, routing.key_input());
+        return (0, vocoder_key_input(&s.state));
     }
     if s.name != WRAPPER {
         return (0, 0);
@@ -314,6 +318,54 @@ pub fn slot_title(s: &SlotPlugin) -> String {
 }
 
 impl crate::app::App {
+    /// A Vocodex slot whose Lemon Vocoder moved an input selector in its window: the slot's saved state takes the
+    /// instance's state, and the playing engine hears the sidechain the new selectors name, at once (spec:
+    /// plugins/lemon-vocoder.md §1). Saving and reopening read the same state, so the routing stays.
+    pub(crate) fn sync_vocoder_ports(&mut self) {
+        let mut moved = Vec::new();
+        for &key in self.plugins.hosted.keys().filter(|&&k| k >= crate::plugins::FX_KEY) {
+            let Some((track, slot)) = fx_of(key) else { continue };
+            let Some(s) = self
+                .state
+                .project
+                .mixer
+                .iter()
+                .find(|m| m.index == track)
+                .and_then(|m| m.slots.get(usize::from(slot))?.as_ref())
+            else {
+                continue;
+            };
+            if !s.name.eq_ignore_ascii_case(crate::plugins::VOCODEX_FILE_NAME) {
+                continue;
+            }
+            let Some(state) = self.plugins.vocoder_file_state(key) else { continue };
+            let routing = |b: &[u8]| os_engine::effects::vocoder::Settings::from_state(b).unwrap_or_default().routing();
+            let (saved, live) = (routing(&s.state), routing(&state));
+            if saved != live {
+                // The sidechain bus follows the live routing; the slot state keeps every selector, even one the other
+                // masks (the carrier decides while it names an input), so saving and reopening keep it too.
+                moved.push((track, slot, live.key_input(), state, saved.key_input() != live.key_input()));
+            }
+        }
+        for (track, slot, port, state, ports_moved) in moved {
+            if let Some(s) = self
+                .state
+                .project
+                .mixer
+                .iter_mut()
+                .find(|m| m.index == track)
+                .and_then(|m| m.slots.get_mut(usize::from(slot))?.as_mut())
+            {
+                s.state = state;
+            }
+            if ports_moved {
+                self.transport.set_effect_ports(usize::from(track), usize::from(slot), 0, port);
+            }
+            // The running engine hears a port change at once; the dirty state carries the selectors to the next engine.
+            self.state.piano.dirty = true;
+        }
+    }
+
     /// Hosts the wrapped plugins of an opened project (spec: flp/events/plugins.md §4): each wrapped channel and slot
     /// whose plugin is found starts from the state the file holds, or from its defaults when only a copy in another
     /// format is found (the hint bar names those; a save keeps the file's wrapper for them until they are changed,
@@ -1135,6 +1187,67 @@ mod tests {
         let r = wrapped_slot(reload(&path).mixer[2].slots[0].as_ref().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!((std::path::PathBuf::from(&r.path), r.state), (exe, start));
+    }
+
+    /// A Vocodex slot's input selectors are its sidechain bus: moving one in Lemon Vocoder reroutes the playing
+    /// engine at once through the transport, with no save or reopen, and switching to no input drops the sidechain.
+    // spec: plugins/lemon-vocoder.md §1
+    #[test]
+    fn vocoder_input_selectors_reroute_live() {
+        use crate::plugins::VOCODEX_FILE_NAME;
+        use os_engine::effects::vocoder as dsp;
+        let mut a = App::new(None);
+        a.state.project = crate::app::test_project();
+        a.state.file = None;
+        a.state.path = None;
+        a.reset_hosted();
+        a.plugins.effects = crate::plugins::builtin_effects();
+        a.state.project.mixer[1].slots[0] = Some(os_model::SlotPlugin {
+            id: os_model::Id::NONE,
+            name: VOCODEX_FILE_NAME.into(),
+            state: dsp::default_state(),
+        });
+        a.sync_effects();
+        let key = fx_key(1, 0);
+        a.params_tick();
+        assert_eq!(slot_ports(&a.state.project, 1, 0), (0, 1), "the carrier's input is the sidechain at first");
+        assert!(a.transport.take_effect_ports().is_empty(), "opening a slot sends no port change");
+
+        // The carrier masks the modulator: moving the modulator is kept in the state, and the sidechain stays put.
+        assert!(a.plugins.set_param_named(key, "Modulator input", 3.0), "the modulator selector is a parameter");
+        a.params_tick();
+        let state = a.state.project.mixer[1].slots[0].as_ref().unwrap().state.clone();
+        assert_eq!(dsp::Settings::from_state(&state).unwrap().routing().modulator, 3, "the masked selector is kept");
+        assert_eq!(slot_ports(&a.state.project, 1, 0), (0, 1), "the carrier still names the sidechain");
+        assert!(a.transport.take_effect_ports().is_empty(), "a masked selector sends no port change");
+
+        // The user picks input 2 for the carrier (its parameter counts 0 = none, 1 = own track, 2 = input 1): the
+        // running engine hears it now, without a save or reopen.
+        assert!(a.plugins.set_param_named(key, "Carrier input", 3.0), "the carrier selector is a parameter");
+        a.params_tick();
+        assert_eq!(slot_ports(&a.state.project, 1, 0), (0, 2), "the slot's state is the instance's, at once");
+        assert_eq!(a.transport.take_effect_ports(), vec![(1, 0, 0, 2)], "the transport told the playing engine");
+        let state = a.state.project.mixer[1].slots[0].as_ref().unwrap().state.clone();
+        assert_eq!(dsp::Settings::from_state(&state).unwrap().routing().key_input(), 2);
+        // A save now writes the live routing, with the masked modulator too; reopening reads it back unchanged.
+        let path = std::env::temp_dir().join(format!("lemon-vocodex-live-{}.flp", std::process::id()));
+        a.save_to(path.clone());
+        let saved = os_flp::project::load(&os_flp::FlpFile::parse(&std::fs::read(&path).unwrap()).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let slot = saved.mixer[1].slots[0].as_ref().unwrap();
+        let routing = dsp::Settings::from_state(&slot.state).unwrap().routing();
+        assert_eq!((routing.modulator, routing.carrier), (3, 2), "the saved selectors are the live ones");
+
+        // Back to no sidechain input (the modulator is back to none too): aux 0, so the slot listens to nothing.
+        assert!(a.plugins.set_param_named(key, "Modulator input", 0.0));
+        a.params_tick();
+        assert!(a.transport.take_effect_ports().is_empty(), "the carrier still masks the modulator");
+        assert!(a.plugins.set_param_named(key, "Carrier input", 0.0));
+        a.params_tick();
+        assert_eq!(slot_ports(&a.state.project, 1, 0), (0, 0));
+        assert_eq!(a.transport.take_effect_ports(), vec![(1, 0, 0, 0)]);
+        let state = a.state.project.mixer[1].slots[0].as_ref().unwrap().state.clone();
+        assert_eq!(dsp::Settings::from_state(&state).unwrap().routing().key_input(), 0);
     }
 
     /// A wrapped plugin is found by class id, else by file and name, else by name.

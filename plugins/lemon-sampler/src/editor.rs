@@ -2889,7 +2889,7 @@ mod tests {
         let l = logic(0);
         let rate = 44100u32;
         let sine: Vec<f32> = (0..rate).map(|i| (std::f32::consts::TAU * 100.0 * i as f32 / rate as f32).sin() * 0.8).collect();
-        let s = os_engine::Sample { rate, left: sine.clone(), right: sine };
+        let s = os_engine::Sample { rate, left: sine.clone(), right: sine, loop_range: None };
         let tones = os_dsp::tone::Tones::analyse_stereo(&s.left, &s.right, s.rate);
         let waves = Waves::new(Mode::Multiband, &[]);
         let draw = |tones: Option<(&os_dsp::tone::Tones, &Waves)>| {
@@ -2992,7 +2992,7 @@ mod tests {
     fn picking_a_realtime_method_sets_time_to_the_sample() {
         let shared = Arc::new(Shared::default());
         // 6.4 s at 130 BPM: 2662.4 / 192 beats, stored as 2662.
-        *shared.raw.lock().unwrap() = Some(Arc::new(os_engine::Sample { rate: 1000, left: vec![0.0; 6400], right: vec![0.0; 6400] }));
+        *shared.raw.lock().unwrap() = Some(Arc::new(os_engine::Sample { rate: 1000, left: vec![0.0; 6400], right: vec![0.0; 6400], loop_range: None }));
         shared.set_tempo(130.0);
         let mut l = Logic::new(Arc::new(SamplerParams::default()), shared, None);
         paint(&mut l);

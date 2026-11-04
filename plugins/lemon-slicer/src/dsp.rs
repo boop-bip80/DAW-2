@@ -228,7 +228,7 @@ mod tests {
         let mut st = State::default();
         st.slices = vec![Slice::at(0), Slice::at(100), Slice::at(300)];
         st.slices[2].flags = 1;
-        Kit::new(Arc::new(Sample { rate: 1000, left, right }), &st)
+        Kit::new(Arc::new(Sample { rate: 1000, left, right, loop_range: None }), &st)
     }
 
     fn plain() -> Block {

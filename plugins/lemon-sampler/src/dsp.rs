@@ -23,7 +23,9 @@ use crate::stream::{Feed, Played};
 pub fn stretch(s: &Sample, ratio: f64, shift: f64) -> Sample {
     let frames = (s.frames() as f64 * ratio).round().max(1.0) as usize;
     let (left, right) = os_dsp::stretch::whole(&s.left, &s.right, s.rate, frames, shift);
-    Sample { rate: s.rate, left, right }
+    // The loop moves with the frames it was stretched with.
+    let loop_range = s.loop_range.map(|(a, b)| ((a as f64 * ratio) as usize, (b as f64 * ratio) as usize));
+    Sample { rate: s.rate, left, right, loop_range }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1268,7 +1270,7 @@ mod tests {
 
     fn ramp(n: usize) -> Sample {
         let left: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
-        Sample { rate: 48000, right: left.clone(), left }
+        Sample { rate: 48000, right: left.clone(), left, loop_range: None }
     }
 
     #[test]
@@ -1343,7 +1345,7 @@ mod tests {
     #[test]
     fn host_gains_and_chokes_reach_one_voice() {
         let mut e = Engine::new(48000.0);
-        e.sample = Some(Arc::new(Sample { rate: 48000, left: vec![0.5; 48000], right: vec![0.5; 48000] }));
+        e.sample = Some(Arc::new(Sample { rate: 48000, left: vec![0.5; 48000], right: vec![0.5; 48000], loop_range: None }));
         let b = Block::default();
         e.note_on_id(60, 100.0 / 128.0, Some(1), &b);
         e.note_on_id(60, 100.0 / 128.0, Some(2), &b);
@@ -1416,7 +1418,7 @@ mod tests {
 
     fn sine(hz: f64, n: usize) -> Sample {
         let x: Vec<f32> = (0..n).map(|i| (2.0 * PI * hz * i as f64 / 48000.0).sin() as f32 * 0.5).collect();
-        Sample { rate: 48000, left: x.clone(), right: x }
+        Sample { rate: 48000, left: x.clone(), right: x, loop_range: None }
     }
 
     /// Frequency from the rising zero crossings.
@@ -1466,7 +1468,7 @@ mod tests {
     #[test]
     fn a_realtime_voice_with_nothing_to_stretch_plays_the_sample_as_it_is() {
         let x: Vec<f32> = (0..30000).map(|i| ((i * 7919 % 2003) as f32 / 2003.0 - 0.5) * (-(i as f32) / 9000.0).exp()).collect();
-        let s = Arc::new(Sample { rate: 44100, left: x.clone(), right: x });
+        let s = Arc::new(Sample { rate: 44100, left: x.clone(), right: x, loop_range: None });
         let mut plain = Engine::new(48000.0);
         plain.sample = Some(s.clone());
         let mut e = Engine::new(48000.0);
@@ -1527,7 +1529,7 @@ mod tests {
                 ((2.0 * PI * (50.0 * t + 110.0 / 30.0 * (1.0 - (-30.0 * t).exp()))).sin() * (-12.0 * t).exp() * 0.9) as f32
             })
             .collect();
-        let s = Sample { rate: 48000, left: x.clone(), right: x };
+        let s = Sample { rate: 48000, left: x.clone(), right: x, loop_range: None };
         let whole = stretch(&s, 2.0, 1.0);
         let mut e = Engine::new(48000.0);
         e.sample = Some(Arc::new(s));
@@ -1569,7 +1571,7 @@ mod tests {
     fn stretch_keeps_pitch_and_changes_length() {
         let n = 48000;
         let sine: Vec<f32> = (0..n).map(|i| (2.0 * PI * 440.0 * i as f64 / 48000.0).sin() as f32 * 0.5).collect();
-        let s = Sample { rate: 48000, left: sine.clone(), right: sine };
+        let s = Sample { rate: 48000, left: sine.clone(), right: sine, loop_range: None };
         let st = stretch(&s, 2.0, 1.0);
         assert_eq!(st.frames(), 2 * n);
         // A fifth up at the same length.

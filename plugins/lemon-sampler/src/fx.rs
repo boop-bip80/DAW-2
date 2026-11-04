@@ -109,7 +109,7 @@ pub fn build(raw: &Sample, src: &Source, k: &FxKey) -> Built {
         effects(&mut s, &mut lp, fx, src, rs);
     }
     let [left, right] = s;
-    Built { sample: Sample { rate: rate as u32, left, right }, looped: lp, per_file_frame }
+    Built { sample: Sample { rate: rate as u32, left, right, loop_range: None }, looped: lp, per_file_frame }
 }
 
 /// **(Lemon Studio)** When the played sample is the file's own frames as they are (no step of [`build`] changes them;
@@ -642,7 +642,7 @@ mod tests {
         let decay = |i: usize| (-(i as f32) / n as f32 * 3.0).exp();
         let left: Vec<f32> = (0..n).map(|i| v() * 0.5 * decay(i) + 0.05).collect();
         let right: Vec<f32> = (0..n).map(|i| v() * 0.5 * decay(i) - 0.03).collect();
-        Sample { rate, left, right }
+        Sample { rate, left, right, loop_range: None }
     }
 
     fn plain(s: &Sample) -> Built {
@@ -725,7 +725,7 @@ mod tests {
     // spec "The pass over each side": fades, boost and clip in the file's units.
     #[test]
     fn fades_boost_and_clip_follow_the_formulas() {
-        let s = Sample { rate: 44100, left: vec![0.5; 1025], right: vec![0.5; 1025] };
+        let s = Sample { rate: 44100, left: vec![0.5; 1025], right: vec![0.5; 1025], loop_range: None };
         // Fade in 1024: gain 1 - (1 - k/M) * 4, silent over the first three quarters.
         let b = build(&s, &Source::default(), &key(SampleFx { fade_in: 1024, ..SampleFx::default() }));
         assert_eq!(b.sample.left[700], 0.0);
@@ -744,7 +744,7 @@ mod tests {
     // spec "One-pole feedback": c = -0.75 at 0, +0.75 at 256: DC gains 0.571 and 4.
     #[test]
     fn the_feedback_tilts_the_sample() {
-        let s = Sample { rate: 44100, left: vec![0.1; 2000], right: vec![0.1; 2000] };
+        let s = Sample { rate: 44100, left: vec![0.1; 2000], right: vec![0.1; 2000], loop_range: None };
         let up = build(&s, &Source::default(), &key(SampleFx { feedback: 256, ..SampleFx::default() }));
         assert!((up.sample.left[1999] - 0.4).abs() < 1e-5, "{}", up.sample.left[1999]);
         let down = build(&s, &Source::default(), &key(SampleFx { feedback: 0, ..SampleFx::default() }));
@@ -766,7 +766,7 @@ mod tests {
         // A mono 16-bit file: Round(single(x * 32767)) / 32768, so positive values above 16384 come out one step lower
         // (16384 itself gives 16383.5, which rounds to the even 16384).
         let v = [16385.0 / 32768.0, 0.5, -0.5, 0.25];
-        let m = Sample { rate: 44100, left: v.to_vec(), right: v.to_vec() };
+        let m = Sample { rate: 44100, left: v.to_vec(), right: v.to_vec(), loop_range: None };
         let src = Source { int16_mono: true, ..Source::default() };
         let b = build(&m, &src, &key(SampleFx { stereo_delay: 2049, ..SampleFx::default() }));
         // Above 2048 the left side is the late one; both sides carry the changed values.
@@ -793,13 +793,13 @@ mod tests {
     // spec "Ping-pong", "Crossfade": the unfolded loop; the crossfade makes a loop of a file without one.
     #[test]
     fn ping_pong_and_crossfade_change_the_loop() {
-        let s = Sample { rate: 44100, left: (0..20).map(|i| i as f32).collect(), right: (0..20).map(|i| i as f32).collect() };
+        let s = Sample { rate: 44100, left: (0..20).map(|i| i as f32).collect(), right: (0..20).map(|i| i as f32).collect(), loop_range: None };
         let src = Source { file_loop: Some((5, 9)), ..Source::default() };
         let b = build(&s, &src, &key(SampleFx { ping_pong: true, ..SampleFx::default() }));
         assert_eq!(&b.sample.left[..16], &[0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 8., 7., 6., 10., 11., 12.]);
         assert_eq!(b.looped, Some((5, 12)));
         // Crossfade 1024 on a file without a loop: half the sample fades into its beginning, the loop starts there.
-        let s = Sample { rate: 44100, left: vec![1.0; 100], right: vec![1.0; 100] };
+        let s = Sample { rate: 44100, left: vec![1.0; 100], right: vec![1.0; 100], loop_range: None };
         let mut s2 = s.clone();
         s2.left[..50].iter_mut().for_each(|v| *v = 0.0);
         let b = build(&s2, &Source::default(), &key(SampleFx { crossfade: 1024, ..SampleFx::default() }));
@@ -811,7 +811,7 @@ mod tests {
     // spec "Trim": quiet ends dropped, the loop points keep their numbers.
     #[test]
     fn trim_drops_the_quiet_ends() {
-        let mut s = Sample { rate: 44100, left: vec![0.0; 300], right: vec![0.0; 300] };
+        let mut s = Sample { rate: 44100, left: vec![0.0; 300], right: vec![0.0; 300], loop_range: None };
         s.left[100..200].iter_mut().for_each(|v| *v = 0.5);
         let b = build(&s, &Source::default(), &key(SampleFx { trim: 1000, ..SampleFx::default() }));
         assert_eq!(b.sample.frames(), 100);
@@ -827,7 +827,7 @@ mod tests {
     // spec "Reverb": a tail of up to 22050 frames; the quiet end is dropped again.
     #[test]
     fn reverb_adds_a_tail() {
-        let mut s = Sample { rate: 44100, left: vec![0.0; 2000], right: vec![0.0; 2000] };
+        let mut s = Sample { rate: 44100, left: vec![0.0; 2000], right: vec![0.0; 2000], loop_range: None };
         s.left[0] = 1.0;
         s.right[0] = 1.0;
         for kind in [0, 1] {
@@ -839,7 +839,7 @@ mod tests {
             assert_eq!(b.sample.left[2500] == b.sample.right[2500], kind == 0, "type {kind}");
         }
         // Silence keeps one frame (not below 1), or the loop's end frame number.
-        let z = Sample { rate: 44100, left: vec![0.0; 2000], right: vec![0.0; 2000] };
+        let z = Sample { rate: 44100, left: vec![0.0; 2000], right: vec![0.0; 2000], loop_range: None };
         assert_eq!(build(&z, &Source::default(), &key(SampleFx { reverb: 128, ..SampleFx::default() })).sample.frames(), 1);
         let src = Source { file_loop: Some((10, 1500)), ..Source::default() };
         assert_eq!(build(&z, &src, &key(SampleFx { reverb: 128, ..SampleFx::default() })).sample.frames(), 1500);
@@ -848,7 +848,7 @@ mod tests {
     // spec "Files below 8000 Hz": converted to the output rate; the loop points move with the frames.
     #[test]
     fn files_below_8000_hz_are_converted() {
-        let s = Sample { rate: 6000, left: (0..600).map(|i| (i as f32 * 0.1).sin()).collect(), right: vec![0.0; 600] };
+        let s = Sample { rate: 6000, left: (0..600).map(|i| (i as f32 * 0.1).sin()).collect(), right: vec![0.0; 600], loop_range: None };
         let src = Source { file_loop: Some((100, 199)), ..Source::default() };
         let b = build(&s, &src, &key(SampleFx::default()));
         assert_eq!((b.sample.rate, b.sample.frames()), (44100, 4410));
@@ -856,7 +856,7 @@ mod tests {
         assert_eq!(b.per_file_frame, 7.35);
         // A whole frame of the file reads that frame (within the weights' rounding).
         assert!((b.sample.left[735 * 2] - s.left[200]).abs() < 1e-3);
-        let s8 = Sample { rate: 8000, ..s.clone() };
+        let s8 = Sample { rate: 8000, loop_range: None, ..s.clone() };
         assert_eq!(build(&s8, &src, &key(SampleFx::default())).sample, s8);
     }
 

@@ -859,7 +859,7 @@ mod tests {
         let mut p = LemonSampler::default();
         p.engine.set_rate(48000.0);
         let x: Vec<f32> = (0..48000).map(|i| (2.0 * std::f64::consts::PI * hz * i as f64 / 48000.0).sin() as f32 * 0.5).collect();
-        p.engine.sample = Some(Arc::new(Sample { rate: 48000, left: x.clone(), right: x }));
+        p.engine.sample = Some(Arc::new(Sample { rate: 48000, left: x.clone(), right: x, loop_range: None }));
         p
     }
 

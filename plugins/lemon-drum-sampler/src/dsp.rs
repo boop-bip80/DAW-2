@@ -338,7 +338,7 @@ mod tests {
 
     fn tone(rate: u32, frames: usize, amp: f32) -> Arc<Sample> {
         let v: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.07).sin() * amp).collect();
-        Arc::new(Sample { rate, left: v.clone(), right: v })
+        Arc::new(Sample { rate, left: v.clone(), right: v, loop_range: None})
     }
 
     /// A kit whose layers are tones: the kick pad (key 36) one, pad 1 (key 37) a soft and a hard one.

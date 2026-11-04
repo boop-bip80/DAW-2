@@ -186,8 +186,9 @@ clicking it does nothing. The full, item-by-item roadmap lives on the
   a graph edit is read on the next tick
   while audio runs. A slot container has no notes, so it does not add them. An unsupported legacy processor is reported
   by name and the container keeps its serial audio route with the notes unchanged, rather than silently dropping it.
-  Not yet: the original's Patcher slots
-  in imported projects (there is no format specification or fixtures for them) and note processors' MIDI output
+  Imported Patcher slots whose patch is one plain serial chain of effects open as containers, in chain order, with
+  each node's plugin and state; other Patcher patches and Patcher channels stay as the project had them, and the hint
+  says why. Not yet: those other Patcher patches and note processors' MIDI output
 - Instrument containers: the channel rack menu's Wrap in container (the original's Patcherize) moves a plugin
   channel's instrument, with its state, into a container on the channel, one undo step. The channel stays a channel
   (its name, steps, piano roll, mixer track, volume and pan); the container plays its notes through its plugins as its

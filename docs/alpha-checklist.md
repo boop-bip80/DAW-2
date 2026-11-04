@@ -96,9 +96,9 @@ sixteen effects and the Tesla audio editor; these are the gaps a project made in
   three-note overlap whose graph changes while all three are held and whose notes each keep their own onset, release and
   unprocessed duration). A slot container has no notes
   and does not add them. An unsupported legacy processor is reported by name and the container keeps its serial audio
-  route with the notes unchanged, rather than silently dropping it. Left: the
-  original's Patcher slots in imported projects (there is no format specification or fixtures for them yet) and note
-  processors' MIDI output. The channel rack's
+  route with the notes unchanged, rather than silently dropping it. Imported Patcher slots whose patch is one plain
+  serial chain of effects open as containers (2026-11-04; other Patcher patches and Patcher channels stay as they
+  were, named in the hint). Left: those other Patcher patches and note processors' MIDI output. The channel rack's
   Patcherize (Wrap in container) followed on 2026-10-30: the channel's instrument
   goes into a container on the channel that plays its notes, instruments and effects can be added (instruments layer
   at wet and dry 100 %), members are automated, linked, undone and saved as a slot container's are, and the old

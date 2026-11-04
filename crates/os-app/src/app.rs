@@ -1678,6 +1678,10 @@ impl App {
         crate::project_info::created(&mut app.state);
         app.mark_saved();
         if let Some(p) = path {
+            // A project opened at launch imports its Patcher slots as it opens, so the effects they may be played by
+            // have to be listed first; `start_plugins` loads them again with the first scan.
+            #[cfg(not(test))]
+            app.load_plugins();
             app.open(p);
         }
         app
@@ -1774,6 +1778,9 @@ impl App {
                 if let Some(f) = self.state.file.take() {
                     crate::lemon_state::apply(&mut self.state, &mut self.plugins, &f);
                     self.state.file = Some(f);
+                }
+                if let Some(m) = crate::patcher_import::open_patchers(&mut self.state, &self.plugins.effects) {
+                    self.state.message = Some(format!("{}. {m}", self.state.message.take().unwrap_or_default()));
                 }
                 self.mark_saved();
                 crate::missing::opened(self);

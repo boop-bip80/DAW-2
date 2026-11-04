@@ -76,6 +76,7 @@ mod midi_out;
 mod lemon_midi_out;
 mod midi_play;
 mod container;
+mod patcher_import;
 mod mixer;
 mod mixer_state;
 mod osc3;

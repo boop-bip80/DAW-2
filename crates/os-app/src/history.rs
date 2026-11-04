@@ -23,6 +23,7 @@
 // spec: ui/settings-choices.md "Undo history: the four checks (2026-10-16)"
 
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 
 use os_model::{ControlPoint, Note};
 
@@ -53,6 +54,8 @@ pub const PROJECT_SETTINGS: &str = "Project settings";
 pub const REPLACE_CHANNEL: &str = "Replace channel";
 /// A mixer track's audio input, output, record source or monitor mode changed (`track_io`).
 pub const MIXER_TRACK_IO: &str = "Mixer track audio input / output";
+/// The folder under a recording's own folder that undone takes wait in (`keep_recording`).
+pub const RECYCLE_BIN: &str = "Recycle bin";
 
 /// What a step changes, as it is on the other side of the step.
 #[derive(Debug, Clone, PartialEq)]
@@ -332,10 +335,21 @@ fn knob_name(id: KnobId) -> &'static str {
     }
 }
 
+/// A recording file placed by a step: undoing the step moves it out of the Recorded folder into the recycle bin,
+/// redoing it brings it back (General ▸ Undo history ▸ Move undone recordings to the trash).
+#[derive(Debug, Clone, PartialEq)]
+struct Recording {
+    path: PathBuf,
+    /// Where the file waits while the step is undone.
+    bin: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 struct Step {
     name: Cow<'static, str>,
     snap: Snap,
+    /// The files a recording step placed; empty for every other step.
+    recordings: Vec<Recording>,
 }
 
 /// The project's undo history (`State::history`).
@@ -468,12 +482,75 @@ pub fn record(s: &mut State, name: &'static str, snap: Snap) {
 pub fn record_named(s: &mut State, name: Cow<'static, str>, snap: Snap) {
     let h = &mut s.history;
     h.steps.truncate(h.done);
-    h.steps.push(Step { name, snap });
+    h.steps.push(Step { name, snap, recordings: Vec::new() });
     h.done = h.steps.len();
     h.undid = false;
     h.run = None;
     h.fresh = true;
     h.trim();
+}
+
+/// Keeps `path`, a WAV a recording step placed, with the newest step: undoing that step moves it to the recycle bin,
+/// redoing it brings it back. Called after the take's clip (or its audio clip channel) went in, so the step is the
+/// recording's.
+pub fn keep_recording(s: &mut State, path: &Path) {
+    let h = &mut s.history;
+    if h.done == 0 || h.done != h.steps.len() {
+        return;
+    }
+    let step = &mut h.steps[h.done - 1];
+    if step.recordings.iter().any(|r| r.path == path) {
+        return;
+    }
+    let name = path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("recording.wav"));
+    let dir = path.parent().unwrap_or_else(|| Path::new(".")).join(RECYCLE_BIN);
+    let mut bin = dir.join(name);
+    if bin.exists() || step.recordings.iter().any(|r| r.bin == bin) {
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "recording".into());
+        let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let mut n = 2;
+        loop {
+            bin = dir.join(format!("{stem} ({n}){ext}"));
+            if !bin.exists() && !step.recordings.iter().any(|r| r.bin == bin) {
+                break;
+            }
+            n += 1;
+        }
+    }
+    step.recordings.push(Recording { path: path.to_path_buf(), bin });
+}
+
+/// The files of the recording step being undone: those no playlist clip still plays move to their recycle bin.
+fn move_to_recycle_bin(s: &State, recordings: &[Recording]) {
+    let played = |path: &Path| {
+        let channel = |i: u16| s.project.channels.iter().find(|c| c.index == i).and_then(|c| c.sample_path.as_deref()).map(Path::new);
+        s.project.arrangement().is_some_and(|a| a.clips.iter().any(|c| match c.source {
+            os_model::ClipSource::Channel(i) => channel(i) == Some(path),
+            os_model::ClipSource::Pattern(_) => false,
+        }))
+    };
+    for r in recordings {
+        if played(&r.path) || !r.path.exists() {
+            continue;
+        }
+        if let Some(dir) = r.bin.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::rename(&r.path, &r.bin);
+    }
+}
+
+/// A redone recording step's files come back from the recycle bin before their clips play again.
+fn restore_recordings(recordings: &[Recording]) {
+    for r in recordings {
+        if r.path.exists() || !r.bin.exists() {
+            continue;
+        }
+        if let Some(dir) = r.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::rename(&r.bin, &r.path);
+    }
 }
 
 /// Adds to the newest step's commands (a plugin's values joining its step, `control::param_edit`), when it is done
@@ -600,7 +677,11 @@ pub fn undo(s: &mut State) -> Option<String> {
     h.done -= 1;
     (h.undid, h.run, h.fresh) = (true, None, false);
     let i = h.done;
+    let recordings = h.steps[i].recordings.clone();
     swap(s, i);
+    if prefs::check(&prefs::UNDONE_RECORDINGS_TO_BIN) {
+        move_to_recycle_bin(s, &recordings);
+    }
     Some(s.history.steps[i].name.to_string())
 }
 
@@ -611,7 +692,10 @@ pub fn redo(s: &mut State) -> Option<String> {
         return None;
     }
     let i = h.done;
+    let recordings = h.steps[i].recordings.clone();
     swap(s, i);
+    // A redo brings its take back wherever the setting stood when it was undone.
+    restore_recordings(&recordings);
     let h = &mut s.history;
     h.done += 1;
     (h.undid, h.run, h.fresh) = (false, None, false);

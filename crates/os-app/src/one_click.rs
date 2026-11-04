@@ -242,7 +242,10 @@ impl App {
         let track = crate::playlist::free_track(s, 0, start, start + len.max(1));
         let text = path.to_string_lossy();
         match crate::playlist::add_audio_clip_as(s, &text, track, start, RECORDED) {
-            Some(_) => format!("Recorded {}", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+            Some(_) => {
+                crate::history::keep_recording(s, path);
+                format!("Recorded {}", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())
+            }
             None => format!("{text} could not be read"),
         }
     }
@@ -374,5 +377,46 @@ mod tests {
         let path = std::path::PathBuf::from(&saved.path);
         assert!(path.exists() && path.parent().unwrap().ends_with("Recorded"), "{path:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Undoing a recording step moves its WAV out of the Recorded folder into the Recycle bin, and a redo brings it
+    /// back; with Move undone recordings to the trash off, the file stays. Ctrl+Z and Ctrl+Alt+Z drive it.
+    #[test]
+    fn undoing_a_take_moves_its_file_to_the_recycle_bin() {
+        let _one = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = app();
+        // The menu's Record entry (a device's input, into the playlist).
+        crate::playlist::run(&mut app, Cmd::OneClick(Input { device: "Test ASIO".into(), asio: true, first: 0, stereo: true }, false));
+        assert!(app.audio_rec.is_some(), "{:?}", app.state.message);
+        app.transport.pretend_at(0.0, true);
+        app.state.rec.armed = true;
+        app.one_click_tick();
+        capture().push(4800, |ch, f| if ch == 0 { f as f32 / 4800.0 } else { 0.5 });
+        app.transport.stop();
+        for _ in 0..500 {
+            app.one_click_tick();
+            if app.audio_rec.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.audio_rec.is_none(), "{:?}", app.state.message);
+        let path = std::path::PathBuf::from(app.state.project.channels.last().unwrap().sample_path.clone().unwrap());
+        let bin = path.parent().unwrap().join(crate::history::RECYCLE_BIN).join(path.file_name().unwrap());
+        assert!(path.exists() && !bin.exists(), "{path:?}");
+        // Ctrl+Z: the take's clip goes and its file waits in the recycle bin.
+        app.undo_key(false);
+        assert!(!path.exists(), "the undone take left the Recorded folder");
+        assert!(bin.exists(), "the undone take is in the recycle bin: {bin:?}");
+        // Ctrl+Alt+Z: the clip and its file come back.
+        app.undo_key(true);
+        assert!(path.exists() && !bin.exists(), "a redo brings the take back");
+        // Move undone recordings to the trash off: the file stays where it is.
+        crate::prefs::set_check(&crate::prefs::UNDONE_RECORDINGS_TO_BIN, false);
+        app.undo_key(false);
+        assert!(path.exists(), "the file stays with the option off");
+        crate::prefs::set_check(&crate::prefs::UNDONE_RECORDINGS_TO_BIN, true);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(bin.parent().unwrap());
     }
 }

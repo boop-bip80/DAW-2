@@ -685,9 +685,11 @@ and Touch controller. Kept with the program's settings, not the project. Which w
   on one goes back or forward to it
 - General settings ▸ Undo history: Maximum undo levels, Undo knob tweaks, Alternate undo mode, and showing the
   history in the browser, newest first if wanted
-- Not yet: "Put undone recordings in the recycle bin", which waits for recording. A plugin's own undo inside its
-  window is the plugin's, apart from the app's history; a state a plugin changes by itself without parameter edits
-  (its own preset browser) makes no step, as the host is not told
+- Undoing a take placed as an audio clip ("Recorded items") moves its WAV out of the Recorded folder into the
+  Recorded folder's Recycle bin, and a redo brings it back; General settings ▸ Undo history ▸ Move undone recordings
+  to the trash turns the move off, leaving the file where it is. A plugin's own undo inside its window is the
+  plugin's, apart from the app's history; a state a plugin changes by itself without parameter edits (its own
+  preset browser) makes no step, as the host is not told
 
 ## 🚧 Scripting and assistants
 

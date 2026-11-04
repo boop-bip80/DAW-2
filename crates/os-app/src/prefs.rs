@@ -283,8 +283,8 @@ pub const UNDO_KNOB_TWEAKS: Check = Check { key: "undo_knob_tweaks", label: "Und
 /// toggles the last move and Ctrl+Alt+Z steps back further (`history::ctrl_z`). EDIT follows. Spec: as above.
 pub const ALTERNATE_UNDO: Check = Check { key: "alternate_undo_mode", label: "Alternate undo mode", default: true };
 
-/// General ▸ Undo history: stored and shown only. Undoing a recording ("Recorded items") keeps its files in the
-/// Recorded folder for now, since a redo puts its clips back; nothing moves them to the trash yet. Spec: as above (not
+/// General ▸ Undo history: undoing a recording ("Recorded items") moves its WAV into the Recorded folder's Recycle
+/// bin, and a redo brings it back (`crate::history::keep_recording`); off, the file stays. Spec: as above (not
 /// measured).
 pub const UNDONE_RECORDINGS_TO_BIN: Check =
     Check { key: "undone_recordings_to_recycle_bin", label: "Move undone recordings to the trash", default: true };

@@ -124,7 +124,8 @@ Greyed-out controls and partial features. These can land alongside the blockers.
 - [x] **Undo for mixer track commands.** Routing, names, colours, resets, effect slots, audio input / output and
   latency settings, adding, moving, deleting and trimming tracks. Mute and solo make no step, as in FL Studio
 - [x] **Undo for the remaining edits.** A generator inserted higher up the rack, Replace, project info and the
-  timebase are each one step
+  timebase are each one step. Undoing a recording ("Recorded items") moves its WAV into the Recorded folder's Recycle
+  bin and a redo brings it back, or leaves it with Move undone recordings to the trash off (2026-11-04)
 - [ ] **Mixer right-click menus.** 4 entries greyed out on 2026-10-30, counted entry by entry after Insert from state
   (and File ▸ Open / Save mixer track state), Plugin delay compensation ▸ Automatic, View ▸ Waveforms and Extra
   properties, the slot menu's Scaling ▸ and Help, Mixer options ▸ Link all parameters... (the current track's own

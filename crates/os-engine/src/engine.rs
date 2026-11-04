@@ -1157,6 +1157,10 @@ pub struct Engine {
     /// which values are set in place rather than smoothed (playback's first tick after a start, seek or loop).
     auto_last: Vec<(os_model::target::Target, i64)>,
     auto_from: u64,
+    /// The project's main pitch in cents as pattern control points leave it (spec: audio/voice-levels.md "The main
+    /// pitch"), and its value at the start of playback, which a replay from another position starts from again.
+    main_pitch: i32,
+    init_main_pitch: i32,
     /// Controller links from slots to targets (spec: plugins/lemon-peak-controller.md "Links").
     ctl_links: Vec<controllers::CtlLink>,
     /// The project's initial values the engine can set (song mode), as automation values: a song that loops sets them
@@ -1613,6 +1617,8 @@ impl Engine {
             curves,
             auto_last: Vec::new(),
             auto_from: 0,
+            main_pitch: i32::from(project.main_pitch.unwrap_or(0)),
+            init_main_pitch: i32::from(project.main_pitch.unwrap_or(0)),
             ctl_links: controllers::links(project),
             init,
             rate,
@@ -2329,6 +2335,7 @@ impl Engine {
                     self.clock.set_tempo(self.rate, self.ppq, self.clock_tempo());
                 }
             }
+            CtlTo::Target(Target::Other(os_model::InitControl::MAIN_PITCH)) => self.set_main_pitch(e.value),
             CtlTo::Target(t) => {
                 if let Some(v) = point_level(t, e.value) {
                     self.set_auto_values(vec![(t, (v * 1_073_741_824.0).round() as i64)], len);
@@ -2375,6 +2382,14 @@ impl Engine {
         }
         // Automation values are handed on again from here, in place.
         self.auto_last.clear();
+        // The main pitch is the project's again; the points before `tick` set it as they are replayed below. The
+        // channels' rates were just put back to their stored ones by `reset`.
+        self.main_pitch = self.init_main_pitch;
+        for ch in &mut self.channels {
+            if ch.main.is_some() {
+                ch.main = Some(self.main_pitch);
+            }
+        }
         self.auto_from = tick;
         self.next_ctl = 0;
         self.params.points.clear();
@@ -2639,6 +2654,21 @@ impl Engine {
     /// `len`: the ticks volumes and pans glide over (0 = set in place). A value for a mixer track or slot whose audio
     /// is late waits the whole ticks that fit into the lateness; nothing waits on playback's first tick (spec:
     /// audio/delay-compensation.md "Automation waits for late audio").
+    /// Sets the main pitch (cents) and retunes every channel that follows it, so its new notes and the voices already
+    /// sounding both move (spec: audio/voice-levels.md "The main pitch").
+    fn set_main_pitch(&mut self, cents: i32) {
+        if cents == self.main_pitch {
+            return;
+        }
+        self.main_pitch = cents;
+        for ch in &mut self.channels {
+            if ch.main.is_some() {
+                ch.main = Some(cents);
+                ch.retune(ch.knob);
+            }
+        }
+    }
+
     fn set_auto_values(&mut self, values: Vec<(os_model::target::Target, i64)>, len: u32) {
         for (target, n) in values {
             let wait = if len == 0 { 0 } else { self.wait_ticks(target) };
@@ -4742,11 +4772,13 @@ fn ctl_to(kind: u32) -> CtlTo {
 
 /// The automation level (0..1) a point's value in its setting's own unit stands for: the inverse of what a clip's
 /// level becomes (`Engine::auto_value`; spec: audio/automation.md "Pattern control points"). `None` for the targets a
-/// point does not move (a send's unit is not measured).
+/// point does not move.
 fn point_level(t: Target, value: i32) -> Option<f64> {
     let v = f64::from(value);
     Some(match t {
         Target::MixerVolume(_) => v / 16000.0,
+        // A send's level is stored as its gain is (spec: audio/mixer.md "Sends").
+        Target::MixerSend(..) => v / 16000.0,
         Target::MixerPan(_) => (v / 6400.0 + 1.0) / 2.0,
         Target::MixerSeparation(_) => (v / 64.0 + 1.0) / 2.0,
         Target::MixerEq(_, _, 0) => (v / 1800.0 + 1.0) / 2.0,
@@ -5665,6 +5697,45 @@ mod tests {
         assert_eq!(e.tempo, 150.0);
         e.seek(0);
         assert_eq!((e.tracks[1].vol, e.tracks[1].slot_mix[2]), (12800, 12800), "back before the points");
+    }
+
+    // spec: audio/automation.md "Pattern control points", audio/mixer.md "Sends"
+    #[test]
+    fn a_pattern_point_moves_a_send_and_the_main_pitch() {
+        use os_model::target;
+        let mut p = song(vec![long_note(0, 384 * 4, 0)], vec![os_model::Clip::new(0, 384 * 4, 0, os_model::ClipSource::Pattern(1))]);
+        p.channels[0].mixer_track = 1;
+        p.mixer = (0..3).map(os_model::MixerTrack::new).collect();
+        // A send at level 0 (sidechain only) passes nothing until the point raises it.
+        p.mixer[1].routes = vec![0, 2];
+        p.mixer[1].send_levels = vec![(2, 0.0)];
+        // A second channel that does not follow the main pitch.
+        let mut other = channel();
+        other.index = 1;
+        other.misc.main_pitch = false;
+        p.channels.push(other);
+        p.main_pitch = Some(0);
+        p.channels[0].misc.main_pitch = true;
+        p.patterns[0].controls = vec![
+            ControlPoint { position: 0, kind: target::send(1, 2), value: 8000 },
+            ControlPoint { position: 0, kind: os_model::InitControl::MAIN_PITCH, value: 1200 },
+        ];
+        let mut e = Engine::new(&p, &mut SampleLibrary::new(None), 48000, PlayMode::Song);
+        let send = |e: &Engine| e.tracks[1].routes.iter().find(|r| r.dest == 2).unwrap().gain;
+        assert_eq!(send(&e), 0.0, "the route starts at the level the project stores");
+        let before = e.channels[0].base_rate;
+        e.next_tick();
+        let gain = send(&e);
+        assert!((gain - os_dsp::mixer::send_gain_auto(0.5)).abs() < 1e-9, "the point's level: {gain}");
+        assert_eq!(e.main_pitch, 1200, "the point's cents");
+        assert!((e.channels[0].base_rate / before - 2.0).abs() < 1e-9, "a key 1200 cents up: {}", e.channels[0].base_rate / before);
+        assert_eq!(e.channels[1].base_rate, before, "a channel that does not follow it stays put");
+        // A replay from another position starts the main pitch at the stored value again (the points before the
+        // position set it as they are replayed), and the point on the tick sets it once more.
+        e.sync_controls(0);
+        assert_eq!(e.main_pitch, 0, "the stored main pitch again");
+        e.next_tick();
+        assert_eq!(e.main_pitch, 1200, "the point sets it again");
     }
 
     fn song(notes: Vec<Note>, clips: Vec<os_model::Clip>) -> Project {

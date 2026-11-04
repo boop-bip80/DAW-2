@@ -519,11 +519,11 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bundle-app"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "bundle-plugins"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "bytemuck"
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "citrus"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "miniz_oxide 0.8.9",
  "nih_plug",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "flp-dump"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "os-flp",
  "os-model",
@@ -1902,7 +1902,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lemon-3x-osc"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-engine",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-balance"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-chorus"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-delay"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-engine",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-drum-sampler"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-sampler",
  "nih_plug",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-fast-distortion"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-filter"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-flanger"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-formula-controller"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-limiter"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-engine",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-parametric-eq-2"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-engine",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-peak-controller"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -2047,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-phaser"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-reverb"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-engine",
@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-sampler"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-dsp",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-slicer"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-dsp",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-small-fx"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-dsp",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-soft-clipper"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-stereo-enhancer"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-stereo-shaper"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -2149,7 +2149,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-transient-processor"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "lemon-vocoder"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "lemon-small-fx",
  "nih_plug",
@@ -2491,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "notices"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "num-complex"
@@ -2953,7 +2953,7 @@ dependencies = [
 
 [[package]]
 name = "os-app"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "asio-sys",
  "block2 0.6.2",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "os-clap"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "clap-sys 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "lemon-formula-controller",
@@ -3044,14 +3044,14 @@ dependencies = [
 
 [[package]]
 name = "os-dsp"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "signalsmith-stretch",
 ]
 
 [[package]]
 name = "os-engine"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "miniz_oxide 0.8.9",
  "os-dsp",
@@ -3063,7 +3063,7 @@ dependencies = [
 
 [[package]]
 name = "os-flp"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "chrono",
  "os-model",
@@ -3072,7 +3072,7 @@ dependencies = [
 
 [[package]]
 name = "os-host"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "cc",
  "libc",
@@ -3083,18 +3083,18 @@ dependencies = [
 
 [[package]]
 name = "os-hostlink"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "os-model"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "os-native"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "libloading 0.8.9",
  "os-dsp",
@@ -3106,7 +3106,7 @@ dependencies = [
 
 [[package]]
 name = "os-native-probe"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "os-engine",
  "os-host",
@@ -3116,11 +3116,11 @@ dependencies = [
 
 [[package]]
 name = "os-paths"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "os-play"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "cpal",
  "os-engine",
@@ -3129,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "os-plugkit"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "block2 0.6.2",
  "libc",
@@ -3148,7 +3148,7 @@ dependencies = [
 
 [[package]]
 name = "os-render"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "os-engine",
  "os-flp",
@@ -3157,15 +3157,15 @@ dependencies = [
 
 [[package]]
 name = "os-smf"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "os-theme"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "os-ui"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "fontdue",
  "os-theme",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "os-vst2"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "libloading 0.8.9",
  "os-engine",
@@ -3186,7 +3186,7 @@ dependencies = [
 
 [[package]]
 name = "os-vst3"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "libloading 0.8.9",
  "os-engine",
@@ -3354,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "press"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-dsp",
@@ -3409,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "pulp-filter"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-dsp",
@@ -4134,7 +4134,7 @@ dependencies = [
 
 [[package]]
 name = "tesla"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "nih_plug",
  "os-dsp",
@@ -4567,7 +4567,7 @@ dependencies = [
 
 [[package]]
 name = "watermark"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "wayland-backend"

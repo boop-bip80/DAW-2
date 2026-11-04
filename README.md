@@ -13,7 +13,7 @@
   <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024_edition-e57324?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platform: Windows | Linux | macOS" src="https://img.shields.io/badge/platform-Windows_%7C_Linux_%7C_macOS-0078d4?style=flat-square">
-  <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-ffe066?style=flat-square">
+  <img alt="Status: beta" src="https://img.shields.io/badge/status-beta-2ea043?style=flat-square">
   <a href="https://discord.gg/yC2uCuGs3M"><img alt="Discord" src="https://img.shields.io/badge/discord-join_the_server-5865f2?style=flat-square&logo=discord&logoColor=white"></a>
 </p>
 
@@ -52,13 +52,15 @@ kept and written back unchanged, so a project survives being opened and saved. T
 young, so read the warning below before trying it on real work.
 
 > [!WARNING]
-> **Lemon Studio is pre-alpha software.** It is under active development and is not yet a usable DAW:
-> expect missing features, rough edges and breaking changes.
+> **Lemon Studio is beta software.** It is feature-complete enough to make music with, but it is still under
+> active development: expect rough edges and breaking changes, and keep backups of your projects.
 >
-> - **Greyed-out controls are not implemented yet.** Many menus and buttons are already laid out but do
+> - **Greyed-out controls are not implemented yet.** Some menus and buttons are already laid out but do
 >   nothing so far; they are drawn dim and say "not available yet".
-> - **No prebuilt binaries** will be published until Lemon Studio reaches a usable state. Until then it
->   can only be built from source.
+> - **Prebuilt binaries** are attached to every tagged release (Windows x64, Linux x64 and macOS). They are
+>   unsigned on Windows and Linux, and signed ad hoc on macOS unless the release was signed with a Developer
+>   ID, so the system may ask you to allow the program the first time. Building from source still works and
+>   is described below.
 > - **Projects saved by FL Studio 10 or later open** (25 and 26 included). Projects older than 24.2 are
 >   converted to the current layout as they open and are saved in it, so the version that wrote them may not
 >   read the saved copy.
@@ -118,8 +120,11 @@ Per-area details are in [docs/status.md](docs/status.md). The full, item-by-item
 
 ## Getting started
 
-No prebuilt binaries are provided at this stage: Lemon Studio is built from source. Each platform below goes from a fresh
-machine to Lemon Studio installed with its icon, and Lemon Studio's own plugins installed for any DAW. All three need
+Prebuilt binaries are attached to each tagged release on the
+[releases page](https://github.com/ItsAlphaNeon/Lemon-Studio/releases): unzip the package for your platform and run
+`lemonstudio` (or `Lemon Studio.app`); the package's `plugins` folder holds Lemon Studio's plugins for other DAWs.
+Each platform below instead goes from a fresh machine to Lemon Studio built from source, installed with its icon, and
+Lemon Studio's own plugins installed for any DAW. All three need
 **Rust**, stable toolchain 1.89 or newer, installed through [rustup](https://rustup.rs/), and a clone of this repository:
 
 ```bash

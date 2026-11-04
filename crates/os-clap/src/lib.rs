@@ -298,7 +298,12 @@ struct HostData {
 
 static HOST_NAME: &CStr = c"Lemon Studio";
 static HOST_URL: &CStr = c"";
-static HOST_VERSION: &CStr = c"0.0.1";
+/// The host version a plugin is told: the program's own version, so an issue report that names the host names the
+/// build it came from.
+fn host_version() -> *const c_char {
+    static VERSION: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| std::ffi::CString::new(env!("CARGO_PKG_VERSION")).expect("a version without a NUL")).as_ptr()
+}
 
 unsafe extern "C" fn host_get_extension(_host: *const clap_host, id: *const c_char) -> *const c_void {
     if id.is_null() {
@@ -875,7 +880,7 @@ impl Plugin {
             name: HOST_NAME.as_ptr(),
             vendor: HOST_NAME.as_ptr(),
             url: HOST_URL.as_ptr(),
-            version: HOST_VERSION.as_ptr(),
+            version: host_version(),
             get_extension: Some(host_get_extension),
             request_restart: Some(host_request_restart),
             request_process: Some(host_request_process),

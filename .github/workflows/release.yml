@@ -1,0 +1,162 @@
+# Builds Lemon Studio for Windows, macOS and Linux and attaches the packages to a GitHub release, so the beta can
+# be tried without a Rust toolchain. Push a tag (`v0.1.0-beta.1`) or run the workflow by hand; a manual run keeps the
+# packages as workflow artifacts only.
+#
+# macOS is signed ad hoc unless the signing secrets are set (see "Sign and notarize" below): the packages work either
+# way, but a signed and notarized build opens without the Gatekeeper warning.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            package: lemon-studio-windows-x64.zip
+          - name: Linux
+            os: ubuntu-24.04
+            package: lemon-studio-linux-x64.tar.gz
+          - name: macOS
+            os: macos-latest
+            package: lemon-studio-macos.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libjack-jackd2-dev libwayland-dev libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The program, and every built-in plugin (the app carries its own copies, but the bundles are what other DAWs
+      # and older projects use, so a release ships them too).
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Bundle plugins
+        run: cargo run -p bundle-plugins --locked
+
+      - name: Bundle the app
+        if: runner.os == 'macOS'
+        run: cargo run -p bundle-app --locked
+
+      # A certificate, its password and the notary credentials come from the repository's secrets. Without them the
+      # build stays ad hoc signed, which is enough to run it after "Open Anyway" in System Settings.
+      - name: Sign and notarize
+        if: runner.os == 'macOS' && secrets.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/lemon-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          app="target/bundled/Lemon Studio.app"
+          # The program and the plugins it loads: no hardened-runtime library validation, audio input, and the
+          # right to run plugin code in-process.
+          codesign --force --deep --options runtime --timestamp \
+            --entitlements crates/os-app/assets/entitlements.plist \
+            --sign "$MACOS_SIGN_IDENTITY" "$app"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/Lemon Studio.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/Lemon Studio.zip" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" --team-id "$MACOS_NOTARY_TEAM_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" --wait
+          xcrun stapler staple "$app"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/lemonstudio.exe dist/
+          Copy-Item target/bundled dist/plugins -Recurse
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.package }}"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/lemonstudio dist/
+          cp crates/os-app/assets/lemonstudio.desktop dist/
+          cp crates/os-app/assets/lemonstudio.png dist/
+          cp -r target/bundled dist/plugins
+          tar -czf "${{ matrix.package }}" -C dist .
+          # The same tree, zipped, for anyone who prefers it.
+          (cd dist && zip -qr "../lemon-studio-linux-x64.zip" .)
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # `ditto` keeps the bundle's signature and extended attributes; `zip` would break them.
+          ditto "target/bundled/Lemon Studio.app" "dist/Lemon Studio.app"
+          cp -R target/bundled dist/plugins
+          ditto -c -k --keepParent dist "${{ matrix.package }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: |
+            ${{ matrix.package }}
+            lemon-studio-linux-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: Attach to the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" packages/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" packages/* --repo "$GITHUB_REPOSITORY" \
+              --title "Lemon Studio $TAG" --generate-notes --prerelease
+          fi

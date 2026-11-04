@@ -59,9 +59,24 @@ pub fn plugin_state_from_fl(fl: &[u8]) -> Vec<u8> {
     blob
 }
 
+/// The JSON inside a plugin state blob: the host's 8-byte length prefix and the JSON, or the JSON alone.
+fn state_json(blob: &[u8]) -> Option<&[u8]> {
+    // The first byte of a little-endian length can itself be `{` (a 123-byte state, say), so which form this is
+    // cannot be read off that byte: take whichever form actually parses.
+    fn parses(j: &[u8]) -> Option<&[u8]> {
+        serde_json::from_slice::<serde_json::Value>(j).is_ok().then_some(j)
+    }
+    if blob.first() == Some(&b'{') {
+        if let Some(j) = parses(blob) {
+            return Some(j);
+        }
+    }
+    blob.get(8..).and_then(parses)
+}
+
 /// The Love Philter state inside a plugin state blob; `Some(empty)` for an instance on its starting state.
 pub fn fl_from_plugin_state(blob: &[u8]) -> Option<Vec<u8>> {
-    let json = if blob.len() > 8 && blob[0] != b'{' { &blob[8..] } else { blob };
+    let json = state_json(blob)?;
     let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(json).ok()?).ok()?;
     let field = v.get("fields")?.get(STATE_FIELD)?.as_str()?;
     serde_json::from_str::<StateBytes>(field).ok().map(|s| s.0)
@@ -273,6 +288,25 @@ os_plugkit::linked_clap_entry!(PulpFilter);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state whose 8-byte length starts with `{` (a 123-byte JSON, say) still reads: the length must not be
+    /// mistaken for the JSON itself.
+    #[test]
+    fn a_length_that_starts_like_json_is_not_mistaken_for_it() {
+        let fl = State::new_default().to_bytes();
+        let blob = plugin_state_from_fl(&fl);
+        let json = String::from_utf8(blob[8..].to_vec()).unwrap();
+        let mut len = 123;
+        while len < json.len() {
+            len += 256;
+        }
+        let mut padded = json;
+        padded.push_str(&" ".repeat(len - padded.len()));
+        let mut prefixed = (len as u64).to_le_bytes().to_vec();
+        prefixed.extend_from_slice(padded.as_bytes());
+        assert_eq!(prefixed[0], b'{');
+        assert_eq!(fl_from_plugin_state(&prefixed), Some(fl));
+    }
 
     #[test]
     fn plugin_states_carry_the_love_philter_state() {

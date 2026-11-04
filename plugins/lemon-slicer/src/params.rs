@@ -234,9 +234,24 @@ pub fn plugin_state_from_fl(fl: &[u8]) -> Vec<u8> {
     blob
 }
 
+/// The JSON inside a plugin state blob: the host's 8-byte length prefix and the JSON, or the JSON alone.
+fn state_json(blob: &[u8]) -> Option<&[u8]> {
+    // The first byte of a little-endian length can itself be `{` (a 123-byte state, say), so which form this is
+    // cannot be read off that byte: take whichever form actually parses.
+    fn parses(j: &[u8]) -> Option<&[u8]> {
+        serde_json::from_slice::<serde_json::Value>(j).is_ok().then_some(j)
+    }
+    if blob.first() == Some(&b'{') {
+        if let Some(j) = parses(blob) {
+            return Some(j);
+        }
+    }
+    blob.get(8..).and_then(parses)
+}
+
 /// The original's saved state for a plugin state blob (see [`plugin_state_from_fl`]); `None` when it is not one.
 pub fn fl_from_plugin_state(blob: &[u8]) -> Option<Vec<u8>> {
-    let json = if blob.len() > 8 && blob[0] != b'{' { &blob[8..] } else { blob };
+    let json = state_json(blob)?;
     let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(json).ok()?).ok()?;
     let raw = from_hex(v.get("fields")?.get(STATE_FIELD)?.as_str()?.trim_matches('"'))?;
     let params = v.get("params")?;

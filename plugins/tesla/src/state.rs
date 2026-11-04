@@ -214,9 +214,24 @@ pub fn plugin_state(s: &Saved) -> Vec<u8> {
     blob
 }
 
+/// The JSON inside a plugin state blob: the host's 8-byte length prefix and the JSON, or the JSON alone.
+fn state_json(blob: &[u8]) -> Option<&[u8]> {
+    // The first byte of a little-endian length can itself be `{` (a 123-byte state, say), so which form this is
+    // cannot be read off that byte: take whichever form actually parses.
+    fn parses(j: &[u8]) -> Option<&[u8]> {
+        serde_json::from_slice::<serde_json::Value>(j).is_ok().then_some(j)
+    }
+    if blob.first() == Some(&b'{') {
+        if let Some(j) = parses(blob) {
+            return Some(j);
+        }
+    }
+    blob.get(8..).and_then(parses)
+}
+
 /// The state inside a plugin state blob (see [`plugin_state`]); `None` when the blob is not a Tesla state.
 pub fn from_plugin_state(blob: &[u8]) -> Option<Saved> {
-    let json = if blob.len() > 8 && blob[0] != b'{' { &blob[8..] } else { blob };
+    let json = state_json(blob)?;
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
     from_json(v.get("fields")?.get(STATE_FIELD)?.as_str()?)
 }

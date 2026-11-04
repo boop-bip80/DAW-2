@@ -26,6 +26,8 @@ pub struct Sample {
     pub rate: u32,
     pub left: Vec<f32>,
     pub right: Vec<f32>,
+    /// The sustain loop the file's `smpl` chunk marks (`start`..`end`, in frames); `None` for a file without one.
+    pub loop_range: Option<(usize, usize)>,
 }
 
 impl Sample {
@@ -100,8 +102,19 @@ pub fn load_shared(path: &Path) -> Result<Arc<Sample>, SampleError> {
     Ok(s)
 }
 
-/// Decodes a WAV (PCM or Vorbis-in-WAV) / FLAC / Ogg Vorbis / WavPack / MP3 / AIFF file.
+/// Decodes a WAV (PCM or Vorbis-in-WAV) / FLAC / Ogg Vorbis / WavPack / MP3 / AIFF file, with the sustain loop its
+/// `smpl` chunk marks (a frame range clamped to the decoded length).
 pub fn load(path: &Path) -> Result<Sample, SampleError> {
+    let mut s = decode_file(path)?;
+    s.loop_range = wav_tags(path).loop_range.and_then(|(a, b)| {
+        let n = s.frames() as u32;
+        (a < n && b > a).then(|| (a as usize, b.min(n) as usize))
+    });
+    Ok(s)
+}
+
+/// [`load`] without the file's loop (what the decoders return).
+fn decode_file(path: &Path) -> Result<Sample, SampleError> {
     let bytes = std::fs::read(path).map_err(|source| SampleError::Io { path: path.to_owned(), source })?;
     let decode_err = |message: String| SampleError::Decode { path: path.to_owned(), message };
     if let Some(vw) = vorbis_in_wav(&bytes) {
@@ -225,6 +238,9 @@ pub struct WavTags {
     /// and a float), when it is above 0 and the flags don't mark the file a one-shot (bit 0): a one-shot's beat count
     /// is not a length to fit it to.
     pub beats: Option<u32>,
+    /// The first `smpl` chunk's first forward sustain loop (a loop's type 0, its start and end), in frames, when its
+    /// end is past its start: what a sampler plays over and over while a note is held.
+    pub loop_range: Option<(u32, u32)>,
 }
 
 /// The `smpl` and `acid` chunks of the file at `path`. A file that isn't a RIFF WAV, or can't be read, has neither.
@@ -246,14 +262,26 @@ fn tags_of(mut r: impl Read + Seek) -> Option<WavTags> {
         let len = u64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
         let mut skip = len + (len & 1);
         if matches!(&chunk[0..4], b"smpl" | b"acid") && len >= 16 {
-            let mut body = [0u8; 16];
+            // `smpl`'s loops follow its 9 header u32s, so its body is read whole (a generous cap); `acid` needs 16 bytes.
+            let take = if &chunk[0..4] == b"smpl" { len.min(4096) } else { 16 } as usize;
+            let mut body = vec![0u8; take];
             if r.read_exact(&mut body).is_err() {
                 break;
             }
-            skip -= 16;
-            let v = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
+            skip -= take as u64;
+            let u32_at = |at: usize| body.get(at..at + 4).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes);
+            let v = u32_at(12).unwrap_or(0);
             if &chunk[0..4] == b"smpl" {
                 tags.unity_note = tags.unity_note.or(u8::try_from(v).ok().filter(|&k| k <= 127));
+                if tags.loop_range.is_none() {
+                    let loop_start = u32_at(36 + 8);
+                    let loop_end = u32_at(36 + 12);
+                    let forward = u32_at(36 + 4) == Some(0);
+                    tags.loop_range = (forward && tags.loop_range.is_none())
+                        .then(|| Some((loop_start?, loop_end?)))
+                        .flatten()
+                        .filter(|&(a, b)| b > a);
+                }
             } else if !acid_seen {
                 acid_seen = true;
                 let one_shot = body[0] & 1 != 0;
@@ -359,7 +387,7 @@ fn decode(bytes: Vec<u8>, ext: Option<&str>) -> Result<Sample, String> {
     if rate == 0 {
         return Err("no audio decoded".into());
     }
-    Ok(Sample { rate, left, right })
+    Ok(Sample { rate, left, right, loop_range: None })
 }
 
 /// The placeholders of sample paths: the FL Studio install folder and its `Data` folder (spec: flp/sample-paths.md).
@@ -715,7 +743,10 @@ impl SampleLibrary {
             return e.3.clone();
         }
         let (left, right) = os_dsp::stretch::whole(&raw.left, &raw.right, raw.rate, frames, transpose);
-        let s = Arc::new(Sample { rate: raw.rate, left, right });
+        // A stretched copy loops where the original's loop landed in it.
+        let ratio = frames as f64 / raw.frames().max(1) as f64;
+        let loop_range = raw.loop_range.map(|(a, b)| ((a as f64 * ratio) as usize, (b as f64 * ratio) as usize));
+        let s = Arc::new(Sample { rate: raw.rate, left, right, loop_range });
         self.stretched.push((raw.clone(), frames, bits, s.clone()));
         s
     }
@@ -859,6 +890,19 @@ mod tests {
         chunk(b"smpl", &b)
     }
 
+    /// `smpl` with one forward sustain loop over frames `start..end`: no unity note, one loop entry (cue point 0,
+    /// type 0, start, end, fraction 0, play count 0).
+    fn smpl_loop(start: u32, end: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [0, 0, 22675, 0, 0, 0, 0, 1, 0] {
+            b.extend(u32::to_le_bytes(v));
+        }
+        for v in [0, 0, start, end, 0, 0] {
+            b.extend(u32::to_le_bytes(v));
+        }
+        chunk(b"smpl", &b)
+    }
+
     /// `acid` with `beats` beats: flags (root note set), root note, two unused fields, beats, meter 4/4, tempo.
     fn acid(beats: u32, root: u16, bpm: f32) -> Vec<u8> {
         acid_flags(2, beats, root, bpm)
@@ -886,17 +930,17 @@ mod tests {
     fn wav_tags_read_the_sampler_and_loop_chunks() {
         let none = WavTags::default();
         assert_eq!(tags(wav(&[])), Some(none), "no chunks");
-        assert_eq!(tags(wav(&[smpl(72)])), Some(WavTags { unity_note: Some(72), beats: None }));
-        assert_eq!(tags(wav(&[acid(4, 64, 120.0)])), Some(WavTags { unity_note: None, beats: Some(4) }), "acid's root is not read");
-        assert_eq!(tags(wav(&[smpl(67), acid(4, 60, 95.0)])), Some(WavTags { unity_note: Some(67), beats: Some(4) }));
-        assert_eq!(tags(wav(&[acid(8, 60, 120.0)])), Some(WavTags { unity_note: None, beats: Some(8) }), "the tempo is not used");
+        assert_eq!(tags(wav(&[smpl(72)])), Some(WavTags { unity_note: Some(72), beats: None, ..WavTags::default() }));
+        assert_eq!(tags(wav(&[acid(4, 64, 120.0)])), Some(WavTags { unity_note: None, beats: Some(4), ..WavTags::default() }), "acid's root is not read");
+        assert_eq!(tags(wav(&[smpl(67), acid(4, 60, 95.0)])), Some(WavTags { unity_note: Some(67), beats: Some(4), ..WavTags::default() }));
+        assert_eq!(tags(wav(&[acid(8, 60, 120.0)])), Some(WavTags { unity_note: None, beats: Some(8), ..WavTags::default() }), "the tempo is not used");
         // After `data`, and behind an odd-length chunk with its pad byte.
         let mut b = wav(&[chunk(b"LIST", b"INFOx")]);
         let extra = [smpl(48), acid(16, 0, 0.0)].concat();
         b.extend(&extra);
         let riff = (b.len() - 8) as u32;
         b[4..8].copy_from_slice(&riff.to_le_bytes());
-        assert_eq!(tags(b), Some(WavTags { unity_note: Some(48), beats: Some(16) }));
+        assert_eq!(tags(b), Some(WavTags { unity_note: Some(48), beats: Some(16), ..WavTags::default() }));
         // Unusable values count as no chunk: 0 beats, a unity note above 127; a body too short is skipped.
         assert_eq!(tags(wav(&[acid(0, 60, 120.0), smpl(200)])), Some(none));
         assert_eq!(tags(wav(&[chunk(b"smpl", &[0; 12])])), Some(none));
@@ -905,6 +949,11 @@ mod tests {
         assert_eq!(tags(wav(&[acid_flags(1, 4, 60, 120.0)])), Some(none));
         assert_eq!(tags(wav(&[acid_flags(0x13, 2, 60, 120.0)])), Some(none));
         assert_eq!(tags(wav(&[acid_flags(0, 2, 60, 120.0)])).unwrap().beats, Some(2));
+        // A forward sustain loop is read; one that runs backwards is not.
+        assert_eq!(tags(wav(&[smpl_loop(100, 400)])).unwrap().loop_range, Some((100, 400)));
+        assert_eq!(tags(wav(&[smpl_loop(0, 550)])).unwrap().loop_range, Some((0, 550)));
+        assert_eq!(tags(wav(&[smpl_loop(400, 100)])).unwrap().loop_range, None, "backwards");
+        assert_eq!(tags(wav(&[smpl(70)])).unwrap().loop_range, None, "no loops");
         // The first chunk of each kind counts.
         assert_eq!(tags(wav(&[smpl(50), smpl(70)])).unwrap().unity_note, Some(50));
         // Not a WAV.
@@ -917,7 +966,7 @@ mod tests {
         // From a file; a missing file has none.
         let path = std::env::temp_dir().join(format!("os_engine_wav_tags_{}.wav", std::process::id()));
         std::fs::write(&path, wav(&[smpl(67), acid(4, 60, 95.0)])).unwrap();
-        assert_eq!(wav_tags(&path), WavTags { unity_note: Some(67), beats: Some(4) });
+        assert_eq!(wav_tags(&path), WavTags { unity_note: Some(67), beats: Some(4), ..WavTags::default() });
         let _ = std::fs::remove_file(&path);
         assert_eq!(wav_tags(&path), none);
     }

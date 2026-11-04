@@ -4827,7 +4827,7 @@ fn fallback_tone(rate: u32) -> Arc<Sample> {
         }
         left.push((0.45 * attack * v) as f32);
     }
-    Arc::new(Sample { rate, right: left.clone(), left })
+    Arc::new(Sample { rate, right: left.clone(), left, loop_range: None })
 }
 
 /// A pattern's length in ticks, by the rule the app shares ([`Project::pattern_length`]): an explicit length wins;

@@ -40,7 +40,9 @@ Tick an item in the change that finishes it; for one under way, add "(in progres
   each package.
 - [ ] **Where settings and projects live on each platform,** and that a `.lemon` project is not expected to open in
   FL Studio. (The README's per-platform notes cover this; the release notes should repeat the short version.)
-- [ ] **How to report a bug:** HELP > Diagnostics writes `Diagnostics.txt`; the issue template asks for it.
+- [x] **How to report a bug:** HELP > Diagnostics writes `Diagnostics.txt`, and a panic leaves `Crash.txt` in the
+  same folder with the message, the place and (with `RUST_BACKTRACE=1`) a backtrace; the issue template asks
+  for both.
 
 ## Verification before the first beta tag
 

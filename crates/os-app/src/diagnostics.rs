@@ -21,6 +21,63 @@ fn report_path() -> Option<PathBuf> {
     os_paths::user_file("Diagnostics.txt")
 }
 
+/// Where a crash report goes: the user folder's "Crash.txt" (tests: a temporary file of the test's own thread).
+fn crash_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        let thread = format!("{:?}", std::thread::current().id()).chars().filter(char::is_ascii_digit).collect::<String>();
+        return Some(std::env::temp_dir().join(format!("lemon-crash-{}-{thread}.txt", std::process::id())));
+    }
+    os_paths::user_file("Crash.txt")
+}
+
+/// The report a panic leaves: this build, the system, the thread, and the panic's message and place, with a backtrace
+/// when `RUST_BACKTRACE` asks for one (Lemon Studio's design: something a tester can attach to an issue).
+pub(crate) fn crash_text(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let msg = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|m| (*m).to_owned())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".into());
+    let place = info
+        .location()
+        .map_or_else(|| "an unknown place".into(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+    let thread = std::thread::current().name().unwrap_or("unnamed").to_owned();
+    let mut out = format!(
+        "Lemon Studio {} (beta) crash report\nSystem: {} {}, {cpus} logical processors\nThread: {thread}\nMessage: {msg}\nWhere: {place}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| v != "0") {
+        out.push_str(&format!("Backtrace:\n{}\n", std::backtrace::Backtrace::force_capture()));
+    } else {
+        out.push_str("Run with RUST_BACKTRACE=1 for a backtrace; HELP > Diagnostics has the rest of the report.\n");
+    }
+    out
+}
+
+/// Writes `text` to the crash report's file and says where it went.
+fn write_crash_report(text: &str) -> Option<PathBuf> {
+    let path = crash_path()?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, text).ok().map(|()| path)
+}
+
+/// Leaves a crash report in the user folder whenever the program panics, then runs the hook that was there before.
+/// Called once, first thing in `main`.
+pub(crate) fn install_crash_report() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // A report is a courtesy: if writing it fails, the panic is still reported as it always was.
+        let _ = write_crash_report(&crash_text(info));
+        previous(info);
+    }));
+}
+
 impl App {
     /// The report's text.
     pub(crate) fn diagnostics(&self) -> String {
@@ -87,6 +144,13 @@ mod tests {
         assert!(text.starts_with(&format!("Lemon Studio {} (beta)\n", env!("CARGO_PKG_VERSION"))), "{text}");
         assert!(text.contains(&format!("System: {} {}", std::env::consts::OS, std::env::consts::ARCH)), "{text}");
         assert!(text.contains("Project: not saved\n  Channels: 5, patterns: 1, mixer tracks: 18"), "{text}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_crash_leaves_a_report() {
+        let path = super::write_crash_report("Lemon Studio 0 crash report\nMessage: boom\n").expect("a crash report");
+        assert_eq!(std::fs::read_to_string(&path).expect("the report"), "Lemon Studio 0 crash report\nMessage: boom\n");
         let _ = std::fs::remove_file(path);
     }
 }

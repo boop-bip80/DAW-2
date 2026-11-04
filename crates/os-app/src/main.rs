@@ -1846,6 +1846,8 @@ fn attach_console() {
 fn main() {
     #[cfg(windows)]
     attach_console();
+    // A crash leaves a report in the user folder, for a bug report (see `diagnostics`).
+    diagnostics::install_crash_report();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // A plugin scanner process (spec: ui/plugin-manager.md §4): loads one file, prints its plugins, ends.
     if args.first().map(String::as_str) == Some(plugin_scan::ARG) {

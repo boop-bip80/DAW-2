@@ -388,7 +388,9 @@ and Touch controller. Kept with the program's settings, not the project. Which w
   open the piano roll's Scale levels and LFO (Ctrl+L) dialogs on the control's events in the selection. Turn
   into automation clip moves the events into a new clip channel linked to the control, as the original does
   (the control's earlier value until the first event, then the events, a recorded ramp as one straight segment, ending
-  on the last event). Each edit is an undo step
+  on the last event). Auto smoothing (its menu's check) smooths a freehand stroke's levels when the mouse button
+  goes up, keeping the stroke's first and last events; a playhead marks the playing position (the pattern's
+  play-start marker when stopped), and Center (0) scrolls the graph to put it in the middle. Each edit is an undo step
 - Edit automation in a window, on the same menus, opens a second event editor window on that control, in front of
   the first, which keeps its control; a click on the one behind brings it in front, the editors share a clipboard, and
   closing one leaves the other (Lemon Studio's design)
@@ -396,7 +398,6 @@ and Touch controller. Kept with the program's settings, not the project. Which w
   that drives it,
   as on a plugin parameter, and Set... puts it at its default, the minimum, 25, 50 or 75% or the maximum, each listed
   with the knob's value there (one undo step)
-- Not yet in the event editor: Auto smoothing, Center
 
 ## 🚧 Project files
 

@@ -111,16 +111,16 @@ fn button(ui: &mut Ui, live: bool, r: Rect, a: Action, hint: &'static str, face:
     }
 }
 
-pub fn paint(ui: &mut Ui, s: &State, _f: &FrameInfo) {
+pub fn paint(ui: &mut Ui, s: &State, f: &FrameInfo) {
     // Edit automation in a window: the second editor, behind the first (spec: ui/event-editor.md §3a).
     if let Some(back) = &s.events_back {
-        paint_one(ui, s, back, false);
+        paint_one(ui, s, back, false, f);
     }
-    paint_one(ui, s, &s.events, true);
+    paint_one(ui, s, &s.events, true, f);
 }
 
 /// Editor `e`'s window. `front`: the editor edited; the one behind only takes a click, which brings it in front.
-fn paint_one(ui: &mut Ui, s: &State, e: &EventsUi, front: bool) {
+fn paint_one(ui: &mut Ui, s: &State, e: &EventsUi, front: bool, f: &FrameInfo) {
     let t = ui.t;
     let win = rect_of(e);
     let (x0, y0) = (win.x, win.y);
@@ -238,6 +238,13 @@ fn paint_one(ui: &mut Ui, s: &State, e: &EventsUi, front: bool) {
     if let Some(((ta, la), (tb, lb))) = e.line {
         let (xa, xb) = (x_in(s, e, f64::from(ta)), x_in(s, e, f64::from(tb)));
         ui.c.line(xa, y_of(g, la), xb, y_of(g, lb), 2.0, t.tx(0xffffff));
+    }
+    // The playing position (or the play-start marker when stopped): Center puts it in the middle.
+    if let Some(tick) = events::playhead(s, f.playing, f.song, f.tick) {
+        let x = x_in(s, e, tick);
+        if x >= g.x && x <= g.right() {
+            ui.c.fill_rect(Rect::new(x.round(), g.y, 1.5, g.h), t.playhead);
+        }
     }
     ui.c.pop_clip();
     ui.c.stroke_rrect(g, 0.0, 1.0, line);

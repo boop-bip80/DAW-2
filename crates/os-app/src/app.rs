@@ -3975,6 +3975,12 @@ impl App {
         }
     }
 
+    /// The event editor's playhead: the playing position in the current pattern, or the marker when stopped.
+    pub(crate) fn events_playhead(&self) -> Option<f64> {
+        let now = &self.shown;
+        crate::events::playhead(&self.state, now.playing, now.song, now.tick)
+    }
+
     /// The playback state now, as the frame should show it.
     fn play_state(&self) -> Shown {
         let playing = self.transport.playing();
@@ -4051,6 +4057,18 @@ impl App {
             if !now.song && rack {
                 for r in views::rack::step_columns(&self.state, old.tick, now.tick) {
                     self.damage_rect(r);
+                }
+            }
+            if self.state.shown(Win::Events) {
+                let g = views::events::graph(&self.state);
+                for t in [
+                    crate::events::playhead(&self.state, old.playing, old.song, old.tick),
+                    crate::events::playhead(&self.state, now.playing, now.song, now.tick),
+                ] {
+                    if let Some(t) = t {
+                        let x = views::events::x_of(&self.state, t);
+                        self.damage_rect(Rect::new(x - 2.0, g.y, 5.0, g.h));
+                    }
                 }
             }
             self.auto_scroll();

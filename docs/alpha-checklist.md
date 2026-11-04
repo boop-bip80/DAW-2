@@ -113,7 +113,8 @@ sixteen effects and the Tesla audio editor; these are the gaps a project made in
 Greyed-out controls and partial features. These can land alongside the blockers.
 
 - [x] **Event editor window.** Edit events opens it from the parameter, channel rack and knob menus: a control's
-  events in the pattern, drawn, erased, selected and deleted, and turned into an automation clip
+  events in the pattern, drawn, erased, selected and deleted, and turned into an automation clip; Auto smoothing
+  smooths a freehand stroke on release, and Center (0) puts the playing position in the middle of the graph
 - [x] **Undo for a plugin editor's own changes.** Parameters moved in a plugin's window and presets loaded from its
   title bar or dropped on it are one step each; a preset's undo brings back the state, the preset and the name
 - [x] **Undo for mixer track commands.** Routing, names, colours, resets, effect slots, audio input / output and

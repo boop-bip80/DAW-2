@@ -69,6 +69,10 @@ pub enum EvCmd {
     SelectNext,
     /// The Relocate events check: Paste inserts, and Cut and Delete close the gap.
     Relocate,
+    /// The Auto smoothing check: a freehand stroke's levels are smoothed when the mouse button goes up.
+    AutoSmooth,
+    /// Scrolls the graph so the playing position is in its middle.
+    Center,
     /// Zoom in or out about the graph's middle, or to the selection.
     ZoomIn,
     ZoomOut,
@@ -103,6 +107,8 @@ pub struct EventsUi {
     pub clipboard: Option<(Vec<(u32, f64)>, u32)>,
     /// Relocate events (§4): Paste makes room for what it pastes, Cut and Delete pull the later events back.
     pub relocate: bool,
+    /// Auto smoothing (§4): a freehand stroke's levels are smoothed when the mouse button goes up.
+    pub auto_smooth: bool,
 }
 
 impl Default for EventsUi {
@@ -121,6 +127,7 @@ impl Default for EventsUi {
             line: None,
             clipboard: None,
             relocate: false,
+            auto_smooth: false,
         }
     }
 }
@@ -248,6 +255,47 @@ pub fn draw(s: &mut State, a: (u32, f64), b: (u32, f64), unit: u32) {
         t += unit;
     }
     s.piano.dirty = true;
+}
+
+/// Auto smoothing: the levels of the control's events between `a` and `b` are averaged with their neighbours, the
+/// stroke's first and last events kept. Returns how many events changed.
+pub fn smooth(s: &mut State, a: (u32, f64), b: (u32, f64)) -> usize {
+    let (from, to) = (a.0.min(b.0), a.0.max(b.0));
+    let points: Vec<(u32, i32)> = points(s).into_iter().filter(|p| (from..=to).contains(&p.0)).collect();
+    if points.len() < 3 {
+        return 0;
+    }
+    let values: Vec<i32> = points.iter().map(|p| p.1).collect();
+    let mut changed = 0;
+    for i in 1..values.len() - 1 {
+        let v = ((f64::from(values[i - 1]) + 2.0 * f64::from(values[i]) + f64::from(values[i + 1])) / 4.0).round() as i32;
+        if v != values[i] {
+            set_value(s, points[i].0, v);
+            changed += 1;
+        }
+    }
+    s.piano.dirty = true;
+    changed
+}
+
+/// The tick the editor's playhead marks: the playing position in pattern mode, or where this pattern plays in song
+/// mode; stopped, the pattern's play-start marker or the pattern tick under the song position.
+pub fn playhead(s: &State, playing: bool, song: bool, tick: f64) -> Option<f64> {
+    if playing {
+        if song { crate::piano::pattern_tick_in_song(s, tick) } else { Some(tick) }
+    } else if s.song_mode {
+        crate::piano::pattern_tick_in_song(s, f64::from(s.playlist.pos))
+    } else {
+        Some(f64::from(s.piano.marker))
+    }
+}
+
+/// Center: scrolls the graph so `tick` is in its middle.
+pub fn center(s: &mut State, tick: f64) {
+    let w = f64::from(crate::views::events::graph(s).w);
+    let ppq = f64::from(s.project.ppq.max(4));
+    let half = w * ppq / f64::from(s.events.px_per_beat) / 2.0;
+    s.events.scroll = (tick - half).max(0.0);
 }
 
 /// The Interpolate tool (spec §1): the control's events from `a` to `b` (tick, level) keep their times and take the
@@ -469,8 +517,8 @@ fn simplify(line: &[(f64, f64)], tol: f64) -> Vec<usize> {
 /// What a press on the graph or the ruler started.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Stroke {
-    /// Drawing freehand; the previous mouse position (tick, level).
-    Draw((u32, f64)),
+    /// Drawing freehand: the stroke's first position, then its previous position (tick, level).
+    Draw((u32, f64), (u32, f64)),
     /// Erasing; the previous mouse tick.
     Erase(u32),
     /// Selecting time from the anchor tick.
@@ -533,7 +581,9 @@ pub fn menu(s: &State, x: f32, y: f32) -> Popup {
         PItem::new("Zoom in", Cmd::Events(EvCmd::ZoomIn)).key("PgUp"),
         PItem::new("Zoom out", Cmd::Events(EvCmd::ZoomOut)).key("PgDn"),
         on_sel(PItem::new("Zoom on selection", Cmd::Events(EvCmd::ZoomSelection)).key("Shift+5")),
+        PItem::new("Center", Cmd::Events(EvCmd::Center)).key("0"),
         PItem::sep(),
+        PItem::new("Auto smoothing", Cmd::Events(EvCmd::AutoSmooth)).mark(crate::playlist::Mark::Check(s.events.auto_smooth)),
         PItem::new("Relocate events", Cmd::Events(EvCmd::Relocate)).mark(crate::playlist::Mark::Check(s.events.relocate)),
     ];
     Popup { x, y, items, sub: None, scroll: [0; 2] }
@@ -571,7 +621,7 @@ impl App {
         }
         let s = &mut self.state;
         let first = &s.events;
-        let mut e = EventsUi { pos: (first.pos.0 + 30.0, first.pos.1 + 30.0), placed: true, tool: first.tool, px_per_beat: first.px_per_beat, relocate: first.relocate, ..EventsUi::default() };
+        let mut e = EventsUi { pos: (first.pos.0 + 30.0, first.pos.1 + 30.0), placed: true, tool: first.tool, px_per_beat: first.px_per_beat, relocate: first.relocate, auto_smooth: first.auto_smooth, ..EventsUi::default() };
         if !open_in(&mut e, target, name, value, range) {
             return None;
         }
@@ -642,7 +692,7 @@ impl App {
             piano::snapshot_as(s, EDIT);
             let u = unit(s, alt);
             draw(s, (tick, level), (tick, level), u);
-            Stroke::Draw((tick, level))
+            Stroke::Draw((tick, level), (tick, level))
         };
         self.drag = Some(crate::app::Drag::Events(stroke));
         self.damage_win(Win::Events);
@@ -656,9 +706,9 @@ impl App {
         let level = crate::views::events::level_at(s, y);
         let u = unit(s, alt);
         let next = match stroke {
-            Stroke::Draw(last) => {
+            Stroke::Draw(start, last) => {
                 draw(s, last, (tick, level), u);
-                Stroke::Draw((tick, level))
+                Stroke::Draw(start, (tick, level))
             }
             Stroke::Erase(last) => {
                 erase(s, last.min(tick), last.max(tick) + u - 1);
@@ -689,6 +739,14 @@ impl App {
     pub(crate) fn events_release(&mut self, stroke: Stroke) {
         let s = &mut self.state;
         let alt = self.alt || s.events.tool == Tool::Paint;
+        // Auto smoothing smooths the stroke's events when the button goes up (spec: ui/event-editor.md).
+        if let Stroke::Draw(a, b) = stroke {
+            if s.events.auto_smooth {
+                smooth(s, a, b);
+            }
+            self.damage_win(Win::Events);
+            return;
+        }
         // Zoom: a drag of 4 px or more zooms on its stretch, a click zooms in about it; the selection comes back.
         if let Stroke::Zoom(anchor, kept) = stroke {
             let dragged = s.events.sel.take().filter(|(a, b)| {
@@ -730,6 +788,7 @@ impl App {
 
     /// The menu's entries (§4).
     pub(crate) fn events_cmd(&mut self, c: EvCmd) -> Option<String> {
+        let playhead = self.events_playhead();
         let s = &mut self.state;
         let m = match c {
             EvCmd::Copy => {
@@ -784,6 +843,17 @@ impl App {
                 s.events.relocate = !s.events.relocate;
                 Some(format!("Relocate events {}", if s.events.relocate { "on" } else { "off" }))
             }
+            EvCmd::AutoSmooth => {
+                s.events.auto_smooth = !s.events.auto_smooth;
+                Some(format!("Auto smoothing {}", if s.events.auto_smooth { "on" } else { "off" }))
+            }
+            EvCmd::Center => match playhead {
+                Some(tick) => {
+                    center(s, tick);
+                    None
+                }
+                None => Some("The playhead is not over a clip of this pattern".into()),
+            },
             EvCmd::ZoomIn | EvCmd::ZoomOut => {
                 zoom(s, if c == EvCmd::ZoomIn { ZOOM_STEP } else { 1.0 / ZOOM_STEP });
                 None
@@ -838,7 +908,8 @@ impl App {
             Key::Character(c) if ctrl && !alt && c.eq_ignore_ascii_case("a") => EvCmd::SelectAll,
             Key::Character(c) if ctrl && !alt && c.eq_ignore_ascii_case("i") => EvCmd::InsertValue,
             Key::Character(c) if ctrl && !alt && c.eq_ignore_ascii_case("l") => EvCmd::Lfo,
-            // Z: the Zoom tool (the original's key).
+            // 0: Center; Z: the Zoom tool (the original's key).
+            Key::Character(c) if !ctrl && !alt && !shift && c == "0" => EvCmd::Center,
             Key::Character(c) if !ctrl && !alt && !shift && c.eq_ignore_ascii_case("z") => {
                 self.state.events.tool = Tool::Zoom;
                 return true;
@@ -1244,5 +1315,49 @@ mod tests {
         let cmd = item(&app, KnobId::ChanVol(0)).cmd;
         crate::playlist::run(&mut app, cmd);
         assert!(app.state.shown(Win::Events) && app.state.events_back.is_none());
+    }
+
+    /// Auto smoothing and Center (§4): the first smooths a freehand stroke on release, the second puts the playhead in
+    /// the graph's middle; the menu and the 0 key reach both.
+    #[test]
+    fn auto_smoothing_and_center() {
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        assert!(open(&mut app.state, os_model::target::channel(0, 0), "Kick - Volume", 0.5, None));
+        let menu = menu(&app.state, 0.0, 0.0);
+        let item = |label: &str| menu.items.iter().find(|i| i.label == label).unwrap_or_else(|| panic!("{label}"));
+        assert_eq!(item("Auto smoothing").cmd, Cmd::Events(EvCmd::AutoSmooth));
+        assert_eq!(item("Auto smoothing").mark, crate::playlist::Mark::Check(false));
+        assert_eq!(item("Center").cmd, Cmd::Events(EvCmd::Center));
+        assert_eq!(item("Center").key, "0");
+
+        // A zigzag stroke: with Auto smoothing off its five events are kept exactly.
+        let raw = [(0, 0.0), (24, 1.0), (48, 0.0), (72, 1.0), (96, 0.0)];
+        for &(t, l) in &raw {
+            set(&mut app.state, t, l);
+        }
+        let before = points(&app.state);
+        app.events_release(Stroke::Draw((0, 0.0), (96, 0.0)));
+        assert_eq!(points(&app.state), before, "off: the drawn levels stay");
+        assert_eq!(app.events_cmd(EvCmd::AutoSmooth).as_deref(), Some("Auto smoothing on"));
+        for &(t, l) in &raw {
+            set(&mut app.state, t, l);
+        }
+        app.events_release(Stroke::Draw((0, 0.0), (96, 0.0)));
+        assert_eq!(points(&app.state), vec![(0, 0), (24, 6400), (48, 6400), (72, 6400), (96, 0)]);
+        assert_eq!(app.events_cmd(EvCmd::AutoSmooth).as_deref(), Some("Auto smoothing off"));
+
+        // Center: the playhead is the pattern marker while stopped; the graph is 660 px at 48 px a beat, 96 ticks a
+        // beat, so the marker at 1920 leaves 660 ticks between it and the left edge.
+        app.state.piano.marker = 1920;
+        app.state.song_mode = false;
+        assert_eq!(playhead(&app.state, false, false, 0.0), Some(1920.0));
+        assert_eq!(app.events_cmd(EvCmd::Center), None);
+        assert!((app.state.events.scroll - 1260.0).abs() < 0.01);
+        // The 0 key is the menu's Center.
+        app.state.events.scroll = 0.0;
+        app.state.z.push(Win::Events);
+        assert!(app.events_key(&winit::keyboard::Key::Character("0".into()), false, false));
+        assert!((app.state.events.scroll - 1260.0).abs() < 0.01);
     }
 }

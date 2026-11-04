@@ -84,22 +84,28 @@ fn commands(params: &Value) -> Result<Vec<Command>, Fail> {
 impl App {
     /// Answers one request line from client `c` (`None`: a notification, no answer).
     pub fn rpc_line(&mut self, c: &mut Client, line: &str) -> Option<String> {
-        let (id, out) = match serde_json::from_str::<Value>(line) {
-            Err(e) => (Value::Null, Err(Fail(PARSE, e.to_string()))),
+        let who = c.name.clone();
+        let (method, id, out) = match serde_json::from_str::<Value>(line) {
+            Err(e) => ("invalid request".to_string(), Some(Value::Null), Err(Fail(PARSE, e.to_string()))),
             Ok(req) => {
                 let id = req.get("id").cloned();
-                let method = req.get("method").and_then(Value::as_str);
+                let method = req.get("method").and_then(Value::as_str).unwrap_or("?").to_string();
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
-                let out = match method {
+                let out = match req.get("method").and_then(Value::as_str) {
                     Some(m) if req.get("jsonrpc").and_then(Value::as_str) == Some("2.0") => self.rpc(c, m, &params),
                     _ => Err(Fail(INVALID, "not a JSON-RPC 2.0 request".into())),
                 };
-                match id {
-                    None => return None,
-                    Some(id) => (id, out),
-                }
+                (method, id, out)
             }
         };
+        // The console shows what ran and its outcome, never the request's params or a token.
+        let status = match &out {
+            Ok(result) => format!("ok {}", crate::tools::short_value(result)),
+            Err(Fail(code, message)) => format!("error {code}: {}", crate::tools::clip(message, 120)),
+        };
+        self.state.tools.script.push(format!("{who}: {} -> {status}", crate::tools::clip(&method, 60)));
+        // A notification has no answer, but its outcome still shows in the console.
+        let id = id?;
         let reply = match out {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err(Fail(code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),

@@ -29,7 +29,7 @@ pub struct Placed {
 }
 
 /// The windows placed by position: the channel rack, the channel window and the tool windows.
-pub const PLACED: [Placed; 11] = [
+pub const PLACED: [Placed; 13] = [
     Placed {
         win: Win::ChannelRack,
         rect: views::rack::rect,
@@ -47,6 +47,8 @@ pub const PLACED: [Placed; 11] = [
         set_pos: |s, p| s.plugin_pos = p,
     },
     Placed { win: Win::Perf, rect: views::perf::rect, paint: views::perf::bounds, bounds: views::perf::bounds, pos: |s| s.perf.pos, set_pos: |s, p| s.perf.pos = p },
+    Placed { win: Win::ControlBuilder, rect: views::control_builder::rect, paint: views::control_builder::bounds, bounds: views::control_builder::bounds, pos: |s| s.tools.builder.pos, set_pos: |s, p| s.tools.builder.pos = p },
+    Placed { win: Win::ScriptOutput, rect: views::script_output::rect, paint: views::script_output::bounds, bounds: views::script_output::bounds, pos: |s| s.tools.script.pos, set_pos: |s, p| s.tools.script.pos = p },
     Placed { win: Win::Tapper, rect: views::tapper::rect, paint: views::tapper::bounds, bounds: views::tapper::bounds, pos: |s| s.tapper.pos, set_pos: |s, p| s.tapper.pos = p },
     Placed { win: Win::Touch, rect: views::touch::rect, paint: views::touch::bounds, bounds: views::touch::bounds, pos: |s| s.touch.pos, set_pos: |s, p| s.touch.pos = p },
     Placed { win: Win::Events, rect: views::events::rect, paint: views::events::bounds, bounds: views::events::bounds, pos: |s| s.events.pos, set_pos: |s, p| s.events.pos = p },

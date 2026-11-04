@@ -21,6 +21,8 @@ pub mod mixer;
 pub mod piano;
 pub mod patterns;
 pub mod perf;
+pub mod control_builder;
+pub mod script_output;
 pub mod playlist;
 pub mod project_forms;
 pub mod rack;
@@ -225,6 +227,8 @@ pub fn paint(ui: &mut Ui, s: &State, f: &FrameInfo) -> usize {
             Win::ChannelRack => ui.part(Seg::Win(win), a, |ui| rack::paint(ui, s, f)),
             Win::Plugin => ui.part(Seg::Win(win), a, |ui| channel_win::paint(ui, s, f)),
             Win::Perf => ui.part(Seg::Win(win), a, |ui| perf::paint(ui, s, f)),
+            Win::ControlBuilder => ui.part(Seg::Win(win), a, |ui| control_builder::paint(ui, s)),
+            Win::ScriptOutput => ui.part(Seg::Win(win), a, |ui| script_output::paint(ui, s)),
             Win::Tapper => ui.part(Seg::Win(win), a, |ui| tapper::paint(ui, s, f)),
             Win::Touch => ui.part(Seg::Win(win), a, |ui| touch::paint(ui, s, f)),
             Win::Strum => ui.part(Seg::Win(win), a, |ui| strum::paint(ui, s, f)),

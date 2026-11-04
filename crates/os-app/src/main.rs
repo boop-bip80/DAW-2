@@ -91,6 +91,7 @@ mod piano_split;
 mod piano_tools;
 mod rack;
 mod remote;
+mod tools;
 mod render;
 mod pattern_render;
 mod patterns;

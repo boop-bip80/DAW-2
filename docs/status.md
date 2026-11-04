@@ -360,7 +360,13 @@ clips clears the locks. Both are one undo step, and the locks are saved in `.lem
 TOOLS > Set up for MIDI export asks first, then turns every sampler and instrument channel into a Lemon MIDI Out
 channel (MIDI channel 1, 2, 3 … in rack order, port 0, patch 1, on the master track, each with a cut group of its
 own; names, places and notes kept), as one undo step that brings the channels and their instruments back.
-Not yet (greyed in the menu bar): TOOLS > Control builder; VIEW > Script output.
+TOOLS > Control builder (Shift+F10) lists every MIDI controller link the Remote control settings keep: what it drives,
+its controller, port, mode, formula and smoothing. Edit opens that link in the MIDI learn box, Remove deletes it, and
+the assignment buttons at the bottom open the same box for the selected channel's volume and pan and the selected
+mixer track's fader and pan. The list is read from the settings as it paints, so a link accepted in the box is there
+the next time the builder is in front. VIEW > Script output (Shift+F11) shows the control plane's requests as they run:
+the client, the method and its result or error, newest last, with Clear. Request parameters and tokens are not shown;
+the last 200 lines are kept, and Older / Newer scroll through them.
 
 **Window positions.** Where the windows were when Lemon Studio closed comes back at the next start: the main
 window (its place and size, and whether it was maximized; brought back onto a screen if its screen is gone) and the

@@ -55,6 +55,10 @@ pub enum Win {
     Container,
     /// A container's routing graph: its connections, named outputs and note processors.
     Graph,
+    /// TOOLS > Control builder: the MIDI controller links, with edit and remove.
+    ControlBuilder,
+    /// VIEW > Script output: the control plane's request console.
+    ScriptOutput,
     /// A docked hosted-plugin window (a native child window; rack row), stacked with the drawn windows.
     Hosted(usize),
 }
@@ -189,6 +193,10 @@ pub enum Action {
     PianoDlg(crate::piano_dlg::Act),
     /// The event editor's buttons and areas (spec: ui/event-editor.md).
     Events(crate::events::EvAct),
+    /// TOOLS > Control builder's rows and assignment buttons (`crate::tools::BuilderAct`).
+    ControlBuilder(crate::tools::BuilderAct),
+    /// VIEW > Script output's Clear button (`crate::tools::ScriptAct`).
+    ScriptOutput(crate::tools::ScriptAct),
     /// Monitor debug panel: a slider (index into `monitor::PARAMS`), Reset, Save, Close.
     MonParam(usize),
     MonReset,
@@ -990,6 +998,8 @@ pub struct State {
     pub cpu: crate::cpu::Cpu,
     /// The Plugin performance monitor's readings and options (read with the CPU panel while it is shown).
     pub perf: crate::perf::Perf,
+    /// TOOLS > Control builder and VIEW > Script output: where they are, what they show.
+    pub tools: crate::tools::ToolsUi,
     /// The Tempo tapper: where it is, the count of taps, the pad's flash.
     pub tapper: crate::tapper::TapperUi,
     /// The container's window: where it is, which container it shows, the levels its chain plays.
@@ -1531,6 +1541,7 @@ impl App {
                 monitor: crate::monitor::Monitor::with_cfg(load_monitor_cfg()),
                 cpu: crate::cpu::Cpu::saved(),
                 perf: crate::perf::Perf::default(),
+                tools: Default::default(),
                 tapper: Default::default(),
                 container: Default::default(),
                 graph: Default::default(),
@@ -7887,9 +7898,12 @@ impl App {
             // The browser and the pickers: General ▸ Input ▸ Manage shortcuts (spec: ui/settings-choices.md).
             Key::Named(NamedKey::F8) => self.f8_key(ctrl, alt),
             Key::Named(NamedKey::F9) => self.act(Action::ToggleWin(Win::Mixer)),
+            // TOOLS > Control builder and VIEW > Script output (Shift+F10 / Shift+F11).
+            Key::Named(NamedKey::F10) if self.shift => self.act(Action::ToggleWin(Win::ControlBuilder)),
             Key::Named(NamedKey::F10) => self.open_settings(views::settings::MIDI),
             // Toolbars > Hide (spec: ui/toolbar-menu.md §5).
             Key::Named(NamedKey::F11) if ctrl => self.toolbar_switch(views::toolbar::Switch::Hide),
+            Key::Named(NamedKey::F11) if self.shift => self.act(Action::ToggleWin(Win::ScriptOutput)),
             Key::Named(NamedKey::F11) => self.open_settings(views::settings::INFO),
             // Monitor debug panel (views/mondebug.rs) parked 2026-10-09: its values are now the defaults. Uncomment to tune again.
             // Key::Named(NamedKey::F12) => self.state.monitor.debug = !self.state.monitor.debug,
@@ -8583,6 +8597,8 @@ impl App {
                 }
             }
             Action::Perf(p) => self.perf_act(p),
+            Action::ControlBuilder(a) => self.builder_act(a),
+            Action::ScriptOutput(a) => self.script_act(a),
             Action::Tapper(a) => self.tapper_act(a),
             Action::Touch(a) => self.touch_act(a),
             Action::Strum(a) => self.strum_act(a),
@@ -8704,6 +8720,8 @@ impl App {
             Action::ToggleWin(Win::Browser) => s.show_browser = !s.show_browser,
             Action::ToggleWin(Win::Perf) => self.toggle_perf(),
             Action::ToggleWin(Win::Tapper) => self.toggle_tapper(),
+            Action::ToggleWin(Win::ControlBuilder) => self.toggle_control_builder(),
+            Action::ToggleWin(Win::ScriptOutput) => self.toggle_script_output(),
             Action::ToggleWin(Win::Touch) => self.toggle_touch(),
             Action::ToggleWin(w) => {
                 if s.shown(w) && s.in_front(w) {
@@ -9468,7 +9486,8 @@ impl App {
             // spec: ui/browser-commands.md
             MenuCmd::Jump(j) if j.available() => self.browser_jump(j),
             // VIEW's window entries are window toggles (`Action::ToggleWin`); ▸ entries open their submenu.
-            MenuCmd::Jump(_) | MenuCmd::Window(_) | MenuCmd::Sub(_) | MenuCmd::None => {
+            MenuCmd::Window(w) => self.act(Action::ToggleWin(w)),
+            MenuCmd::Jump(_) | MenuCmd::Sub(_) | MenuCmd::None => {
                 self.state.message = Some(format!("{}: not available yet", entry.label));
             }
         }

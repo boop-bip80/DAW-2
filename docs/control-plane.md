@@ -24,6 +24,9 @@ can connect, but every program on it can, so on a port a client must first give 
 answered before that. A connection that sends a line that isn't JSON (a web page posting to the port) gets one parse
 error and is closed. On Linux and macOS prefer a socket path. Port `0` picks a free one.
 
+In the app, **VIEW > Script output** (Shift+F11) shows each request and its outcome as it runs. Parameters and
+tokens are not shown; the newest 200 lines are kept and can be scrolled back through.
+
 ```bash
 lemonstudio --control /tmp/lemon.sock song.flp
 lemonstudio --serve 7777 --control-level propose song.flp

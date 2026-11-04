@@ -32,8 +32,14 @@ Systems a fully functional DAW can't ship without.
   Fruity effects stay wrapped instead of becoming the native plugins, and a 3x Osc saved before FL Studio 21 has
   its envelope and filter settings at their defaults
 - [x] **Multi-core mixing.** The engine renders on one audio thread, which limits dense projects
-- [ ] **Engine rework (sampler voice, automation).** The README's roadmap names it as the next big step; land it
-  before the alpha rather than after
+- [ ] **Engine rework (sampler voice, automation).** The automation half is done: a pattern's control points now move
+  send levels and the project's main pitch, the two targets they could not reach
+  (`engine::tests::a_pattern_point_moves_a_send_and_the_main_pitch`). What remains is the sampler voice: the engine's
+  own voices never loop over a channel's loop points, so a sample played by the engine itself (no hosted Lemon
+  Sampler) plays out where the sampler would sustain ([engine.rs](../crates/os-engine/src/engine.rs), "The engine's
+  own voices never loop"). Looping needs a decision on what the loop does at the note's end — FL holds it until the
+  note off, then runs the closing fade — and it changes the rule that ends a voice when its sample is out, which the
+  song's end is computed from; that is why it is not a one-line change
 
 ## Built-in instruments and effects
 

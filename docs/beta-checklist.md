@@ -12,9 +12,16 @@ Tick an item in the change that finishes it; for one under way, add "(in progres
 
 ## Alpha blockers still open
 
-- [ ] **Engine rework (sampler voice, automation).** The README's roadmap names it as the next big step. The sampler
-  voice and the automation walk are the two places where the engine still takes shortcuts that a dense project can
-  hear.
+- [ ] **Sampler voice loops.** The automation half of the engine item is done and tested:
+  `cargo test -p os-engine a_pattern_point_moves_a_send_and_the_main_pitch` covers a pattern control point on a send
+  level and on the main pitch, including a channel that does not follow the main pitch and a replay from another
+  position. The sampler voice half remains: the engine's own voices never loop over the channel's loop points
+  (`crates/os-engine/src/engine.rs`, "The engine's own voices never loop"), so a sample the engine plays itself — no
+  hosted Lemon Sampler — plays out instead of sustaining. What exactly remains: give `ChannelState` the channel's
+  loop range when "Use loop points" is on, carry it on `Voice`, wrap `pos` in `render_voice_into` while the note is
+  held, and decide the note-off behaviour (FL runs the closing fade from the loop position); the song's end must
+  ignore a looping voice so a render still finishes. That needs a golden render to check against, which this
+  environment has no audio device or reference export for.
 
 ## Shipping
 

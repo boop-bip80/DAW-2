@@ -335,8 +335,10 @@ and Touch controller. Kept with the program's settings, not the project. Which w
 - Automation clips for channel, mixer and plugin parameters
 - A clip drives every target it is linked to, including mixer slot switches and mix levels, track EQ, send
   levels, stereo separation and the channel's level adjustments
-- A pattern's control points drive mixer volumes, pans, separation, equalisers, slot switches and mix levels, the
-  tempo and plugin parameters, besides the channel's own settings (sends and the main pitch not yet)
+- A pattern's control points drive mixer volumes, pans, separation, equalisers, send levels, slot switches and mix
+  levels, the tempo, the main pitch and plugin parameters, besides the channel's own settings. A send's value is read
+  in the mixer's own unit (stored 0..=16000), and a main-pitch point retunes every channel that follows it, the voices
+  already sounding included
 - All thirteen curve shapes are walked exactly; values are taken one tick ahead and passed on only when
   they change
 - A clip's range (its channel's MIN and MAX knobs, minimum above maximum turning the curve upside down) and its

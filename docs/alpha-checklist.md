@@ -32,14 +32,14 @@ Systems a fully functional DAW can't ship without.
   Fruity effects stay wrapped instead of becoming the native plugins, and a 3x Osc saved before FL Studio 21 has
   its envelope and filter settings at their defaults
 - [x] **Multi-core mixing.** The engine renders on one audio thread, which limits dense projects
-- [ ] **Engine rework (sampler voice, automation).** The automation half is done: a pattern's control points now move
+- [x] **Engine rework (sampler voice, automation).** Both halves are done and tested. A pattern's control points move
   send levels and the project's main pitch, the two targets they could not reach
-  (`engine::tests::a_pattern_point_moves_a_send_and_the_main_pitch`). What remains is the sampler voice: the engine's
-  own voices never loop over a channel's loop points, so a sample played by the engine itself (no hosted Lemon
-  Sampler) plays out where the sampler would sustain ([engine.rs](../crates/os-engine/src/engine.rs), "The engine's
-  own voices never loop"). Looping needs a decision on what the loop does at the note's end — FL holds it until the
-  note off, then runs the closing fade — and it changes the rule that ends a voice when its sample is out, which the
-  song's end is computed from; that is why it is not a one-line change
+  (`engine::tests::a_pattern_point_moves_a_send_and_the_main_pitch`). The engine's own voices loop a sample while the
+  note is held: the channel's loop points, else the file's `smpl` sustain loop, now reach `Sample::loop_range` and
+  `ChannelState`, every `Voice` carries them, and `render_voice_into` wraps the read position at the loop's end. A note
+  off fades the voice across the loop and frees it, and a looped voice is released at its note's end or the song's, so
+  the song still ends (`a_looped_voice_wraps_at_the_loop_end`, `a_looped_voice_fades_out_on_note_off`,
+  `a_song_ends_with_a_looping_voice_ringing`; a sample without a loop still plays once)
 
 ## Built-in instruments and effects
 

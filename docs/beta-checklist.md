@@ -12,16 +12,14 @@ Tick an item in the change that finishes it; for one under way, add "(in progres
 
 ## Alpha blockers still open
 
-- [ ] **Sampler voice loops.** The automation half of the engine item is done and tested:
-  `cargo test -p os-engine a_pattern_point_moves_a_send_and_the_main_pitch` covers a pattern control point on a send
-  level and on the main pitch, including a channel that does not follow the main pitch and a replay from another
-  position. The sampler voice half remains: the engine's own voices never loop over the channel's loop points
-  (`crates/os-engine/src/engine.rs`, "The engine's own voices never loop"), so a sample the engine plays itself — no
-  hosted Lemon Sampler — plays out instead of sustaining. What exactly remains: give `ChannelState` the channel's
-  loop range when "Use loop points" is on, carry it on `Voice`, wrap `pos` in `render_voice_into` while the note is
-  held, and decide the note-off behaviour (FL runs the closing fade from the loop position); the song's end must
-  ignore a looping voice so a render still finishes. That needs a golden render to check against, which this
-  environment has no audio device or reference export for.
+None. The engine item is done and tested: `cargo test -p os-engine
+a_pattern_point_moves_a_send_and_the_main_pitch` covers the automation half (a pattern control point on a send level
+and on the main pitch, a channel that does not follow the main pitch, and a replay from another position), and
+`a_looped_voice_wraps_at_the_loop_end`, `a_looped_voice_fades_out_on_note_off` and
+`a_song_ends_with_a_looping_voice_ringing` cover the sampler: the channel's loop points or the file's `smpl` sustain
+loop reach `Sample::loop_range` and `ChannelState`, each `Voice` carries the range, `render_voice_into` wraps the read
+position at the loop's end, a note off fades the voice across the loop and frees it, a sample without a loop still
+plays once, and a looping voice is released at the song's end so a render finishes.
 
 ## Shipping
 

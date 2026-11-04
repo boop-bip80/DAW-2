@@ -8,9 +8,10 @@
 //! control"), and takes it out, "Remove start value" (no undo step, as in FL). With "Initialize controls
 //! automatically" on, "Create automation clip" adds the control too, in its own step (`playlist::create_automation`).
 //! In song mode, starting playback, moving the song position and playback looping back to the song's start set every
-//! control in the list to its value (`apply`; the engine sets them itself where it loops), then automation clips act as
-//! usual. The browser lists them under Current project ▸ Initialized controls (`views::browser`); the file holds them
-//! in event 216 (`os_flp::project`).
+//! control in the list to its value (`apply`); the engine applies the model's controls where it loops, while the app
+//! reaches hosted plugin parameters. A project opened in song mode applies them after its instances and parameter lists
+//! are ready. Then automation clips act as usual. The browser lists them under Current project ▸ Initialized controls
+//! (`views::browser`); the file holds them in event 216 (`os_flp::project`).
 // spec: ui/settings-choices.md "Advanced: Initialize controls automatically (2026-10-16)"
 
 use os_model::target::{self, Target};
@@ -472,6 +473,66 @@ mod tests {
         assert_eq!(controls(&d), INIT);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&resaved);
+    }
+
+    /// A plugin parameter's start value is written to a `.lemon` project, read back unchanged, and reaches the hosted
+    /// parameter both when the project finishes loading and when the song starts at position 0.
+    #[test]
+    fn a_plugin_start_value_survives_save_and_reopens_at_song_start() {
+        let dir = std::env::temp_dir().join(format!("lemon-plugin-init-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Plugin start.lemon");
+        let mut a = app();
+        a.reset_hosted();
+        a.plugins.effects = crate::plugins::builtin_effects();
+        let eq = os_model::SlotPlugin {
+            id: os_model::Id::NONE,
+            name: crate::plugins::EQ_FILE_NAME.into(),
+            state: lemon_parametric_eq_2::params::default_state(),
+        };
+        a.state.project.mixer[2].slots[1] = Some(eq);
+        a.sync_effects();
+        let key = crate::plugins::fx_key(2, 1);
+        a.params_tick();
+        assert!(a.plugins.hosted.contains_key(&key));
+
+        let tgt = target::slot_param(2, 1, 35);
+        let [init, _] = items(&a.state, Some((tgt, 0.75)));
+        pl::run(&mut a, init.cmd);
+        let stored = a.state.project.init_controls.iter().find(|c| c.target == tgt).copied().expect("the start value");
+        assert_eq!((stored.head, stored.value), (os_model::InitControl::PLUGIN_HEAD, 750_000));
+        pl::arr_mut(&mut a.state).clips.push(Clip::new(0, 4 * 384, 0, ClipSource::Pattern(1)));
+        a.state.song_mode = true;
+        a.save_to(path.clone());
+        assert!(path.is_file(), "save wrote the project");
+
+        let file = os_flp::FlpFile::parse(&std::fs::read(&path).unwrap()).unwrap();
+        let disk = os_flp::project::load(&file).unwrap();
+        assert_eq!(disk.init_controls, vec![stored], "the record round-trips unchanged");
+
+        let mut b = App::new(None);
+        b.plugins.effects = crate::plugins::builtin_effects();
+        b.open(path.clone());
+        for _ in 0..10_000 {
+            b.plugin_tick();
+            if !b.loading() {
+                break;
+            }
+        }
+        assert!(!b.loading(), "the project finishes loading");
+        assert!(b.plugins.hosted.contains_key(&key), "the EQ is hosted after reopen");
+        let value = crate::params::param_value(&b.state, key, 35).expect("the parameter is listed");
+        assert!((value - 0.75).abs() < 1e-6, "loading the project applies the start value: {value}");
+
+        // Move the hosted parameter away, then start the song at 0: the transport path must put it back.
+        assert!(crate::params::set_param_value(&mut b.state, key, 35, 0.25));
+        b.state.song_mode = true;
+        b.state.playlist.pos = 0;
+        b.start_playback();
+        let value = crate::params::param_value(&b.state, key, 35).expect("the parameter is still listed");
+        assert!((value - 0.75).abs() < 1e-6, "starting at 0 applies the start value: {value}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// The browser lists the controls under Current project ▸ Initialized controls ("<owner> - <setting>"), a folder

@@ -206,8 +206,11 @@ clicking it does nothing. The full, item-by-item roadmap lives on the
   the host to show its menu gets one of Lemon Studio's own menus, docked or detached
 - The parameter menu (a parameter in the browser after "Browse parameters", TOOLS ▸ Last tweaked): create or edit
   the parameter's automation clip, link a controller, copy, paste, type in or set a value (a submenu of its steps, or
-  its default and minimum to maximum), remove an initial value read from a file
-- Not yet in the parameter menu: Init song with this position on a plugin parameter
+  its default and minimum to maximum), set or remove a song start value, and remove an initial value read from a file
+- The parameter menu's Init song with this position (Set as song start value) works on plugin parameters too: the
+  value is kept as a Lemon Studio record (head 0x4C4D5031, normalized millionths) and set when the song starts, opens,
+  seeks or loops, after the hosted instance and its parameter list are ready. FL's plugin records use units Lemon
+  Studio does not know: they are kept byte for byte and are not applied
 - VST2 shells (one file offering several plugins); a VST2 plugin's state is saved in the layout FL Studio's projects use
 - A plugin that crashes is stopped (its slot passes the sound through) instead of closing Lemon Studio. On macOS
   and Linux this is new, and on macOS a crash in a plugin's editor still closes Lemon Studio

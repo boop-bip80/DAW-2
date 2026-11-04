@@ -50,7 +50,7 @@ pub(crate) fn put(s: &mut State, t: u32, e: Option<InitControl>) {
 }
 
 /// "Set as song start value": control `t`, at its value `v` (0..1), goes in the list, replacing an earlier value.
-/// One undo step, "Initialized control". Nothing for a control whose stored units aren't known (a plugin parameter).
+/// One undo step, "Initialized control". Plugin parameters are stored as Lemon Studio's normalized records.
 pub fn init(s: &mut State, t: u32, v: f64) {
     let Some(c) = InitControl::from_unit(t, v) else { return };
     history::record(s, INITIALIZED, Snap::Init(t, entry(s, t)));
@@ -70,7 +70,8 @@ pub(crate) fn automatic(t: u32, v: f64) -> Option<InitControl> {
 
 /// "Set as song start value" and "Remove start value" for a menu whose "Create automation clip" makes a clip on
 /// `control` (its target and current value 0..1); both greyed without one. Init is checked while the control is in the
-/// list, and greyed ("not yet") for a control whose stored units aren't known; Delete is greyed unless it is listed.
+/// list, and greyed ("not yet") for a control whose stored units aren't known; plugin parameters are known (Lemon
+/// Studio's normalized records). Delete is greyed unless it is listed.
 pub fn items(s: &State, control: Option<(u32, f64)>) -> [PItem; 2] {
     let Some((t, v)) = control else {
         return [PItem::new(INIT_LABEL, Cmd::Nothing).off(), PItem::new(DELETE_LABEL, Cmd::Nothing).off()];
@@ -117,6 +118,11 @@ fn set_value(s: &mut State, c: InitControl) -> bool {
         _ => {}
     }
     match target::decode(c.target) {
+        Target::ChannelParam(..) | Target::SlotParam(..) => {
+            let Some(v) = c.unit() else { return false };
+            let Some((key, index)) = crate::params::key_of(s, target::decode(c.target)) else { return false };
+            crate::params::set_param_value(s, key, index, v)
+        }
         Target::Tempo => set(&mut s.tempo, (f / 1000.0).clamp(10.0, 522.0)),
         Target::ChannelVolume(ch) => p.channels.iter_mut().find(|x| x.index == ch).is_some_and(|x| set(&mut x.volume, (f / 12800.0).clamp(0.0, 1.0))),
         Target::ChannelPan(ch) => p.channels.iter_mut().find(|x| x.index == ch).is_some_and(|x| set(&mut x.pan, (f / 6400.0 - 1.0).clamp(-1.0, 1.0))),
@@ -236,7 +242,7 @@ mod tests {
     }
 
     /// The two items go wherever "Create automation clip" makes a clip; Init is checked while the control is listed and
-    /// Delete can be chosen only then; both greyed without a control, Init greyed ("not yet") for a plugin parameter.
+    /// Delete can be chosen only then; both greyed without a control, and a plugin parameter uses Lemon's record.
     #[test]
     fn menus_offer_the_initial_value_with_a_check_mark() {
         let mut a = app();
@@ -260,9 +266,12 @@ mod tests {
         // No clip to make (the rack's mixer box): both greyed.
         let (init, delete) = pair(&crate::rack::mixer_menu(&a.state, 0, 0.0, 0.0));
         assert!(!init.enabled && !delete.enabled);
-        // A plugin parameter: its stored units aren't known.
+        // A plugin parameter: Lemon Studio's normalized record.
         let [init, delete] = items(&a.state, Some((target::channel_param(0, 3), 0.5)));
-        assert!(!init.enabled && matches!(init.cmd, Cmd::NotYet(_)) && !delete.enabled);
+        assert!(init.enabled && matches!(init.cmd, Cmd::InitControl(..)) && !delete.enabled);
+        pl::run(&mut a, init.cmd);
+        assert_eq!(a.state.project.init_controls.last().map(|c| (c.head, c.value)), Some((os_model::InitControl::PLUGIN_HEAD, 500_000)));
+        pl::run(&mut a, Cmd::DeleteInit(target::channel_param(0, 3)));
 
         // "Remove start value": the control leaves the list.
         let delete = pair(&rack_menu(&a)).1.cmd;

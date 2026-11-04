@@ -196,11 +196,12 @@ impl ControllerLink {
 }
 
 /// One of the project's initial values: a control and the value it takes when the song starts (spec:
-/// ui/settings-choices.md "Advanced: Initialize controls automatically"). A 12-byte record of event 216, kept as read,
-/// so a record whose meaning isn't known (a plugin parameter's) is written back as it was.
+/// ui/settings-choices.md "Advanced: Initialize controls automatically"). A 12-byte record of event 216. Plugin
+/// parameters are Lemon Studio's own records ([`InitControl::PLUGIN_HEAD`]); records read from FL Studio (head 0) keep
+/// their unknown units and are written back as they were.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitControl {
-    /// Bytes 0..3 of the record: 0 in every record seen.
+    /// Bytes 0..3 of the record: 0 in FL's records, [`InitControl::PLUGIN_HEAD`] in Lemon Studio's plugin records.
     pub head: u32,
     /// The control (bytes 4..7), as an automation target ([`target`]): the setting's id in the low 16 bits, its place
     /// (a channel index, a mixer place or 0x4000 for the project) in the high 16.
@@ -212,6 +213,13 @@ pub struct InitControl {
 impl InitControl {
     /// The record's size in event 216.
     pub const LEN: usize = 12;
+
+    /// Plugin parameter records written by Lemon Studio carry this head. Their `value` is the normalized parameter value
+    /// in millionths (`0..=1_000_000`); FL's plugin values use units Lemon Studio does not know, so records with head 0
+    /// are never applied or converted.
+    pub const PLUGIN_HEAD: u32 = 0x4C4D_5031;
+    /// The normalized value plugin records hold at 1.0 ([`InitControl::PLUGIN_HEAD`]).
+    pub const PLUGIN_SCALE: f64 = 1_000_000.0;
 
     /// The project's main volume (stored 0..=16000), main swing (0..=128) and main pitch (cents) at the project's place
     /// (spec: flp/layouts.md "Parameter ids in an automation link").
@@ -234,8 +242,8 @@ impl InitControl {
         b
     }
 
-    /// Control `t` at the automation value `v` (0..1), in the setting's stored units; `None` for a control whose stored
-    /// units aren't known (plugin parameters, see [`InitControl::unit`]).
+    /// Control `t` at the automation value `v` (0..1), in the setting's stored units; a plugin parameter becomes a
+    /// Lemon Studio record ([`InitControl::PLUGIN_HEAD`]); `None` for a control whose stored units aren't known.
     pub fn from_unit(t: u32, v: f64) -> Option<InitControl> {
         use target::Target;
         let v = v.clamp(0.0, 1.0);
@@ -243,6 +251,9 @@ impl InitControl {
         // the original writes for it was not measured, and no automation clip drives it yet (`unit` gives `None`).
         if t == Self::MAIN_SWING {
             return Some(InitControl { head: 0, target: t, value: (128.0 * v).round() as i32 });
+        }
+        if matches!(target::decode(t), Target::ChannelParam(..) | Target::SlotParam(..)) {
+            return Some(InitControl { head: Self::PLUGIN_HEAD, target: t, value: (Self::PLUGIN_SCALE * v).round() as i32 });
         }
         let value = match target::decode(t) {
             Target::ChannelVolume(_) | Target::ChannelPan(_) | Target::SlotMix(..) => 12800.0 * v,
@@ -262,11 +273,15 @@ impl InitControl {
 
     /// The value as an automation clip hands it on (0..1), for the settings whose stored units are known: the inverse
     /// of [`InitControl::from_unit`] (spec: audio/voice-levels.md "Values from automation", audio/mixer.md "Changes
-    /// while the song plays", audio/timing.md "Tempo that changes"). Plugin parameters, a channel's other levels and
-    /// the project's main volume and swing give `None`.
+    /// while the song plays", audio/timing.md "Tempo that changes"). Plugin parameters are known only in Lemon
+    /// Studio's records ([`InitControl::PLUGIN_HEAD`]); FL's plugin records, a channel's other levels and the project's
+    /// main volume and swing give `None`.
     pub fn unit(&self) -> Option<f64> {
         use target::Target;
         let v = f64::from(self.value);
+        if self.head == Self::PLUGIN_HEAD && matches!(target::decode(self.target), Target::ChannelParam(..) | Target::SlotParam(..)) {
+            return Some((v / Self::PLUGIN_SCALE).clamp(0.0, 1.0));
+        }
         let unit = match target::decode(self.target) {
             Target::ChannelVolume(_) | Target::ChannelPan(_) | Target::SlotMix(..) => v / 12800.0,
             Target::ChannelPitch(_) => (v + 4800.0) / 9600.0,
@@ -2521,8 +2536,16 @@ pub mod target {
             }
             // The main swing's start value: 0..128, as event 11 keeps it.
             assert_eq!(InitControl::from_unit(InitControl::MAIN_SWING, 0.5), Some(InitControl { head: 0, target: InitControl::MAIN_SWING, value: 64 }));
+            // Plugin parameters are Lemon Studio's normalized records; FL's head-0 records keep unknown units.
+            for t in [channel_param(0, 4), slot_param(1, 0, 2)] {
+                let c = InitControl::from_unit(t, 0.25).unwrap();
+                assert_eq!(c.head, InitControl::PLUGIN_HEAD);
+                assert_eq!(c.value, 250_000);
+                assert_eq!(c.unit(), Some(0.25));
+                assert_eq!(InitControl { head: 0, target: t, value: 7 }.unit(), None);
+            }
             // Units not known: kept, not converted.
-            for t in [channel_param(0, 4), slot_param(1, 0, 2), InitControl::MAIN_VOLUME, channel(0, CHANNEL_CUTOFF)] {
+            for t in [InitControl::MAIN_VOLUME, channel(0, CHANNEL_CUTOFF)] {
                 assert_eq!(InitControl::from_unit(t, 0.5), None);
                 assert_eq!(InitControl { head: 0, target: t, value: 7 }.unit(), None);
             }

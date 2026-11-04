@@ -2475,6 +2475,10 @@ impl App {
         if decoded && self.sync_samplers(Some(deadline)) && self.host_plugins(deadline) && self.loading.as_mut().is_some_and(|l| l.builds_done()) {
             self.loading = None;
             self.state.playlist.wave_wait = false;
+            // Plugin start values need their hosted instances and parameter lists, which are ready now (spec:
+            // ui/settings-choices.md "Advanced: Initialize controls automatically").
+            self.params_tick();
+            crate::init::apply(&mut self.state);
             // What was not found is listed now (spec: ui/project-loading.md §6).
             crate::missing::loaded(self);
             return self.invalidate();

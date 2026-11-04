@@ -112,6 +112,9 @@ sixteen effects and the Tesla audio editor; these are the gaps a project made in
 
 Greyed-out controls and partial features. These can land alongside the blockers.
 
+- [x] **Plugin parameter start values.** A plugin parameter's menu sets it as the song's start value, one undo step;
+  the value is a Lemon Studio record (normalized millionths) and is applied when a song starts, opens, seeks or loops,
+  after the hosted instance is ready. FL's plugin start-value records keep their unknown units and are not applied
 - [x] **Event editor window.** Edit events opens it from the parameter, channel rack and knob menus: a control's
   events in the pattern, drawn, erased, selected and deleted, and turned into an automation clip; Auto smoothing
   smooths a freehand stroke on release, and Center (0) puts the playing position in the middle of the graph

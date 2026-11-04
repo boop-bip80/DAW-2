@@ -747,10 +747,19 @@ mod tests {
         let tgt = target::slot_param(2, 1, 35);
         let create = menu.items.iter().find(|i| i.label == "Create automation clip").unwrap();
         assert_eq!(create.cmd, Cmd::CreateAutomation(tgt, "Lemon Parametric EQ - Bus 2 - Main level".into(), 0.5));
-        // A plugin parameter's stored units aren't known: no initial value (spec: ui/settings-choices.md "Advanced:
-        // Initialize controls automatically").
-        let init = menu.items.iter().find(|i| i.label == crate::init::INIT_LABEL).unwrap();
-        assert!(!init.enabled && matches!(init.cmd, Cmd::NotYet(_)));
+        // A plugin parameter can be the song's start value (spec: ui/settings-choices.md "Advanced: Initialize
+        // controls automatically"): Lemon Studio's normalized record, applied through the hosted parameter list.
+        let init = menu.items.iter().find(|i| i.label == crate::init::INIT_LABEL).unwrap().clone();
+        assert!(init.enabled);
+        crate::playlist::run(&mut a, init.cmd);
+        let rec = a.state.project.init_controls.iter().find(|c| c.target == tgt).copied().expect("the start value");
+        assert_eq!((rec.head, rec.value), (os_model::InitControl::PLUGIN_HEAD, 500_000));
+        assert!((value_of(&a.state, key, 35).unwrap() - 0.5).abs() < 1e-6);
+        assert!(crate::params::set_param_value(&mut a.state, key, 35, 0.25));
+        a.state.song_mode = true;
+        assert!(crate::init::apply(&mut a.state));
+        assert!((value_of(&a.state, key, 35).unwrap() - 0.5).abs() < 1e-6, "the song start value reaches the plugin");
+        a.state.project.init_controls.clear();
         // Copy value (main level), then paste another value onto band 1 level.
         crate::playlist::run(&mut a, Cmd::Param(PCmd::Copy(key, 35)));
         assert_eq!(a.state.value_clip, Some(0.5));

@@ -1611,6 +1611,9 @@ impl Engine {
             project
                 .init_controls
                 .iter()
+                // Plugin parameters are set by the app once their hosted instances exist; the engine has no list to
+                // reach them through here, and applying them twice would move a plugin's own edits.
+                .filter(|c| !matches!(os_model::target::decode(c.target), os_model::target::Target::ChannelParam(..) | os_model::target::Target::SlotParam(..)))
                 .filter_map(|c| Some((os_model::target::decode(c.target), (c.unit()? * 1_073_741_824.0).round_ties_even() as i64)))
                 .collect()
         } else {
@@ -7966,7 +7969,7 @@ mod tests {
         p.init_controls = vec![
             init(target::channel(0, target::CHANNEL_VOLUME), 6400),
             init(target::channel(0, target::CHANNEL_PITCH), 1200),
-            init(target::channel_param(0, 3), 99),
+            InitControl { head: InitControl::PLUGIN_HEAD, target: target::channel_param(0, 3), value: 500_000 },
         ];
         // A clip on the pitch from tick 0: it acts after the initial value.
         let mut auto_ch = channel();
@@ -7992,7 +7995,7 @@ mod tests {
         assert_eq!((e.channels[0].vol_v, e.channels[0].knob), (0.25, 2400.0), "the start is the app's: the channel's own volume");
         e.channels[0].knob = 0.0;
         to_loop(&mut e);
-        assert_eq!(e.init.len(), 2, "a plugin parameter's record is left out");
+        assert_eq!(e.init.len(), 2, "a plugin parameter's record is left to the app");
         assert_eq!(e.channels[0].vol_v, 0.5, "the initial volume where the song starts again");
         assert_eq!(e.channels[0].knob, 2400.0, "then the clip");
         // Pattern mode: no initial values.

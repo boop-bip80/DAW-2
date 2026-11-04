@@ -509,8 +509,8 @@ and Touch controller. Kept with the program's settings, not the project. Which w
 - A file of 30 s or more loaded into a sampler channel turns its Keep on disk on (General settings ▸
   Advanced ▸ Auto keep long audio on disk)
 - Lemon Trio's custom shape plays a sample as one period of the oscillator: choosing it opens a file dialog, and
-  its sample page shows the wave and loads another. The sample is the channel's (saved with the project, and the
-  channel is named after it while Auto name channels is on). Not yet: dropping a file on the sample page
+  its sample page shows the wave and loads another, with a click or a file dropped on it (Windows and macOS). The
+  sample is the channel's (saved with the project, and the channel is named after it while Auto name channels is on)
 - Keep on disk streams the sample from its file while it plays: only the first moments after each start point and a
   small buffer per voice stay in memory. It applies to uncompressed WAV and AIFF files played as they are; compressed
   files, the sample tools and effects, reverse and the Stretch / Stretch Pro methods keep the sample in memory, and

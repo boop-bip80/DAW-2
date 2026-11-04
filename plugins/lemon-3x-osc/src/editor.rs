@@ -218,6 +218,17 @@ impl Logic {
         self.sync_sample();
     }
 
+    /// Takes a file dropped on the editor: the sample page loads it as the custom shape's sample (as its click
+    /// does); another page leaves the sample alone and says where to drop it. Whether it loaded.
+    pub fn drop_sample(&mut self, path: &str) -> bool {
+        if usize::from(self.view.tab) != usize::from(view::PAGES) - 1 {
+            self.hint = "Custom shape sample: open the sample page to drop a file".into();
+            return false;
+        }
+        self.load(path);
+        true
+    }
+
     pub fn dragging(&self) -> bool {
         self.drag.is_some()
     }
@@ -467,6 +478,7 @@ mod win32 {
     use windows_sys::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OPENFILENAMEW};
     use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+    use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     use super::{Act, Btn, Logic, Mods};
@@ -561,6 +573,7 @@ mod win32 {
                 Box::into_raw(win) as *const c_void,
             );
             slot.store(hwnd as isize, Ordering::Release);
+            DragAcceptFiles(hwnd, 1);
             SetTimer(hwnd, TIMER, 30, None);
             Handle(hwnd as isize, slot)
         }
@@ -669,6 +682,18 @@ mod win32 {
                     let notches = ((wp >> 16) & 0xffff) as u16 as i16 as f32 / 120.0;
                     let acts = w.logic.wheel(x, y, notches, mods());
                     w.run(acts);
+                    0
+                }
+                WM_DROPFILES => {
+                    let drop = wp as HDROP;
+                    let mut buf = vec![0u16; 1024];
+                    let n = DragQueryFileW(drop, 0, buf.as_mut_ptr(), buf.len() as u32) as usize;
+                    DragFinish(drop);
+                    if n > 0 {
+                        let path = String::from_utf16_lossy(&buf[..n]);
+                        w.logic.drop_sample(&path);
+                        w.invalidate();
+                    }
                     0
                 }
                 WM_DESTROY => {
@@ -934,6 +959,9 @@ mod gui {
                 link: peer,
                 last_page: 0,
             };
+            // Sample files dropped on the editor reach its logic (Windows has WM_DROPFILES).
+            #[cfg(target_os = "macos")]
+            ed.win.accept_files();
             ed.run();
         });
         if thread.is_none() {
@@ -993,7 +1021,12 @@ mod gui {
                         let acts = self.logic.wheel(x, y, notches, self.mods());
                         self.act(acts);
                     }
-                    Input::Key { .. } | Input::Drop { .. } => {}
+                    Input::Key { .. } => {}
+                    // A file dropped on the editor: the sample page takes it (macOS; Windows has WM_DROPFILES).
+                    Input::Drop { path } => {
+                        self.logic.drop_sample(&path);
+                        self.dirty = true;
+                    }
                 }
                 if self.dirty && self.win.idle() {
                     self.paint();
@@ -1393,6 +1426,36 @@ mod tests {
             .filter(|&(xx, yy)| near(px[yy * view::W as usize + xx]))
             .count();
         assert!(lit > 300, "{lit} wave pixels");
+    }
+
+    /// A file dropped on the sample page loads it, as its click does; another page does not take it.
+    #[test]
+    fn sample_page_takes_a_dropped_file() {
+        let mut l = logic();
+        let path = wav("dropped.wav", &[0, 8192, 16384, 8192, 0, -8192, -16384, -8192]);
+        // The oscillator page does not take a drop: nothing loads, and the hint says where it goes.
+        l.view.tab = 0;
+        paint(&mut l);
+        assert!(!l.drop_sample(&path));
+        assert_eq!(l.hint, "Custom shape sample: open the sample page to drop a file");
+        assert_eq!(*l.params.sample_path.read().unwrap(), "");
+        assert_eq!(l.view.sample.path, "");
+        assert!(l.shared.wave().is_none());
+        // The sample page takes it, as its click does.
+        l.view.tab = 2;
+        paint(&mut l);
+        assert!(l.drop_sample(&path));
+        assert_eq!(l.hint, "Custom shape sample: dropped.wav");
+        assert_eq!(*l.params.sample_path.read().unwrap(), path);
+        assert_eq!(l.view.sample.path, path);
+        assert!(l.shared.wave().is_some());
+        // A file that is not a sample says so and keeps the wave the page shows.
+        let old = l.shared.wave().unwrap();
+        assert!(l.drop_sample(&format!("{path}.missing")));
+        assert_eq!(l.hint, "Custom shape sample: dropped.wav.missing could not be read");
+        assert_eq!(l.view.sample.path, path);
+        assert!(Arc::ptr_eq(&old, &l.shared.wave().unwrap()));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

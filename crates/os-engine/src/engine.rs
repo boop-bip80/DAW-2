@@ -242,6 +242,9 @@ impl ClipFx {
 struct ChannelState {
     /// The frames the channel's voices play (`None` for a sample that only `length` stands for).
     sample: Option<Arc<Sample>>,
+    /// The range the channel's own voices loop over while their note is held (frames of `sample`): its loop points,
+    /// or the file's own loop; `None` when it plays once.
+    looped: Option<(f64, f64)>,
     /// A channel its hosted instrument plays from the start (`Engine::with_instruments`): the length in frames and the
     /// rate of its sample in place of the decoded frames, which the engine never plays (`played`).
     length: Option<(usize, u32)>,
@@ -628,6 +631,8 @@ struct Voice {
     step: f64,
     /// Tick at which the voice is cut (the end of an audio clip), if any.
     cut: Option<u64>,
+    /// The range the voice loops over while its note is held (`ChannelState::looped`), or `None` for a one-shot.
+    looped: Option<(f64, f64)>,
     /// Tick at which the note is released (the envelopes' release starts); `None` = released with the song.
     release_at: Option<u64>,
     vel: f64,
@@ -1265,7 +1270,7 @@ impl Engine {
                 // The hosted sampler loops the sample: "Use loop points" is on (a sampler's default; an audio clip's is
                 // off) and there is a loop, the channel's own (one that is not the whole file) or the file's. Its voices
                 // are not one-shot voices: they sound until their note ends (spec: audio/note-rules.md, audio/sampler.md
-                // "The sample file"). The engine's own voices never loop.
+                // "The sample file"). The engine's own voices loop the same range (`ChannelState::looped`).
                 let use_loop = ch.sound.sampler_flags.map_or(ch.kind == ChannelKind::Sampler, |f| f & os_model::ChannelSound::USE_LOOP != 0);
                 let own_loop = |n: usize| ch.sound.loop_points.is_some_and(|[a, b]| b > a && (a > 0 || b < n as i64));
                 let looped = length.is_some_and(|(n, _)| {
@@ -1326,8 +1331,19 @@ impl Engine {
                 let insert = usize::from(ch.mixer_track).min(n_tracks - 1);
                 let knob = f64::from(ch.pitch_cents);
                 let main = ch.misc.main_pitch.then(|| i32::from(project.main_pitch.unwrap_or(0)));
+                // What an own voice of this channel loops over: the channel's loop points when it has them, else the
+                // file's own sustain loop, with the same switch the hosted sampler obeys (above).
+                let loop_range = sample.as_ref().and_then(|s| {
+                    let n = s.frames() as f64;
+                    let range = match ch.sound.loop_points {
+                        Some([a, b]) if a >= 0 && b > a => Some((a as f64, (b as f64).min(n))),
+                        _ => s.loop_range.map(|(a, b)| (a as f64, b as f64)),
+                    };
+                    range.filter(|&(a, b)| use_loop && a >= 0.0 && b > a && b <= n)
+                });
                 let mut state = ChannelState {
                     sample,
+                    looped: loop_range,
                     length,
                     volume,
                     pan: ch.pan,
@@ -2073,6 +2089,7 @@ impl Engine {
         let (vel, pan) = (laws::velocity_gain(velocity), 0.0);
         let gain = ch.start_gain(vel, pan);
         let serial = ch.serial;
+        let looped = ch.looped;
         // A realtime stretch copy made for this key plays as it is.
         let (buf, step) = match ch.keyed.iter().position(|k| k.0 == key) {
             Some(i) => ((i + 1) as u16, 1.0),
@@ -2084,6 +2101,7 @@ impl Engine {
             pos: 0.0,
             step,
             cut: None,
+            looped,
             release_at: None,
             vel,
             pan,
@@ -3131,10 +3149,18 @@ impl Engine {
                 continue;
             }
             let due = (song_end && v.cut.is_none()) || v.release_at.is_some_and(|r| r <= tick);
-            // A note's end only matters with the volume envelope on: otherwise the sampler plays on (measured).
-            if due && self.channels[v.channel].vol_env.is_some() {
-                v.off = Some(v.age);
+            if !due {
+                continue;
             }
+            if self.channels[v.channel].vol_env.is_some() {
+                v.off = Some(v.age);
+            } else if v.looped.is_some() {
+                // A looped voice never reaches its sample's end: its note's end (or the song's) fades it out as a note
+                // off does, so the tail rule can end the song instead of waiting on a voice that would never stop.
+                let fade = (f64::from(self.rate) * RELEASE_SECONDS) as u32;
+                v.release.get_or_insert((fade.max(1), fade.max(1)));
+            }
+            // A note's end only matters with the volume envelope on: otherwise the one-shot sampler plays on (measured).
         }
         // Instrument notes: their note offs and chokes, all of them at the song's end.
         let mut i = 0;
@@ -3303,9 +3329,11 @@ impl Engine {
         let layer = t.via.and_then(|w| self.channels.get(w.layer).map(|l| (l.layer_adds(), w.gain)));
         let gain = self.channels[t.channel].start_gain_via(t.vel, t.pan, layer);
         let serial = self.channels[t.channel].serial;
+        let looped = self.channels[t.channel].looped;
         self.voices.push(Voice {
             channel: t.channel,
             pos: t.from,
+            looped,
             step: t.rate,
             cut: t.cut,
             release_at: t.end,
@@ -3742,6 +3770,7 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
     let ch = &channels[v.channel];
     let Some(s) = ch.buffer(v.buf) else { return false };
     let n = s.frames();
+    let looped = v.looped.filter(|&(a, b)| a >= 0.0 && b > a && b <= n as f64);
     let glide = ch.ramp.filter(|r| v.serial < r.id);
     // A layer's note: the layer's volume and crossfade gain multiply, its pan and pitch add (spec: audio/note-rules.md
     // "Layer channels").
@@ -3841,6 +3870,14 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
         out[f * 2] += l * gl * fade * env_gain * shape;
         out[f * 2 + 1] += r * gr * fade * env_gain * shape;
         pos += step;
+        if let Some((a, b)) = looped {
+            // A held note plays across its loop: past the loop's end the read position goes back to its start, so the
+            // voice never reaches the sample's end. Its note off fades it out (`Voice::release`, above), and that fade
+            // runs across the loop; the voice frees when the fade ends.
+            while pos >= b {
+                pos -= b - a;
+            }
+        }
     }
     v.pos = pos;
     v.gain = (gl, gr);
@@ -6069,6 +6106,73 @@ mod tests {
         let o = offs(&p, |_| false);
         assert!(at_end(&o), "the channel's own loop: {o:?}");
         let _ = std::fs::remove_file(&wav);
+    }
+
+    /// A WAV of 550 stereo frames at 48 kHz: 100 of silence, then 300 at 0.5 (the loop), then 150 of silence, so a loop
+    /// that sounds can be told from a one-shot that has played out.
+    fn loop_sample(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("os-engine-{name}-{}.wav", std::process::id()));
+        let mut frames = vec![0.0f32; 1100];
+        frames[200..800].fill(0.5);
+        crate::wav::write_f32_stereo(&mut std::fs::File::create(&path).unwrap(), 48000, &frames).unwrap();
+        path
+    }
+
+    /// A channel that loops plays across its loop points while its note is held: past the sample's end the frames come
+    /// from inside the loop. The same sample without a loop plays once and is silent there.
+    #[test]
+    fn a_looped_voice_wraps_at_the_loop_end() {
+        let path = loop_sample("wrap");
+        let mut p = project(vec![long_note(0, 768, 0)], vec![]);
+        p.channels[0].sample_path = Some(path.to_string_lossy().into_owned());
+        p.channels[0].sound.loop_points = Some([100, 400]);
+        let looped = render(&p);
+        // The sample lasts about 11 ms; a second in, only the loop can sound (the file's tail is silent).
+        let past = &looped[2 * 44100..];
+        assert!(peak(past, 0) > 0.05, "the loop sounds past the sample's end: peak {}", peak(past, 0));
+        p.channels[0].sound.loop_points = None;
+        let once = render(&p);
+        let past = &once[2 * 44100..];
+        assert!(peak(past, 0) < 1e-6, "a one-shot is silent past its end: peak {}", peak(past, 0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A looped voice hears a note off: the release fade runs across the loop, which is the only thing that ends it (it
+    /// never reaches its sample's end), and frees the voice.
+    #[test]
+    fn a_looped_voice_fades_out_on_note_off() {
+        let path = loop_sample("off");
+        let mut p = project(vec![], vec![]);
+        p.channels[0].sample_path = Some(path.to_string_lossy().into_owned());
+        p.channels[0].sound.loop_points = Some([100, 400]);
+        let mut lib = SampleLibrary::new(None);
+        let mut e = Engine::new(&p, &mut lib, 44100, PlayMode::Pattern(1));
+        e.note_on(0, 60, 100);
+        let mut out = Vec::new();
+        e.render_ticks(8, &mut out);
+        assert_eq!(e.voices.len(), 1, "the note sounds across its loop");
+        e.note_off(0, 60);
+        e.render_ticks(64, &mut out);
+        assert!(e.voices.is_empty(), "the release fade freed the looping voice");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The song's end does not wait on a looping voice: one still ringing when the song ends is released there, so the
+    /// render finishes instead of running the tail rule out to its limit on a voice that would never reach its sample's
+    /// end.
+    #[test]
+    fn a_song_ends_with_a_looping_voice_ringing() {
+        let path = loop_sample("end");
+        let mut p = project(vec![long_note(0, 96, 0)], vec![]);
+        p.channels[0].sample_path = Some(path.to_string_lossy().into_owned());
+        p.channels[0].sound.loop_points = Some([100, 400]);
+        let mut lib = SampleLibrary::new(None);
+        let mut e = Engine::new(&p, &mut lib, 44100, PlayMode::Pattern(1));
+        let out = e.render_all(512);
+        assert!(e.finished(), "the song ended");
+        // 96 ticks is 0.44 s; an unreleased looping voice would hold the tail rule to its limit.
+        assert!(out.len() / 2 < 44100 * 3, "{} frames", out.len() / 2);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A paused playback whose hosted instruments another stream processes lets go of them: an audio clip's voice is

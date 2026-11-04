@@ -334,7 +334,6 @@ until let go (the tempo stays); while the window is in front, the Left / Right a
 
 **Closing windows.** VIEW > Close all windows (F12), Close all unfocused windows (Ctrl+F12: all but the one
 in front) and Close all plugin windows (Alt+F12: channel settings and plugin editors); the browser stays.
-Not yet: Align all channel editors.
 
 **Arranging windows.** VIEW > Arrange windows: Realign (Shift+Ctrl+H) and Desktop (default) put the Playlist, Mixer,
 Piano roll and Channel rack back as a new install has them; Desktop (alternate) floats the Playlist over the top of

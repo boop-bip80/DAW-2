@@ -10,6 +10,7 @@
 //! levels as normalized `f64`s. File encodings live in `os-flp`, not here.
 
 pub mod clip_lfo;
+pub mod container;
 pub mod crossfade;
 pub mod curve;
 
@@ -247,6 +248,7 @@ impl InitControl {
             Target::ChannelVolume(_) | Target::ChannelPan(_) | Target::SlotMix(..) => 12800.0 * v,
             Target::ChannelPitch(_) => 9600.0 * v - 4800.0,
             Target::MixerVolume(_) | Target::MixerSend(..) => 16000.0 * v,
+            Target::MainPitch => 2400.0 * v - 1200.0,
             Target::MixerPan(_) => 12800.0 * v - 6400.0,
             Target::MixerSeparation(_) => 128.0 * v - 64.0,
             Target::MixerEq(_, _, 0) => 3600.0 * v - 1800.0,
@@ -261,7 +263,7 @@ impl InitControl {
     /// The value as an automation clip hands it on (0..1), for the settings whose stored units are known: the inverse
     /// of [`InitControl::from_unit`] (spec: audio/voice-levels.md "Values from automation", audio/mixer.md "Changes
     /// while the song plays", audio/timing.md "Tempo that changes"). Plugin parameters, a channel's other levels and
-    /// the project's main volume, swing and pitch give `None`.
+    /// the project's main volume and swing give `None`.
     pub fn unit(&self) -> Option<f64> {
         use target::Target;
         let v = f64::from(self.value);
@@ -269,6 +271,7 @@ impl InitControl {
             Target::ChannelVolume(_) | Target::ChannelPan(_) | Target::SlotMix(..) => v / 12800.0,
             Target::ChannelPitch(_) => (v + 4800.0) / 9600.0,
             Target::MixerVolume(_) | Target::MixerSend(..) => v / 16000.0,
+            Target::MainPitch => (v + 1200.0) / 2400.0,
             Target::MixerPan(_) => (v + 6400.0) / 12800.0,
             Target::MixerSeparation(_) => (v + 64.0) / 128.0,
             Target::MixerEq(_, _, 0) => (v + 1800.0) / 3600.0,
@@ -2304,7 +2307,8 @@ pub mod target {
         Some(match t {
             Target::ChannelVolume(_) | Target::ChannelPan(_) | Target::SlotMix(..) => (0.0, 12800.0),
             Target::ChannelPitch(_) => (-4800.0, 4800.0),
-            Target::MixerVolume(_) => (0.0, 16000.0),
+            Target::MixerVolume(_) | Target::MixerSend(..) => (0.0, 16000.0),
+            Target::MainPitch => (-1200.0, 1200.0),
             Target::MixerPan(_) => (-6400.0, 6400.0),
             Target::MixerSeparation(_) => (-64.0, 64.0),
             Target::MixerEq(_, _, 0) => (-1800.0, 1800.0),
@@ -2335,6 +2339,9 @@ pub mod target {
         MixerEq(u16, u8, u8),
         /// Mixer track, destination track: the send level.
         MixerSend(u16, u16),
+        /// The project's main pitch in cents, -1200..=1200 ([`InitControl::MAIN_PITCH`]'s place; spec:
+        /// audio/voice-levels.md "The main pitch"). Every channel that follows the main pitch moves.
+        MainPitch,
         /// Mixer track, slot: the slot's switch / its mix level.
         SlotOn(u16, u8),
         SlotMix(u16, u8),
@@ -2349,6 +2356,9 @@ pub mod target {
     pub fn decode(t: u32) -> Target {
         if t == TEMPO {
             return Target::Tempo;
+        }
+        if t == crate::InitControl::MAIN_PITCH {
+            return Target::MainPitch;
         }
         let hi = (t >> 16) as u16;
         let lo = t as u16;
@@ -2405,6 +2415,7 @@ pub mod target {
             Target::ChannelPan(_)
                 | Target::ChannelPitch(_)
                 | Target::ChannelLevel(_, CHANNEL_PAN_OFFSET | CHANNEL_VOLUME_MULT | CHANNEL_MOD_X | CHANNEL_MOD_Y)
+                | Target::MainPitch
                 | Target::MixerPan(_)
                 | Target::MixerSeparation(_)
                 | Target::MixerEq(_, _, 0)
@@ -2414,6 +2425,20 @@ pub mod target {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        // spec: audio/voice-levels.md "The main pitch", audio/automation.md "Pattern control points"
+        #[test]
+        fn the_main_pitch_and_sends_are_targets_of_their_own() {
+            use crate::InitControl;
+            assert_eq!(decode(InitControl::MAIN_PITCH), Target::MainPitch);
+            assert!(bipolar(InitControl::MAIN_PITCH), "the main pitch centres at 0.5");
+            assert_eq!(point_range(Target::MainPitch), Some((-1200.0, 1200.0)));
+            assert_eq!(point_range(Target::MixerSend(1, 2)), Some((0.0, 16000.0)));
+            let at = |v: f64| InitControl::from_unit(InitControl::MAIN_PITCH, v).unwrap().value;
+            assert_eq!((at(0.0), at(0.5), at(1.0)), (-1200, 0, 1200));
+            assert_eq!(InitControl { head: 0, target: InitControl::MAIN_PITCH, value: -1200 }.unit(), Some(0.0));
+            assert_eq!(InitControl { head: 0, target: InitControl::MAIN_PITCH, value: 600 }.unit(), Some(0.75));
+        }
 
         // spec: plugins/plugin-parameters.md §3
         #[test]

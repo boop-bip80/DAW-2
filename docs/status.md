@@ -141,9 +141,10 @@ clicking it does nothing. The full, item-by-item roadmap lives on the
   Link all parameters... links the effect's parameters to consecutive controllers, as its window menu's
 - Containers (a first part of the original's Patcher, in Lemon Studio's own form): the slot menu's Wrap in container
   moves the slot's effect into a container in the same slot, and Wrap all in container moves all of the track's
-  effects into one container in that slot, in slot order. One undo step each. A container plays its effects one
-  after the other, each with its own wet and dry levels (taken from the slot's mix knob and switch), and its delay
-  is the sum of theirs, made up as any plugin's. The container keeps the slot's name, colour and icon. Its window
+  effects into one container in that slot, in slot order. One undo step each. A fresh container starts as a serial
+  chain, each effect with its own wet and dry levels (taken from the slot's mix knob and switch), and its delay is
+  the sum of the serial path's, made up as any plugin's; its saved graph can reorder and branch the members (below).
+  The container keeps the slot's name, colour and icon. Its window
   (the slot menu's Container ▸ Edit list..., or opening the slot) lists the effects with a wet and a dry knob each
   (turned, typed in, reset, one undo step a turn; an automated level turns its knob), opens each effect's own
   plugin window, and moves, removes and adds effects (the effect list of an empty slot), one undo step each. An
@@ -152,18 +153,51 @@ clicking it does nothing. The full, item-by-item roadmap lives on the
   browser's Effects (after their container), and their parameters' menu makes automation clips, controller links and
   event editors as a slot's effect's does; each level in the list has that menu too. A clip or link names the effect
   by its container's slot and its id in the container (at most 15 effects), so it follows the effect when the list
-  is reordered, plays in playback and export, and is saved with the project. A member's window lists, steps, saves
-  and loads its presets; its window edits and presets are undo steps, as a slot effect's are. Not yet: moving a
-  wrapped slot's own clips and links onto the member, the CPU switches per effect, and the original's Patcher slots
-  in imported projects
+  is reordered, plays in playback and export, and is saved with the project. A clip or controller link that drove a
+  wrapped slot's effect moves onto the member with it (each slot's, for Wrap all), and an undo moves it back. A
+  member's menu switches it off and on: an off member is skipped (its input passes through untouched, an instrument
+  is silent) and adds no delay, while its settings, levels, automation and links stay; one undo step, saved with the
+  project. Its window lists, steps, saves and loads its presets; its window edits and presets are undo steps, as a
+  slot effect's are. A container's saved graph drives playback headless: members are processed in the order their
+  connections require, a member's signal goes to every destination it connects to (fan-out), and each named output is
+  the sum of its connected members. The graph's output 0 (the first named output) is what the slot or channel plays;
+  every extra output can be routed to its own mixer destination (`Graph::destinations`) and is summed into that track's input
+  before its effect slots, equaliser, fader, pan, mute and sends. A route or an output count changed while audio runs
+  is read on the next tick, without dropping or repeating notes. The graph (named outputs, their destinations,
+  note-processor records and connections between the input, members and outputs) is saved in the project (container
+  state version 6; versions 1-4 read back as the serial list and version 5 with its extra outputs unrouted). Headless
+  graph commands connect and disconnect nodes and add, route, edit, reorder or remove outputs and note processors, one
+  undo step each, and reject loops and unknown nodes. The graph window (the container window's Graph...) lists the
+  input, members and outputs and the connections; Add output... creates an output already routed to a mixer track,
+  Outputs... changes or clears a route and removes an output, and the other menus add connections and remove
+  connections or note processors. Each control runs those same headless commands and undo steps. A channel's Notes...
+  menu adds, edits, moves and removes its three built-in processors in order. They transform every live note before the
+  channel's instrument members: Transpose (semitones, clamped to playable keys), Velocity (percent, clamped to 0..1)
+  and Delay (ticks, moving note-on and note-off by the same tick length at the current tempo). A delayed note therefore
+  sounds for its original duration, with its release shifted by the same amount as its onset. A held note keeps the
+  transformed key and delay it started with: removing or changing the Delay, reordering processors or adding a
+  processor while it sounds affects only its next note, so its release stays exactly once and the note neither sticks
+  on nor is cut short. Same-key notes may overlap when a delay is active. Their held entries are matched oldest first:
+  each note-off releases the oldest still-held note of that key and removes exactly one live-note entry, so a retrigger
+  is not swallowed by the earlier release. Each overlapping note therefore gets its own delayed onset and release, the
+  later note keeps sounding after the earlier release, and all notes return to silence only after the last release.
+  Captured audio proves this for two and three overlapping notes, including a graph edit while all three are held; each
+  note keeps its own onset, release and unprocessed duration. The transform runs on live playing and external MIDI, and
+  a graph edit is read on the next tick
+  while audio runs. A slot container has no notes, so it does not add them. An unsupported legacy processor is reported
+  by name and the container keeps its serial audio route with the notes unchanged, rather than silently dropping it.
+  Not yet: the original's Patcher slots
+  in imported projects (there is no format specification or fixtures for them) and note processors' MIDI output
 - Instrument containers: the channel rack menu's Wrap in container (the original's Patcherize) moves a plugin
   channel's instrument, with its state, into a container on the channel, one undo step. The channel stays a channel
-  (its name, steps, piano roll, mixer track, volume and pan); the container plays its notes through its plugins in
-  order. Its window (a click on the channel's name button) lists them; Add plugin offers instruments and effects. An
+  (its name, steps, piano roll, mixer track, volume and pan); the container plays its notes through its plugins as its
+  saved graph routes them (serial until edited). Its window (a click on the channel's name button) lists them; Add plugin offers instruments and effects. An
   instrument starts at wet and dry 100 %, so a second one layers over the first, and an effect after them works on
   both. Members are automated, linked, typed in and undone as a slot container's are, named by the channel, listed in
-  the browser's Generators after their channel, and saved in Lemon projects. Not yet: moving the old instrument's
-  clips and links onto its member, the graph editor's several outputs and note processors
+  the browser's Generators after their channel, and saved in Lemon projects. A clip or controller link that drove
+  the old instrument moves onto its member. Its Graph... window edits the saved graph, and every named output routes
+  its connected members to its own mixer track as a slot container's does. A channel's note processors act before its
+  instruments. Not yet: note processors' MIDI output
 
 ## ✅ Plugin hosting
 
@@ -335,8 +369,8 @@ and Touch controller. Kept with the program's settings, not the project. Which w
 - Automation clips for channel, mixer and plugin parameters
 - A clip drives every target it is linked to, including mixer slot switches and mix levels, track EQ, send
   levels, stereo separation and the channel's level adjustments
-- A pattern's control points drive mixer volumes, pans, separation, equalisers, slot switches and mix levels, the
-  tempo and plugin parameters, besides the channel's own settings (sends and the main pitch not yet)
+- A pattern's control points drive mixer volumes, pans, separation, equalisers, sends, slot switches and mix levels,
+  the tempo, the main pitch and plugin parameters, besides the channel's own settings
 - All thirteen curve shapes are walked exactly; values are taken one tick ahead and passed on only when
   they change
 - A clip's range (its channel's MIN and MAX knobs, minimum above maximum turning the curve upside down) and its
@@ -358,7 +392,8 @@ and Touch controller. Kept with the program's settings, not the project. Which w
 - Edit automation in a window, on the same menus, opens a second event editor window on that control, in front of
   the first, which keeps its control; a click on the one behind brings it in front, the editors share a clipboard, and
   closing one leaves the other (Lemon Studio's design)
-- A knob's menu (channel volume and pan, mixer and main knobs): Edit automation clip... shows the clip that drives it,
+- A knob's menu (channel volume and pan, mixer knobs and the main pitch knob): Edit automation clip... shows the clip
+  that drives it,
   as on a plugin parameter, and Set... puts it at its default, the minimum, 25, 50 or 75% or the maximum, each listed
   with the knob's value there (one undo step)
 - Not yet in the event editor: Auto smoothing, Center

@@ -17,6 +17,11 @@ pub const VOICE_GAIN_FRAMES: u32 = 32;
 
 /// A note-driven stereo generator.
 pub trait Instrument: Send {
+    /// The engine's sample rate, set before the first note and block. A note processor that delays in ticks uses it.
+    /// Default: ignored.
+    fn set_sample_rate(&mut self, rate: u32) {
+        let _ = rate;
+    }
     /// Starts a note `offset` frames into the next `process` call. Velocity 0..=1 (FL velocity / 128).
     fn note_on(&mut self, offset: u32, key: u8, velocity: f32);
     /// Ends a note `offset` frames into the next `process` call.
@@ -153,6 +158,22 @@ pub trait Instrument: Send {
     /// audio/delay-compensation.md). Default: none.
     fn reported_delay(&self) -> u32 {
         0
+    }
+    /// The number of extra named outputs after the main one an instrument exposes (a channel container's graph). The
+    /// engine adds each one to the mixer track its destination names. Default: none.
+    fn extra_outputs(&self) -> usize {
+        0
+    }
+    /// Extra output `k` (0 = the second named output) as the last `process` call left it. Read right after `process`.
+    /// Default: none.
+    fn extra_output(&self, k: usize) -> Option<(&[f32], &[f32])> {
+        let _ = k;
+        None
+    }
+    /// The mixer track extra output `k` plays on (`None`: no destination, so it is silent). Default: none.
+    fn extra_output_destination(&self, k: usize) -> Option<usize> {
+        let _ = k;
+        None
     }
 }
 
@@ -411,6 +432,22 @@ pub trait HostedEffect: Send {
     /// after `process_fx` (spec: audio/delay-compensation.md).
     fn reported_delay_fx(&self) -> u32 {
         0
+    }
+    /// The number of extra stereo outputs after the main one a container graph exposes (`crate::chain`). A plugin
+    /// without them has zero, and the mixer routes none.
+    fn extra_outputs_fx(&self) -> usize {
+        0
+    }
+    /// Extra output `k` (0 = the container's second named output) as the block processed last left it. The mixer adds
+    /// it to the track its destination names, after that track's slots, equaliser and fader have been worked out.
+    fn extra_output_fx(&self, k: usize) -> Option<(&[f32], &[f32])> {
+        let _ = k;
+        None
+    }
+    /// The mixer track extra output `k` plays on (`None`: it has no destination and is silent).
+    fn extra_output_destination_fx(&self, k: usize) -> Option<usize> {
+        let _ = k;
+        None
     }
     /// A controller plugin's output `k` (0..1) as its last block left it, for the links that read it (spec:
     /// plugins/lemon-peak-controller.md "Links"). `None`: no such output (yet).

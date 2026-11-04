@@ -53,6 +53,8 @@ pub enum Win {
     /// A container's window: its effects with their wet and dry knobs (Lemon Studio's design: spec
     /// plugins/patcher/README.md §4.3).
     Container,
+    /// A container's routing graph: its connections, named outputs and note processors.
+    Graph,
     /// A docked hosted-plugin window (a native child window; rack row), stacked with the drawn windows.
     Hosted(usize),
 }
@@ -179,6 +181,8 @@ pub enum Action {
     Strum(crate::strum::Act),
     /// The container window's names and buttons (`crate::container::CAct`).
     Container(crate::container::CAct),
+    /// The container graph window's buttons (`crate::container::GAct`).
+    Graph(crate::container::GAct),
     /// The Arpeggiate dialog's buttons, switches and menus (spec: ui/piano-arpeggiate.md).
     Arp(crate::arpeggiate::Act),
     /// The Flam, Flip and Scale levels dialogs' switches and buttons (spec: as `Win::PianoDlg`).
@@ -990,6 +994,8 @@ pub struct State {
     pub tapper: crate::tapper::TapperUi,
     /// The container's window: where it is, which container it shows, the levels its chain plays.
     pub container: crate::container::ContainerUi,
+    /// The container graph window: where it is.
+    pub graph: crate::container::GraphUi,
     pub touch: crate::touch::TouchUi,
     /// The event editor: the control it shows, its view, tool and selection.
     pub events: crate::events::EventsUi,
@@ -1527,6 +1533,7 @@ impl App {
                 perf: crate::perf::Perf::default(),
                 tapper: Default::default(),
                 container: Default::default(),
+                graph: Default::default(),
                 touch: Default::default(),
                 events: Default::default(),
                 events_back: None,
@@ -5575,6 +5582,12 @@ impl App {
                 (target::mixer(t, target::MIXER_VOLUME), format!("{} - Volume", mix_name(t)), v)
             }
             Action::Tempo => (target::TEMPO, "Tempo".into(), crate::playlist::tempo_value(s.tempo)),
+            // The main pitch (spec: audio/voice-levels.md "The main pitch"): its knob is 0..1, 0.5 = 0 cents.
+            Action::Knob(crate::knobs::KnobId::MasterPitch) => (
+                os_model::InitControl::MAIN_PITCH,
+                "Main pitch".into(),
+                f64::from(s.knob(crate::knobs::KnobId::MasterPitch)),
+            ),
             Action::Knob(k @ crate::knobs::KnobId::Eq(t, b, f)) => {
                 s.project.mixer.iter().find(|m| m.index == t)?;
                 let param = [target::EQ_GAIN, target::EQ_FREQ, target::EQ_WIDTH][usize::from(f.min(2))] + b.min(2);
@@ -8426,6 +8439,7 @@ impl App {
             Action::Touch(a) => self.touch_act(a),
             Action::Strum(a) => self.strum_act(a),
             Action::Container(a) => self.container_act(a),
+            Action::Graph(a) => self.graph_act(a),
             Action::Arp(a) => self.arp_act(a),
             Action::PianoDlg(a) => self.piano_dlg_act(a),
             Action::Events(a) => self.events_act(a),
@@ -8781,6 +8795,10 @@ impl App {
             Action::CloseWin(Win::Events) => {
                 crate::events::close(s);
                 self.invalidate();
+            }
+            Action::CloseWin(Win::Container) => {
+                s.hide(Win::Container);
+                s.hide(Win::Graph);
             }
             Action::CloseWin(w) => s.hide(w),
             Action::BrowserRow(_) | Action::BrowserTab(_) | Action::BrowserList | Action::BrowserCollapse | Action::BrowserReread | Action::BrowserMenu | Action::BrowserSearch | Action::BrowserClear | Action::BrowserSplitter => {}
@@ -16514,7 +16532,7 @@ mod tests {
             app.state.playlist.edit.clone().expect("value box")
         };
         let pitch = Target::Knob(KnobId::MasterPitch);
-        let e = open(&mut app, &mut c, Action::Knob(KnobId::MasterPitch), false);
+        let e = open(&mut app, &mut c, Action::Knob(KnobId::MasterPitch), true);
         assert_eq!(e.target, EditTarget::TypeIn(pitch, false));
         assert_eq!(e.text, "440");
         assert_eq!(crate::typein::width(pitch), crate::typein::W_PLAIN);

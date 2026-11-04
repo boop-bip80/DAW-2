@@ -270,6 +270,8 @@ struct ChannelState {
     fine: i32,
     root: u8,
     main: Option<i32>,
+    /// The main pitch the channel was built with: what a seek or a replay from the top puts back (`reset`).
+    init_main: Option<i32>,
     pitched: bool,
     /// Values at the start of playback, restored when control points are replayed from the top.
     init: (f64, f64, f64),
@@ -446,6 +448,7 @@ impl ChannelState {
     fn reset(&mut self) {
         (self.volume, self.pan, self.base_rate) = self.init;
         self.knob = self.init_knob;
+        self.main = self.init_main;
         self.vol_v = self.init_v;
         self.ramp = None;
         self.adjust = self.init_adjust;
@@ -556,11 +559,27 @@ impl ChannelState {
         }
     }
 
-    /// Sets the pitch knob (cents) and with it the channel's rate: the knob, fine tune, root note and main pitch
-    /// (spec: audio/voice-levels.md), counted here from key 60 as the voices' key rates are.
+    /// Sets the pitch knob (cents) and with it the channel's rate (`refresh_rate`).
     fn retune(&mut self, knob: f64) {
         self.knob = knob;
+        self.refresh_rate();
+    }
+
+    /// The channel's rate from the pitch it plays at now (`pitch_from_60`): the knob, fine tune, root note and main
+    /// pitch (spec: audio/voice-levels.md), counted from key 60 as the voices' key rates are.
+    fn refresh_rate(&mut self) {
         self.base_rate = self.src_ratio * if self.pitched { laws::cents_rate(self.pitch_from_60()) } else { 1.0 };
+    }
+
+    /// Moves the project's main pitch (cents) on a channel that follows it: its rate follows, sounding voices go with it
+    /// and a hosted instrument is retuned with the next tick (`InstTuning`). A channel that keeps its own pitch is left
+    /// alone.
+    fn set_main_pitch(&mut self, cents: i32) {
+        if self.main.is_none() || self.main == Some(cents) {
+            return;
+        }
+        self.main = Some(cents);
+        self.refresh_rate();
     }
 
     /// The channel's pitch in cents from key 60.
@@ -825,6 +844,9 @@ struct FxSlot {
     /// output to the lateness at the slot (spec: audio/sidechain.md "Sidechain input").
     key: Option<usize>,
     key_pad: pdc::Pad,
+    /// Extra graph outputs a hosted container exposes and the mixer track each plays on; see
+    /// [`Engine::refresh_extra_routes`].
+    extra: Vec<Option<usize>>,
     /// A hosted plugin's input ports, main and first auxiliary bus (0 = none), and the track its main bus takes instead
     /// of the track's own audio, with the pad that delays it like a sidechain input (spec: audio/sidechain.md "Hosted
     /// plugins' input buses").
@@ -851,6 +873,7 @@ impl FxSlot {
             fx,
             delay,
             dry_pad: pdc::Pad::default(),
+            extra: Vec::new(),
             key: None,
             key_pad: pdc::Pad::default(),
             ports: [0; 2],
@@ -1040,7 +1063,9 @@ pub struct Engine {
     /// Channel control points in tick order, and the next one to apply.
     controls: Vec<CtlEvent>,
     next_ctl: usize,
-    /// Notes started and not yet released: (channel, key, release tick; `u64::MAX` = a live note).
+    /// Notes started and not yet released: (channel, key, release tick; `u64::MAX` = a live note), oldest first. An
+    /// instrument channel keeps one entry per live note, so a same-key retrigger can overlap an earlier delayed release;
+    /// `note_off` removes exactly one entry, matching the chain's oldest-held-note release order.
     sounding: Vec<(usize, u16, u64)>,
     voices: Vec<Voice>,
     /// The tick clock of the current pass, the next tick to render and its first sample.
@@ -1338,6 +1363,7 @@ impl Engine {
                     fine: ch.misc.fine,
                     root: ch.misc.root,
                     main,
+                    init_main: main,
                     pitched,
                     init: (volume, ch.pan, src_ratio),
                     vol_v: ch.volume,
@@ -1762,7 +1788,8 @@ impl Engine {
                 self.report.plugin_channels_silent = self.report.plugin_channels_silent.saturating_sub(1);
             }
             ch.plugin = true;
-            if let Ok(h) = inst.try_lock() {
+            if let Ok(mut h) = inst.try_lock() {
+                h.set_sample_rate(self.rate);
                 let mine = |g: Target| matches!(g, Target::ChannelParam(c, _) if usize::from(c) == channel);
                 param_points(&mut self.controls, mine, |k| h.param_range(k));
             }
@@ -2101,8 +2128,16 @@ impl Engine {
 
     /// Release a live note with a short fade.
     pub fn note_off(&mut self, channel: usize, key: u16) {
-        if self.has_instrument(channel) && self.sounding.iter().any(|&(c, k, end)| c == channel && k == key && end == u64::MAX) {
-            self.inst_live.push((channel, key.min(127) as u8, -1.0, 0));
+        // A key can have more than one live instrument note: a same-key retrigger before its delayed release is a
+        // second entry in `sounding`. Release exactly the oldest one, matching `Chain`'s held-note order; retaining
+        // every matching entry here would swallow the second note's release and leave it stuck.
+        if self.has_instrument(channel) {
+            if let Some(at) = self.sounding.iter().position(|&(c, k, end)| c == channel && k == key && end == u64::MAX) {
+                self.sounding.remove(at);
+                self.inst_live.push((channel, key.min(127) as u8, -1.0, 0));
+            }
+        } else {
+            self.sounding.retain(|&(c, k, end)| !(c == channel && k == key && end == u64::MAX));
         }
         let fade = (f64::from(self.rate) * RELEASE_SECONDS) as u32;
         let vol_env = self.channels.get(channel).is_some_and(|c| c.vol_env.is_some());
@@ -2116,7 +2151,6 @@ impl Engine {
                 }
             }
         }
-        self.sounding.retain(|&(c, k, end)| !(c == channel && k == key && end == u64::MAX));
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -2681,6 +2715,14 @@ impl Engine {
             Target::ChannelPitch(c) => {
                 if let Some(ch) = self.channels.get_mut(usize::from(c)) {
                     ch.retune(f64::from(laws::auto_pitch_cents(v)));
+                }
+            }
+            // The project's main pitch, Round((2 v - 1) * 1200) cents: every channel that follows it retunes, its
+            // sounding voices with it (spec: audio/voice-levels.md "The main pitch").
+            Target::MainPitch => {
+                let cents = ((2.0 * v - 1.0) * 1200.0).round_ties_even() as i32;
+                for ch in &mut self.channels {
+                    ch.set_main_pitch(cents);
                 }
             }
             Target::ChannelLevel(c, id) => {
@@ -3432,6 +3474,13 @@ impl Engine {
             for (x, s) in self.bus[self.channels[c].insert].iter_mut().zip(&o.buf) {
                 *x += *s;
             }
+            for (dest, extra) in &o.extra {
+                if let Some(track) = self.bus.get_mut(*dest) {
+                    for (x, s) in track.iter_mut().zip(extra) {
+                        *x += *s;
+                    }
+                }
+            }
         }
         // The missed notes and controller messages of the instruments that ran have been sent.
         let ran = |c: usize| self.multicore.instrument_ran(c);
@@ -3447,6 +3496,33 @@ impl Engine {
         self.inst_active = active;
         if active {
             self.inst_tail = u64::from(self.rate) * INSTRUMENT_TAIL_SECONDS;
+        }
+    }
+
+    /// Reads the extra outputs of every hosted container before a tick, so a graph edit that adds or removes an output,
+    /// or points one at another mixer track, is heard on the next tick. A destination outside the project is treated as
+    /// unrouted rather than indexing past the mixer. A changed map rebuilds the processing order: a source track runs
+    /// before the destination that consumes its extra output.
+    fn refresh_extra_routes(&mut self) {
+        let n = self.tracks.len();
+        let mut changed = false;
+        for track in &mut self.tracks {
+            for fx in &mut track.effects {
+                let Fx::Hosted(host) = &fx.fx else { continue };
+                let Ok(host) = host.try_lock() else { continue };
+                let mut extra = Vec::with_capacity(host.extra_outputs_fx());
+                for k in 0..host.extra_outputs_fx() {
+                    extra.push(host.extra_output_destination_fx(k).filter(|&d| d < n));
+                }
+                if extra != fx.extra {
+                    fx.extra = extra;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.order = processing_order(&self.tracks);
+            self.pdc.due = true;
         }
     }
 
@@ -3469,6 +3545,7 @@ impl Engine {
     /// its output added into its destinations; the master's output is the song. The tracks run in processing order, or
     /// on several cores with the same result (`multicore`; spec: audio/multicore.md).
     fn mix(&mut self, frames: usize, song: &TransportInfo) {
+        self.refresh_extra_routes();
         let limit = os_dsp::glide::engine_limit(self.rate);
         // The device's inputs over this tick, read whether a track hears them or not (a track that starts to monitor
         // hears what arrives from then on), and the pairs the tracks' direct outputs are added into.
@@ -4037,6 +4114,7 @@ fn instrument_job(cx: &InstCx, lane: InstLane, sc: &mut multicore::MixScratch) {
     let ch = &cx.channels[c];
     (out.ran, out.active) = (false, false);
     out.buf.clear();
+    out.extra.clear();
     let Some(inst) = ch.instrument.0.as_ref() else { return };
     let Some(mut inst) = lock_busy(inst, until, cx.wait, cx.export) else {
         *owed += n;
@@ -4162,6 +4240,19 @@ fn instrument_job(cx: &InstCx, lane: InstLane, sc: &mut multicore::MixScratch) {
     let (l, r) = (&mut sc.l[..n], &mut sc.r[..n]);
     inst.process(cx.rate, l, r);
     out.delay = inst.reported_delay();
+    // A channel container's extra graph outputs are its members' sound: keep them before the channel's volume and pan,
+    // which belong to output 0, and add them to their mixer tracks in `instruments_out`. A destination past the mixer
+    // is ignored there, so a graph edited while playing cannot index past the tracks.
+    for k in 0..inst.extra_outputs() {
+        let Some(dest) = inst.extra_output_destination(k) else { continue };
+        let Some((el, er)) = inst.extra_output(k) else { continue };
+        let mut extra = Vec::with_capacity(n * 2);
+        for f in 0..n {
+            extra.push(el.get(f).copied().unwrap_or(0.0));
+            extra.push(er.get(f).copied().unwrap_or(0.0));
+        }
+        out.extra.push((dest, extra));
+    }
     // An instrument without voice gains: the clips' shapes on its whole output. A clip that has ended keeps the channel
     // silent through its choke's tail only while no other clip of the channel plays; then the playing clips' gains
     // alone count. Clips that overlap still share one gain, so a crossfade between them dips.
@@ -4335,6 +4426,26 @@ fn run_slot(
             for (i, f) in buf.chunks_exact_mut(2).enumerate() {
                 f[0] = l[i];
                 f[1] = r[i];
+            }
+            // A container's extra graph outputs go to their mixer destinations. They join the destination before its
+            // slots, equaliser and fader, so its gain, pan, mute and sends act on them; an output pointed at this track
+            // joins its own audio (or the slot's dry part when the slot mixes dry).
+            for (k, dest) in fx.extra.iter().copied().enumerate() {
+                let Some(dest) = dest else { continue };
+                let Some((el, er)) = h.extra_output_fx(k) else { continue };
+                if dest != t {
+                    let into = out.put(multicore::Dest::Track(dest));
+                    for (a, b) in el.iter().zip(er) {
+                        into.push(*a);
+                        into.push(*b);
+                    }
+                } else {
+                    let into: &mut [f32] = if blend { &mut dry[..] } else { &mut *buf };
+                    for ((f, a), b) in into.chunks_exact_mut(2).zip(el).zip(er) {
+                        f[0] += *a;
+                        f[1] += *b;
+                    }
+                }
             }
             h.reported_delay_fx()
         }
@@ -4522,6 +4633,15 @@ fn processing_order(tracks: &[MixTrack]) -> Vec<usize> {
         state[t] = 1;
         for r in &tracks[t].routes {
             visit(r.dest, tracks, state, order);
+        }
+        // A container's extra output is consumed by its destination's turn, so that track runs after its source just
+        // as a send's destination does.
+        for fx in &tracks[t].effects {
+            for d in fx.extra.iter().flatten() {
+                if *d < tracks.len() {
+                    visit(*d, tracks, state, order);
+                }
+            }
         }
         state[t] = 2;
         order.push(t);
@@ -4742,11 +4862,13 @@ fn ctl_to(kind: u32) -> CtlTo {
 
 /// The automation level (0..1) a point's value in its setting's own unit stands for: the inverse of what a clip's
 /// level becomes (`Engine::auto_value`; spec: audio/automation.md "Pattern control points"). `None` for the targets a
-/// point does not move (a send's unit is not measured).
+/// point does not move.
 fn point_level(t: Target, value: i32) -> Option<f64> {
     let v = f64::from(value);
     Some(match t {
-        Target::MixerVolume(_) => v / 16000.0,
+        Target::MixerVolume(_) | Target::MixerSend(..) => v / 16000.0,
+        // The main pitch in cents, its range -1200..=1200 (`Target::point_range`).
+        Target::MainPitch => (v / 1200.0 + 1.0) / 2.0,
         Target::MixerPan(_) => (v / 6400.0 + 1.0) / 2.0,
         Target::MixerSeparation(_) => (v / 64.0 + 1.0) / 2.0,
         Target::MixerEq(_, _, 0) => (v / 1800.0 + 1.0) / 2.0,
@@ -7392,6 +7514,43 @@ mod tests {
         let t = &e.tracks[1];
         assert_eq!((t.effects[0].dry.current, t.routes[1].glide.current), (dry(6400), t.routes[1].gain));
         assert_eq!(t.gains.map(|r| r.map(|g| g.current)), t.matrix);
+    }
+
+    // spec: audio/automation.md "Pattern control points"; audio/voice-levels.md "The main pitch"
+    #[test]
+    fn control_points_drive_sends_and_the_main_pitch() {
+        use os_model::{target, ChannelKind, ControlPoint};
+        let mut p = project(
+            vec![long_note(0, 384, 0)],
+            vec![
+                ControlPoint { position: 48, kind: target::send(1, 2), value: 16000 },
+                ControlPoint { position: 96, kind: os_model::InitControl::MAIN_PITCH, value: 300 },
+            ],
+        );
+        p.channels[0].kind = ChannelKind::Plugin;
+        p.channels[0].mixer_track = 1;
+        p.mixer = (0..3).map(os_model::MixerTrack::new).collect();
+        p.mixer[1].routes = vec![0, 2];
+        p.mixer[1].send_levels = vec![(2, 0.0)];
+        let mut lib = SampleLibrary::default();
+        let mut e = Engine::new(&p, &mut lib, 48000, PlayMode::Pattern(1));
+        e.set_instrument(0, Arc::new(Mutex::new(Probe { log: Vec::new(), held: Vec::new(), at: 0 })));
+        let ticks = |e: &mut Engine, tick: u64| {
+            while e.tick <= tick {
+                e.next_tick();
+            }
+        };
+        ticks(&mut e, 47);
+        assert_eq!(e.tracks[1].routes[1].gain, 0.0, "the send as stored");
+        assert_eq!(e.inst_tuning[0].shift, 0.0, "and the main pitch");
+        ticks(&mut e, 48);
+        assert_eq!(e.tracks[1].routes[1].gain, os_dsp::mixer::send_gain_auto(1.0), "the point at tick 48");
+        ticks(&mut e, 96);
+        assert_eq!(e.channels[0].main, Some(300), "three semitones up");
+        assert_eq!(e.inst_tuning[0].shift, 3.0, "the hosted instrument retunes");
+        // A seek before the points puts the send and the main pitch back as the project stores them.
+        e.seek_tick(10);
+        assert_eq!((e.tracks[1].routes[1].gain, e.channels[0].main), (0.0, Some(0)));
     }
 
     // spec: audio/automation.md "When a clip acts", "Walking the curve"; audio/voice-levels.md "Values from automation"

@@ -537,6 +537,10 @@ impl Multicore {
             sig.extend(m.routes.iter().map(|r| r.dest as u32));
             sig.push(m.effects.len() as u32);
             sig.extend(m.effects.iter().flat_map(|f| [f.key.map_or(none, |k| k as u32), f.main.map_or(none, |k| k as u32)]));
+            for f in &m.effects {
+                sig.push(f.extra.len() as u32);
+                sig.extend(f.extra.iter().map(|d| d.map_or(none, |d| d as u32)));
+            }
         }
         if *sig == self.sig {
             return;
@@ -561,6 +565,12 @@ impl Multicore {
             for f in &m.effects {
                 for k in [f.key, f.main].into_iter().flatten().filter(|&k| k != s && k < n) {
                     self.edges.push((pos[k].min(pos[s]), pos[k].max(pos[s])));
+                }
+                for d in f.extra.iter().flatten().filter(|&&d| d != s && d < n) {
+                    if pos[*d] > pos[s] {
+                        self.pairs.push((pos[*d], pos[s]));
+                        self.edges.push((pos[s], pos[*d]));
+                    }
                 }
             }
         }
@@ -639,6 +649,9 @@ impl Multicore {
 pub(super) struct InstOut {
     /// What the channel adds to its insert, interleaved.
     pub buf: Vec<f32>,
+    /// Extra graph outputs of a channel container: the mixer track each plays on and its interleaved block, taken
+    /// before the channel's volume and pan, which belong to output 0 only.
+    pub extra: Vec<(usize, Vec<f32>)>,
     /// The instrument ran (else it was busy elsewhere and missed the tick).
     pub ran: bool,
     /// The delay it reported, and whether it said it still sounds.

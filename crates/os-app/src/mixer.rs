@@ -163,6 +163,8 @@ pub enum MCmd {
     /// takes them as slot `container::CHANNEL` of its row in the track's place (`Cmd::SlotWin`), and instruments too:
     /// `MemberAddInst` and `MemberReplaceInst` with the instrument's index in `Plugins::available`.
     Member(u8, usize, crate::container::Op),
+    /// A headless edit of the container's graph (`App::edit_graph`), on the current track's slot or a channel's.
+    Graph(u8, crate::container::GraphCmd),
     MemberAdd(u8, usize),
     MemberAddInst(u8, usize),
     MemberReplace(u8, usize, usize),
@@ -1763,6 +1765,8 @@ pub fn run(app: &mut App, c: MCmd) -> Option<String> {
         MCmd::SlotMove(..) => Some("Move effect"),
         MCmd::Wrap(_, false) => Some(crate::container::WRAP),
         MCmd::Wrap(_, true) => Some(crate::container::WRAP_ALL),
+        MCmd::Member(_, _, crate::container::Op::Switch) => Some(crate::container::SWITCH),
+        MCmd::Graph(..) => Some(crate::container::GRAPH),
         MCmd::Member(_, _, crate::container::Op::Up | crate::container::Op::Down) => Some(crate::container::MOVE),
         MCmd::Member(_, _, crate::container::Op::Remove) => Some(crate::container::REMOVE),
         MCmd::MemberAdd(..) => Some(crate::container::ADD),
@@ -1775,7 +1779,7 @@ pub fn run(app: &mut App, c: MCmd) -> Option<String> {
     };
     if let Some(name) = step {
         // The containers' members as their windows left them: what the step keeps and an undo brings back.
-        if matches!(c, MCmd::Wrap(..) | MCmd::Member(..) | MCmd::MemberAdd(..) | MCmd::MemberAddInst(..) | MCmd::MemberReplace(..) | MCmd::MemberReplaceInst(..)) {
+        if matches!(c, MCmd::Wrap(..) | MCmd::Member(..) | MCmd::MemberAdd(..) | MCmd::MemberAddInst(..) | MCmd::MemberReplace(..) | MCmd::MemberReplaceInst(..) | MCmd::Graph(..)) {
             crate::container::store_members(&mut app.state.project, &app.plugins);
         }
         return crate::control::edit_app(app, name, Region::Project, |app| run_now(app, c));
@@ -2065,6 +2069,11 @@ fn run_now(app: &mut App, c: MCmd) -> Option<String> {
         }
         MCmd::Member(slot, i, op) => {
             let msg = app.edit_member(slot, i, op);
+            changed(&mut app.state);
+            msg
+        }
+        MCmd::Graph(slot, cmd) => {
+            let msg = app.edit_graph(slot, cmd);
             changed(&mut app.state);
             msg
         }

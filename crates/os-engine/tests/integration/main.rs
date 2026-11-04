@@ -5,6 +5,8 @@
 //! The engine's integration tests as one binary: each file here is a module, as a test binary of its own would be
 //! built and linked on its own.
 
+mod container_outputs;
 mod fx_null;
 mod live_note_count;
+mod note_processors;
 mod pc_null;

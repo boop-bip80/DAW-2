@@ -114,4 +114,8 @@ pub fn paint(ui: &mut Ui, s: &State, _f: &FrameInfo) {
     let ink = if full { t.text_faint } else if hov { t.tx(0xffffff) } else { t.text };
     icons::draw(ui.c, Icon::Plus, Rect::new(add.x + 6.0, add.cy() - 6.0, 12.0, 12.0), ink);
     super::strum::label(ui, lf, add.x + 22.0, add.cy(), -1, ink, if channel { "Add plugin" } else { "Add effect" });
+    let graph = Rect::new(x0 + 130.0, win.bottom() - FOOT + 8.0, 78.0, 24.0);
+    let hov = ui.hit(graph, Action::Container(CAct::Graph), "Edit the routing graph: connections and outputs");
+    super::button_face(ui, graph, if hov { Look::Hover } else { Look::Off });
+    super::strum::label(ui, lf, graph.x + 30.0, graph.cy(), -1, if hov { t.tx(0xffffff) } else { t.text }, "Graph...");
 }

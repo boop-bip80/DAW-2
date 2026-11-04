@@ -55,7 +55,7 @@ sixteen effects and the Tesla audio editor; these are the gaps a project made in
 - [x] **Formula Controller.** Lemon Formula Controller plays projects' Fruity Formula Controller slots, with the
   original's formula language, and their controller links drive linked controls as the Peak Controller's do
 - [ ] **Patcher.** Slice 1 on 2026-10-30: the mixer slot menu's Patcherize and Patcherize all (Wrap in container,
-  Wrap all in container) put the slot's effect, or all of the track's, into a container that plays them in series,
+  Wrap all in container) put the slot's effect, or all of the track's, into a container that starts as a serial chain,
   each with its own wet and dry, with their delays made up and one undo step. The container keeps the slot's name,
   colour and icon. Its window (the slot menu's Container ▸ Edit list..., or opening the slot) opens each effect's
   plugin window, turns and types in its wet and dry levels on knobs that follow automation, and removes, moves and
@@ -64,12 +64,45 @@ sixteen effects and the Tesla audio editor; these are the gaps a project made in
   saved in Lemon Studio's projects. The effects inside are automated and linked as a slot's effect is, their wet and
   dry levels too (clips and controller links name the member by its container's slot and its id, so they follow it
   when it moves and are saved with the project), and their windows have their presets, a slot effect's menu
-  (Replace, Delete) and undo steps for their edits and presets (2026-10-30). Left: the original's Patcher slots in
-  imported projects, moving a wrapped slot's own clips and links onto its member, the CPU switches per effect, and
-  the graph editor. The channel rack's Patcherize (Wrap in container) followed on 2026-10-30: the channel's instrument
+  (Replace, Delete) and undo steps for their edits and presets (2026-10-30). A clip or controller link that drove a
+  wrapped slot's effect moves onto the member that took it, each slot's for Wrap all, and an undo moves it back
+  (2026-11-04). A member's menu switches it off and on: an off member is skipped by the chain (its input passes
+  through untouched, an instrument is silent) and adds no delay, while its settings, levels, automation and links
+  stay; it is one undo step and is saved with the project (2026-11-04). A container's saved graph drives playback
+  headless: the engine processes members in the order their connections require, sends each member's signal to every
+  destination it connects to (fan-out), and builds each named output by summing the signals connected to it. The graph's output 0
+  (the first named output) is what the container's slot or channel plays; every extra output can be routed to its own mixer destination
+  and is summed into that track's input before its effect slots, equaliser, fader, pan, mute and sends. A route or
+  output count changed while audio runs is read on the next tick, without dropping or repeating notes. The graph
+  (named outputs, their destinations, note-processor records and connections between the input, members and outputs)
+  is stored in the project (container state version 6; versions 1-4 read back as the serial list and version 5 with
+  its extra outputs unrouted), edited by one-undo-step headless commands (connect, disconnect, output add/route/remove
+  and note-processor add/edit/reorder/remove; loops and unknown nodes rejected) and saved and reopened in `.lemon` files.
+  Its graph window (the container window's Graph...) lists the nodes and connections, connects through its source and
+  destination menus, adds outputs already routed to a mixer track, changes or clears routes, removes connections and
+  extra outputs, and adds, edits, moves or removes a channel's note processors through Notes.... A channel's processors
+  transform every live note before its instrument members, in list order: Transpose (semitones, clamped to playable
+  keys), Velocity (percent, clamped to 0..1) and Delay (ticks, shifting note-on and note-off by the same tick length at
+  the current tempo). A delayed note therefore keeps its original duration, with onset and release shifted together.
+  A held note keeps the key and delay it started with: removing or changing the Delay, reordering processors or adding
+  one mid-note changes only the next note, so the held note's release arrives once, at its original shifted position,
+  and the audio returns to silence without a stuck or duplicated note. Same-key notes may overlap when a delay is
+  active; held entries are matched oldest first, each note-off releases the oldest still-held note of that key, and the
+  engine removes exactly one live-note entry. A retrigger is therefore not swallowed by the earlier pending release:
+  each note gets its own delayed onset and release, the later note outlasts the earlier one, and all notes are silent
+  only after the last release. They run for live playing and external MIDI, and edits are read on the next tick while
+  audio runs (tested from captured audio: pitch, amplitude, onset, release, sounding duration and one delivery per note,
+  including the four live held-note edits and four same-key overlap cases with mid-overlap graph edits, plus a
+  three-note overlap whose graph changes while all three are held and whose notes each keep their own onset, release and
+  unprocessed duration). A slot container has no notes
+  and does not add them. An unsupported legacy processor is reported by name and the container keeps its serial audio
+  route with the notes unchanged, rather than silently dropping it. Left: the
+  original's Patcher slots in imported projects (there is no format specification or fixtures for them yet) and note
+  processors' MIDI output. The channel rack's
+  Patcherize (Wrap in container) followed on 2026-10-30: the channel's instrument
   goes into a container on the channel that plays its notes, instruments and effects can be added (instruments layer
-  at wet and dry 100 %), and members are automated, linked, undone and saved as a slot container's are; the old
-  instrument's clips and links are not moved onto its member yet
+  at wet and dry 100 %), members are automated, linked, undone and saved as a slot container's are, and the old
+  instrument's clips and links move onto its member
 - [x] **Transient Processor, Chorus and Stereo Shaper compared with FL Studio 2026's exports.** Six of the seven
   small effects match sample for sample in the tests (98 cases for these three: `os-engine/tests/integration/fx_null.rs`); the
   Chorus uses the true pi where the original's is a hair off, so 10 of its 21 cases match and the rest are at least

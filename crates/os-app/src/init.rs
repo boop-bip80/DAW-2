@@ -190,6 +190,7 @@ pub fn name(s: &State, t: u32) -> String {
         Target::MixerSeparation(m) => format!("{} - Stereo separation", mix(m)),
         Target::MixerEq(m, b, k) => format!("{} - EQ band {} {}", mix(m), b + 1, ["gain", "frequency", "width"][usize::from(k).min(2)]),
         Target::MixerSend(m, d) => format!("{} - Send to {}", mix(m), mix(d)),
+        Target::MainPitch => "Main pitch".into(),
         Target::SlotOn(m, k) => format!("{} - Slot {} switch", mix(m), k + 1),
         Target::SlotMix(m, k) => format!("{} - Slot {} mix level", mix(m), k + 1),
         // A plugin that isn't hosted: its parameter by number.
@@ -324,6 +325,22 @@ mod tests {
         assert_eq!(history::undo(&mut a.state).as_deref(), Some(history::CREATE_AUTOMATION));
         assert_eq!((a.state.project.init_controls.clone(), pl::clips(&a.state).len()), (vec![rec(vol, 6400)], 2));
         prefs::set_check(&prefs::INIT_CONTROLS, true);
+    }
+
+    /// The main pitch is an automation target as a channel's control is (spec: audio/voice-levels.md "The main pitch"):
+    /// its events hold the pitch in cents (0.5 of the knob is none), and its clip lists the start value in cents.
+    #[test]
+    fn the_main_pitch_knob_makes_an_automation_clip() {
+        let mut a = app();
+        prefs::set_check(&prefs::INIT_CONTROLS, true);
+        a.state.project.main_pitch = Some(-300);
+        let (t, name, v) = a.automation_target(&Action::Knob(KnobId::MasterPitch)).unwrap();
+        assert_eq!((t, name.as_str()), (os_model::InitControl::MAIN_PITCH, "Main pitch"));
+        assert!((v - 0.375).abs() < 1e-6, "-300 cents is 0.375 of the knob: {v}");
+        assert_eq!(os_model::target::point_range(os_model::target::decode(t)), Some((-1200.0, 1200.0)));
+        pl::run(&mut a, Cmd::CreateAutomation(t, name, v));
+        assert_eq!(a.state.project.init_controls, vec![rec(os_model::InitControl::MAIN_PITCH, -300)]);
+        assert_eq!(pl::clips(&a.state).len(), 1);
     }
 
     /// A song (pattern 1, empty, on track 1) with channel 1's volume and the tempo listed.

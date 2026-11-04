@@ -14,3 +14,4 @@ CLAUDE.md
 # macOS Finder metadata
 .DS_Store
 .sysroot/
+.tmp/

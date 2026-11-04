@@ -63,7 +63,7 @@ jobs:
       # A certificate, its password and the notary credentials come from the repository's secrets. Without them the
       # build stays ad hoc signed, which is enough to run it after "Open Anyway" in System Settings.
       - name: Sign and notarize
-        if: runner.os == 'macOS' && secrets.MACOS_CERTIFICATE != ''
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}

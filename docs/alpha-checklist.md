@@ -180,7 +180,7 @@ Greyed-out controls and partial features. These can land alongside the blockers.
   roadmap in the specs) work (2026-10-30): Vocal denoise / isolator's MIX goes from the noise alone through the
   original to the voice alone, Deverb takes the late reverb out (General or Vocal, with a MIX) at a reverb time it
   reads from the selection. Both are Lemon Studio's spectral design, not the original's trained model; what the
-  entries do is from the original's manual. Edit > Undo mix (envelope) came with them
+  entries do is from the original's manual. Edit > Undo mix (envelope) and (spectral) came with them
 - [x] **Value boxes.** All of them work, the last two being the autosave Maximum and Metronome track, and MIDI
   settings' Performance mode MIDI channel (2026-10-30)
 - [x] **Performance mode.** Launching the zone's clips with the mouse, with the typing keyboard (the original's

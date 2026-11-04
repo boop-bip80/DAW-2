@@ -582,8 +582,9 @@ and Touch controller. Kept with the program's settings, not the project. Which w
   noise) and takes out the rest, or the other way round, by one MIX knob; Deverb... takes the late reverb out of the
   selection (General or Vocal) at a reverb time it measures there; both preview, with undo
 - Tesla's Edit > Undo mix (envelope) ▸ mixes an earlier state of the sample back in by the all-purpose envelope (the
-  top undoes, the bottom keeps the change)
-- Not yet: Edit > Undo mix (spectral)
+  top undoes, the bottom keeps the change); Undo mix (spectral) ▸ mixes it back through the EQ curve last set in
+  Equalize..., so a boost at a frequency undoes more of it there and a cut keeps it, with the same envelope setting
+  the amount
 
 ## ✅ Exporting audio
 

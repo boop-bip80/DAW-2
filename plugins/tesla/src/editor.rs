@@ -214,6 +214,8 @@ pub enum Cmd {
     UndoTo(usize),
     /// Edit > Undo mix (envelope) ▸: mix back the state before the newest n steps.
     UndoMix(usize),
+    /// Edit > Undo mix (spectral) ▸: mix that state back in through the Equalize... panel's EQ curve.
+    UndoMixSpectral(usize),
     UndoLarge,
     Cut,
     Copy,
@@ -1708,6 +1710,11 @@ impl Logic {
 
     fn close_amp(&mut self, accept: bool) {
         let Some(ui) = self.view.amp.take() else { return };
+        // The EQ curve stays after the panel closes: Edit > Undo mix (spectral) shapes the undo by it.
+        if let Some(e) = ui.eq {
+            let curve = ui.curve;
+            self.doc(|d| d.eq_shape = Some(doc::EqShape { curve, smooth: e.smooth }));
+        }
         match (ui.previewing, accept) {
             (true, false) => {
                 self.doc(|d| d.undo());
@@ -2129,6 +2136,7 @@ impl Logic {
                 m.add(item("Redo").shortcut("Ctrl+Y").enabled(d.can_redo()), Cmd::Redo);
                 m.submenu("Undo history", self.menu_undo(d), Cmd::None);
                 m.submenu("Undo mix (envelope)", self.menu_undo_mix(d), Cmd::None);
+                m.submenu("Undo mix (spectral)", self.menu_undo_mix_spectral(d), Cmd::None);
                 m.add(check("Enable undo for large samples", v.undo_large), Cmd::UndoLarge);
                 m.sep(Cmd::None);
                 m.add(item("Cut").shortcut("Ctrl+X").enabled(has), Cmd::Cut);
@@ -2306,6 +2314,20 @@ impl Logic {
         m
     }
 
+    /// Edit > Undo mix (spectral) ▸: the undo history, newest first; grey until an EQ curve has been set in the
+    /// Equalize... panel, and for states that do not line up with the sample (another length).
+    fn menu_undo_mix_spectral(&self, d: &Doc) -> MenuDef<Cmd> {
+        let mut m = MenuDef::new(MenuStyle::Context);
+        let h = d.history();
+        if h.is_empty() {
+            m.add(MenuItem::item("(nothing to undo)").enabled(false), Cmd::None);
+        }
+        for (i, n) in h.iter().enumerate().take(32) {
+            m.add(MenuItem::item(n).enabled(d.can_undo_mix_spectral(i + 1)), Cmd::UndoMixSpectral(i + 1));
+        }
+        m
+    }
+
     pub fn pick(&mut self, _req: &MenuReq, cmd: Cmd, x: f32, y: f32) -> Vec<Act> {
         let w = self.layout().lane().w;
         let mut acts = vec![Act::Repaint];
@@ -2343,6 +2365,17 @@ impl Logic {
                     format!("Undo mix (envelope): back before \"{name}\" by the all-purpose envelope (top: undone, bottom: kept)")
                 } else {
                     format!("Undo mix (envelope): the sample before \"{name}\" has another length; use Undo history")
+                };
+            }
+            Cmd::UndoMixSpectral(n) => {
+                let name = self.doc(|d| d.history().get(n.saturating_sub(1)).cloned().unwrap_or_default());
+                let shaped = self.doc(|d| d.eq_shape.is_some());
+                self.hint = if self.doc(|d| d.undo_mix_spectral(n)) {
+                    format!("Undo mix (spectral): back before \"{name}\" through the Equalize curve, by the all-purpose envelope (top: undone, bottom: kept)")
+                } else if !shaped {
+                    "Undo mix (spectral): set and close an EQ curve with Equalize... first".into()
+                } else {
+                    format!("Undo mix (spectral): the sample before \"{name}\" has another length; use Undo history")
                 };
             }
             Cmd::UndoLarge => self.doc(|d| d.view.undo_large = !d.view.undo_large),
@@ -4397,6 +4430,83 @@ mod tests {
         assert!(!l.doc(|d| d.can_undo_mix(1)));
         l.pick(&MenuReq::Main(MenuId::Edit), Cmd::UndoMix(1), 0.0, 0.0);
         assert!(l.hint.ends_with("has another length; use Undo history"), "{}", l.hint);
+    }
+
+    /// Edit > Undo mix (spectral): the EQ curve of the last Equalize... panel shapes the undo, and the all-purpose
+    /// envelope sets its amount over time. A low boost undoes the low band far more than the cut high band does.
+    #[test]
+    fn spectral_undo_mixes_by_the_eq_curve() {
+        let mut l = logic();
+        let rate = 16000usize;
+        let tone = |hz: f64, i: usize| (0.2 * (std::f64::consts::TAU * hz * i as f64 / rate as f64).sin()) as f32;
+        let base: Vec<f32> = (0..rate).map(|i| tone(200.0, i) + tone(3000.0, i)).collect();
+        load(&mut l, Sample::from_channels(rate as u32, vec![base.clone()], Format::Float32));
+        // The amplitude of one tone in the middle of a channel.
+        let amp = |ch: &[f32], hz: f64| {
+            let (a, b) = (rate / 10, rate * 9 / 10);
+            let (mut s, mut c) = (0.0f64, 0.0f64);
+            for (i, v) in ch[a..b].iter().enumerate() {
+                let ph = std::f64::consts::TAU * hz * (a + i) as f64 / rate as f64;
+                s += *v as f64 * ph.sin();
+                c += *v as f64 * ph.cos();
+            }
+            2.0 * (s * s + c * c).sqrt() / (b - a) as f64
+        };
+        // A whole-file change to undo: Normalize makes both tones louder by the same gain.
+        l.pick(&MenuReq::Main(MenuId::Tools), Cmd::Tool(ToolCmd::Normalize), 0.0, 0.0);
+        assert_eq!(l.doc(|d| d.history()[0].clone()), "Normalize");
+        let norm = l.doc(|d| d.sample.ch[0].clone());
+        let (nlo, nhi) = (amp(&norm, 200.0), amp(&norm, 3000.0));
+        let gain = nlo / amp(&base, 200.0);
+        assert!(gain > 2.0 && (nhi / amp(&base, 3000.0) - gain).abs() < 1e-3, "Normalize: {gain}");
+        // Without an EQ curve there is nothing for the spectral undo to shape by: the menu row is grey, and picking
+        // the command says what is missing.
+        assert!(!l.doc(|d| d.can_undo_mix_spectral(1)));
+        let m = l.menu(&MenuReq::Main(MenuId::Edit));
+        let row = |m: &MenuDef<Cmd>| m.items.iter().position(|it| matches!(it, MenuItem::Item { label, .. } if label == "Undo mix (spectral)")).expect("the submenu");
+        assert!(!m.sub(row(&m)).expect("its rows").items[0].clickable());
+        l.pick(&MenuReq::Main(MenuId::Edit), Cmd::UndoMixSpectral(1), 0.0, 0.0);
+        assert_eq!(l.hint, "Undo mix (spectral): set and close an EQ curve with Equalize... first");
+        // Equalize... opened from the Tools menu: +18 dB at 200 Hz, -18 dB at 3 kHz. Accept adds its step, and the
+        // curve stays on the document after the panel closes.
+        l.pick(&MenuReq::Main(MenuId::Tools), Cmd::Tool(ToolCmd::Equalize), 0.0, 0.0);
+        l.view.amp.as_mut().unwrap().curve = Curve::from_points(&[
+            env::Point { pos: 0.0, v: 0.5, smooth: false },
+            env::Point { pos: spectral::eq_x(200.0), v: 0.875, smooth: false },
+            env::Point { pos: spectral::eq_x(3000.0), v: 0.125, smooth: false },
+            env::Point { pos: 1.0, v: 0.5, smooth: false },
+        ]);
+        l.view.amp.as_mut().unwrap().eq.as_mut().unwrap().smooth = false;
+        paint(&mut l);
+        let (ax, ay) = centre(&l, Target::Amp(AmpCtl::Accept));
+        l.down(ax, ay, Btn::Left, Mods::default(), false);
+        l.up(Btn::Left);
+        assert_eq!(l.doc(|d| d.history()[0].clone()), "Equalize");
+        assert!(l.doc(|d| d.eq_shape.is_some()), "the curve stays after the panel closes");
+        let edited = l.doc(|d| d.sample.ch[0].clone());
+        assert!(amp(&edited, 200.0) > 2.0 * nlo, "the EQ boosted the low tone");
+        // The curve is not part of the undo step: undoing the Equalize keeps it for the spectral undo.
+        l.pick(&MenuReq::Main(MenuId::Edit), Cmd::Undo, 0.0, 0.0);
+        assert!(l.doc(|d| d.sample.ch[0].iter().zip(&norm).all(|(a, b)| (a - b).abs() < 1e-6)));
+        assert!(l.doc(|d| d.eq_shape.is_some()));
+        // The all-purpose envelope at the top: Undo mix (spectral) undoes through the curve.
+        l.doc(|d| {
+            let n = d.frames();
+            for k in 0..3 {
+                d.env.move_point(env::ALL, n, k, [0.0, (n / 2) as f64, (n - 1) as f64][k], 1.0);
+            }
+        });
+        let m = l.menu(&MenuReq::Main(MenuId::Edit));
+        let sub = m.sub(row(&m)).expect("its rows");
+        assert_eq!(sub.cmds[..1], [Cmd::UndoMixSpectral(1)]);
+        assert!(sub.items[0].clickable());
+        l.pick(&MenuReq::Main(MenuId::Edit), Cmd::UndoMixSpectral(1), 0.0, 0.0);
+        assert_eq!(l.hint, "Undo mix (spectral): back before \"Normalize\" through the Equalize curve, by the all-purpose envelope (top: undone, bottom: kept)");
+        assert_eq!(l.doc(|d| d.history()[0].clone()), "Undo mix (spectral)");
+        let after = l.doc(|d| d.sample.ch[0].clone());
+        let (lo, hi) = (amp(&after, 200.0), amp(&after, 3000.0));
+        assert!(lo > 2.5 * nlo, "the boosted low band is undone much further: {lo} vs {nlo}");
+        assert!((hi - nhi).abs() < 0.15 * nhi, "the cut high band mostly keeps the change: {hi} vs {nhi}");
     }
 
     #[test]

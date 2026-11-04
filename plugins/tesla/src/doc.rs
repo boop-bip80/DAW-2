@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::env::{self, Envs};
 use crate::sample::{q16, Format, Sample};
+use crate::spectral::{self, Curve};
 use crate::state::{Rec, Saved, View};
 use crate::tools;
 use os_dsp::transients;
@@ -48,6 +49,14 @@ struct Step {
     env: Envs,
 }
 
+/// The EQ shape of the last Equalize... panel: Edit > Undo mix (spectral) shapes the undo's difference by it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EqShape {
+    pub curve: Curve,
+    /// The panel's Smooth: a spline through the curve's points, else straight lines.
+    pub smooth: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Doc {
     pub sample: Arc<Sample>,
@@ -61,6 +70,8 @@ pub struct Doc {
     pub sel: Option<(usize, usize)>,
     /// Where a click without a drag put the cursor (insert and paste go here with no selection).
     pub cursor: usize,
+    /// The curve the last Equalize... panel was closed with (None until one is used).
+    pub eq_shape: Option<EqShape>,
     undo: Vec<Step>,
     redo: Vec<Step>,
     /// Bumped by every change of the sample (the audio thread and the caches follow it).
@@ -85,7 +96,7 @@ fn rise(j: usize, k: usize) -> f32 {
 
 impl Doc {
     pub fn from_saved(s: Saved) -> Doc {
-        Doc { sample: Arc::new(s.sample), path: s.path, rec: s.rec, view: s.view, edison_env: s.edison_env, env: s.env, sel: None, cursor: 0, undo: Vec::new(), redo: Vec::new(), version: 1 }
+        Doc { sample: Arc::new(s.sample), path: s.path, rec: s.rec, view: s.view, edison_env: s.edison_env, env: s.env, sel: None, cursor: 0, eq_shape: None, undo: Vec::new(), redo: Vec::new(), version: 1 }
     }
 
     pub fn saved(&self) -> Saved {
@@ -225,6 +236,35 @@ impl Doc {
                 for f in a..=b {
                     let g = env::value(&p, f as f64);
                     c[f] = c[f] * (1.0 - g) + o[f] * g;
+                }
+            }
+        })
+    }
+
+    /// Whether Undo mix (spectral) can go back over the newest `n` steps: an EQ curve has been set in the Equalize...
+    /// panel, and that state lines up with the sample (`undo_state`).
+    pub fn can_undo_mix_spectral(&self, n: usize) -> bool {
+        self.eq_shape.is_some() && self.undo_state(n).is_some()
+    }
+
+    /// Edit > Undo mix (spectral): like [`Doc::undo_mix`], but the difference between the sample before the newest `n`
+    /// steps and the sample now (earlier − now) goes through the **EQ curve the Equalize... panel was last closed
+    /// with**, and the all-purpose envelope scales that shaped difference over time. A boost at a frequency undoes
+    /// more of it there, a cut keeps it. One undo step "Undo mix (spectral)"; false without an EQ curve or when that
+    /// state has another length, channel count or rate. The original's manual says only that the EQ curve guides the
+    /// undo: shaping the difference by it is Lemon Studio's design.
+    pub fn undo_mix_spectral(&mut self, n: usize) -> bool {
+        let Some(old) = self.undo_state(n) else { return false };
+        let Some(shape) = self.eq_shape else { return false };
+        let p = self.env.points(env::ALL, self.frames());
+        let rate = self.sample.rate;
+        let eq = spectral::Equalize { mix: 1.0, smooth: shape.smooth };
+        self.tool("Undo mix (spectral)", |s, a, b| {
+            for (c, o) in s.ch.iter_mut().zip(&old.ch) {
+                let delta: Vec<f32> = o.iter().zip(c.iter()).map(|(o, c)| o - c).collect();
+                let shaped = spectral::equalize(&delta, rate, shape.curve.points(), &eq);
+                for f in a..=b {
+                    c[f] += env::value(&p, f as f64) * shaped[f];
                 }
             }
         })
